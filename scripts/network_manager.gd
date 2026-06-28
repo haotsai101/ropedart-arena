@@ -15,7 +15,7 @@ var is_host := false
 var my_peer_id := 0
 var room_code := ""
 
-var _signaling_url := "wss://dartrope-signaling.onrender.com"
+var _signaling_url := "wss://ropedart-arena.onrender.com"
 
 var _ws: WebSocketPeer = null
 var _ws_open := false        # true once the WS handshake is complete
