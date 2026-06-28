@@ -24,8 +24,8 @@ const MAX_CHARGE_TIME := 1.5
 const BOT_CHARGE_RATIOS := [0.3, 0.6, 1.0]
 
 @onready var aim_indicator: Node3D = $AimIndicator
-@onready var player_mesh: MeshInstance3D = $PlayerMeshInstance
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
+@onready var player_mesh: Node3D = $char_fruit
 
 var player_color: Color
 var aim_dir: Vector2 = Vector2(0, 1)
@@ -61,11 +61,14 @@ var _net_throwing: bool = false
 func _ready() -> void:
 	add_to_group("players")
 	player_color = PLAYER_COLORS[clamp(player_index, 0, PLAYER_COLORS.size() - 1)]
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = player_color
-	mat.roughness = 0.5
-	player_mesh.set_surface_override_material(0, mat)
-	_player_material = mat
+	# Tint the fruit character body with player color so players are distinguishable
+	var fruit_body: MeshInstance3D = find_child("CharFruit_Body", true, false) as MeshInstance3D
+	if fruit_body != null:
+		var fruit_mat := StandardMaterial3D.new()
+		fruit_mat.albedo_color = player_color
+		fruit_mat.roughness = 0.5
+		fruit_body.set_surface_override_material(0, fruit_mat)
+		_player_material = fruit_mat
 	if is_bot:
 		bot_controller = get_node_or_null("BotController")
 	# Online: set up authority and sync — only when multiplayer peer is active
