@@ -844,6 +844,8 @@ func _begin_host() -> void:
 	var max_p: int = NetworkManager.room_settings.get("max_players", 4)
 	var diff: int = NetworkManager.room_settings.get("bot_difficulty", 0)
 	NetworkManager.create_room(max_p, diff)
+	if _browser_status_lbl != null:
+		_browser_status_lbl.text = "Creating room..."
 
 
 # ===========================================================================

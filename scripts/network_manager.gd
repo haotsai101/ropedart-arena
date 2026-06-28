@@ -22,10 +22,11 @@ var room_code := ""
 var room_settings: Dictionary = {"max_players": 4, "bot_difficulty": 0}
 var room_players: Array = []   # [{username, peer_id}]
 
-var _signaling_url := "wss://dartrope-signaling.onrender.com"
+var _signaling_url := "wss://ropedart-arena.onrender.com"
 
 var _ws: WebSocketPeer = null
 var _ws_open := false
+var _ws_was_open := false
 var _pending_send: Array = []
 
 var _rtc: WebRTCMultiplayerPeer = null
@@ -71,6 +72,7 @@ func disconnect_from_room() -> void:
 		_ws.close()
 		_ws = null
 	_ws_open = false
+	_ws_was_open = false
 	_pending_send.clear()
 	if _rtc != null:
 		_rtc.close()
@@ -144,10 +146,15 @@ func _process(_delta: float) -> void:
 
 		if not _ws_open and ws_state == WebSocketPeer.STATE_OPEN:
 			_ws_open = true
+			_ws_was_open = true
 			_flush_pending()
 
-		if ws_state == WebSocketPeer.STATE_CLOSED and _ws_open:
-			_ws_open = false
+		if ws_state == WebSocketPeer.STATE_CLOSED:
+			if _ws_open:
+				_ws_open = false
+			elif not _ws_was_open:
+				emit_signal("connection_failed", "Could not reach signaling server")
+				_ws = null
 
 		while _ws != null and _ws.get_available_packet_count() > 0:
 			var raw := _ws.get_packet().get_string_from_utf8()
