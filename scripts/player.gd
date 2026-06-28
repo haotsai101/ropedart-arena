@@ -35,6 +35,9 @@ var is_dead: bool = false
 var spawn_pos: Vector3
 var bot_controller: Node = null
 
+# Virtual on-screen controls — non-null only for player_index 0 on touch devices.
+var _virtual_controls: Node = null
+
 # Online multiplayer
 var player_peer_id: int = 1          # which multiplayer peer owns this player
 var is_network_controlled: bool = false  # true when a remote peer drives this player
@@ -71,6 +74,12 @@ func _ready() -> void:
 		_player_material = fruit_mat
 	if is_bot:
 		bot_controller = get_node_or_null("BotController")
+	# Virtual controls for touch devices (player_index 0, human only)
+	if player_index == 0 and not is_bot and DisplayServer.is_touchscreen_available():
+		var vc := load("res://scripts/virtual_controls.gd").new()
+		vc.name = "VirtualControls"
+		get_tree().root.add_child(vc)
+		_virtual_controls = vc
 	# Online: set up authority and sync — only when multiplayer peer is active
 	if GameManager.is_online and multiplayer.multiplayer_peer != null:
 		set_multiplayer_authority(player_peer_id)
@@ -214,7 +223,9 @@ func _physics_process(delta: float) -> void:
 
 func _get_throw_held() -> bool:
 	if player_index == 0:
-		return Input.is_key_pressed(KEY_SPACE)
+		if _virtual_controls != null and _virtual_controls.get_throw_held():
+			return true
+		return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_A)
 
 
@@ -222,6 +233,11 @@ func _get_move_input() -> Vector2:
 	if is_bot and bot_controller != null:
 		return bot_controller.get_desired_move()
 	if player_index == 0:
+		# Virtual joystick takes priority when a finger is on it
+		if _virtual_controls != null:
+			var vc_move: Vector2 = _virtual_controls.get_move()
+			if vc_move.length() > 0.1:
+				return vc_move
 		return Vector2(
 			float(Input.is_key_pressed(KEY_D)) - float(Input.is_key_pressed(KEY_A)),
 			float(Input.is_key_pressed(KEY_S)) - float(Input.is_key_pressed(KEY_W))
@@ -236,14 +252,35 @@ func _get_aim_input() -> Vector2:
 	if is_bot and bot_controller != null:
 		return bot_controller.get_desired_aim()
 	if player_index == 0:
-		return Vector2(
-			float(Input.is_key_pressed(KEY_RIGHT)) - float(Input.is_key_pressed(KEY_LEFT)),
-			float(Input.is_key_pressed(KEY_DOWN))  - float(Input.is_key_pressed(KEY_UP))
-		)
+		# Virtual joystick takes priority when a finger is active on the right stick
+		if _virtual_controls != null:
+			var vc_aim: Vector2 = _virtual_controls.get_aim()
+			if vc_aim.length() > 0.1:
+				return vc_aim
+		# Mouse aim: project cursor onto the XZ gameplay plane
+		return _get_mouse_aim()
 	var joy := player_index - 1
 	var v := Vector2(Input.get_joy_axis(joy, JOY_AXIS_RIGHT_X),
 					 Input.get_joy_axis(joy, JOY_AXIS_RIGHT_Y))
 	return v if v.length() >= DEADZONE else Vector2.ZERO
+
+
+func _get_mouse_aim() -> Vector2:
+	var camera := get_viewport().get_camera_3d()
+	if camera == null:
+		return Vector2.ZERO
+	var mouse_pos := get_viewport().get_mouse_position()
+	var ray_origin := camera.project_ray_origin(mouse_pos)
+	var ray_dir    := camera.project_ray_normal(mouse_pos)
+	# Intersect ray with the gameplay plane (y = 0)
+	if absf(ray_dir.y) < 0.001:
+		return Vector2.ZERO
+	var t := -ray_origin.y / ray_dir.y
+	var world_pos := ray_origin + ray_dir * t
+	var diff := Vector2(world_pos.x - global_position.x, world_pos.z - global_position.z)
+	if diff.length() < 0.1:
+		return Vector2.ZERO
+	return diff.normalized()
 
 
 func _throw(ratio: float) -> void:
