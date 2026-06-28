@@ -22,6 +22,7 @@ config/features=PackedStringArray("4.7", "Forward Plus")
 
 GameManager="*res://scripts/game_manager.gd"
 NetworkManager="*res://scripts/network_manager.gd"
+UsernameManager="*res://scripts/username_manager.gd"
 
 [dotnet]
 

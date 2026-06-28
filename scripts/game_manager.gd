@@ -142,6 +142,15 @@ func _rpc_set_state(new_state: int) -> void:
 	state_changed.emit(new_state)
 
 
+@rpc("authority", "call_local", "reliable")
+func _rpc_sync_settings(total: int, humans: int, difficulty: int, lives: int, rounds: int) -> void:
+	total_players = total
+	human_count = humans
+	bot_difficulty = difficulty
+	lives_per_round = lives
+	rounds_to_win = rounds
+
+
 func get_countdown_remaining() -> float:
 	return maxf(_timer, 0.0)
 
@@ -150,6 +159,9 @@ func start_round() -> void:
 	# In online mode, only the host starts rounds; the RPC propagates the state.
 	if is_online and multiplayer.multiplayer_peer != null and not multiplayer.is_server():
 		return
+	# Sync match settings to all clients before starting countdown.
+	if is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		rpc("_rpc_sync_settings", total_players, human_count, bot_difficulty, lives_per_round, rounds_to_win)
 	var spawn_positions := _get_spawn_positions()
 	for i in _all_players.size():
 		var p = _all_players[i]

@@ -1,21 +1,12 @@
 extends Control
-## Lobby: full-screen match-setup UI built entirely in code (mirrors hud.gd style).
-## Navigate rows with Up/Down arrows or D-pad; change values with Left/Right or D-pad;
-## confirm with Enter / Space / gamepad A.
-##
-## Phase 1 online: added LOCAL / ONLINE mode selector and online flow.
+## Lobby: multi-screen online match-setup UI built entirely in code.
+## Screens: "username" → "browser" → "waiting"
+## _set_screen() transitions between them by rebuilding all child nodes.
 
-const DIFFICULTY_LABELS: Array = ["EASY", "MEDIUM", "HARD"]
+const DIFFICULTY_LABELS: Array = ["Easy", "Medium", "Hard"]
+const DIFF_LABEL_UPPER: Array = ["EASY", "MEDIUM", "HARD"]
 
-## Each entry: [setting_key, display_name, min_value, max_value]
-const ROW_DEFS: Array = [
-	["total_players",   "TOTAL PLAYERS",   2, 6],
-	["human_count",     "HUMAN PLAYERS",   1, 6],
-	["bot_difficulty",  "BOT DIFFICULTY",  0, 2],
-	["lives_per_round", "LIVES PER ROUND", 1, 5],
-	["rounds_to_win",   "ROUNDS TO WIN",   1, 5],
-]
-
+# Colors
 const COLOR_BG             := Color(0.04, 0.04, 0.07, 1.0)
 const COLOR_PANEL_BG       := Color(0.06, 0.06, 0.10, 1.0)
 const COLOR_PANEL_BORDER   := Color(0.18, 0.18, 0.28, 0.7)
@@ -28,683 +19,913 @@ const COLOR_TEXT           := Color(0.90, 0.90, 0.90, 1.0)
 const COLOR_DIM            := Color(0.45, 0.45, 0.55, 1.0)
 const COLOR_VALUE          := Color(0.30, 0.60, 0.90, 1.0)
 const COLOR_PROMPT         := Color(0.70, 0.80, 1.00, 1.0)
-const COLOR_MODE_ACTIVE    := Color(0.30, 0.60, 0.90, 1.0)
-const COLOR_MODE_INACTIVE  := Color(0.25, 0.25, 0.35, 1.0)
-const COLOR_ONLINE_LABEL   := Color(0.60, 0.85, 1.00, 1.0)
+const COLOR_ACCENT         := Color(0.60, 0.85, 1.00, 1.0)
+const COLOR_ROW_SELECTED   := Color(0.15, 0.25, 0.45, 1.0)
+const COLOR_HOST_TAG       := Color(0.90, 0.70, 0.20, 1.0)
 
-# ---- State ----------------------------------------------------------------
-var _total_players:   int = 4
-var _human_count:     int = 1
-var _bot_difficulty:  int = 0
-var _lives_per_round: int = 3
-var _rounds_to_win:   int = 3
+# ---------------------------------------------------------------------------
+# Persistent state (survives _rebuild_ui)
+# ---------------------------------------------------------------------------
 
-var _focused_row:  int   = 0
-var _value_labels: Array = []   # Label nodes, one per row
-var _row_panels:   Array = []   # Panel nodes, one per row
+var _screen: String = "username"
 
-# Mode: 0 = LOCAL, 1 = ONLINE
-var _mode: int = 0
+# Username screen
+var _typed_username: String = ""
+var _cursor_timer: float = 0.0
+var _cursor_blink: bool = true
 
-# Online sub-screen: "select" | "url" | "host_wait" | "join_code"
-var _online_screen: String = "select"
+# Browser screen
+var _browser_rooms: Array = []
+var _browser_selected: int = 0
+var _browser_loading: bool = false
+var _browser_refresh_timer: float = 0.0
 
-# Local copy of signaling URL (user may edit it)
-var _signaling_url: String = "wss://dartrope-signaling.onrender.com"
+# Waiting screen (host settings)
+var _wait_settings_focus: int = 0   # 0 = max_players row, 1 = bot_difficulty row
+var _lives_value: int = 3
+var _rounds_value: int = 3
 
-# Room code being typed by user (join screen)
-var _join_code: String = ""
+# Error/transition timer
+var _error_timer: float = 0.0
+var _error_message: String = ""
 
-# Expected peer count when host starts
-var _connected_peers: int = 1
+# ---------------------------------------------------------------------------
+# Live-update label references (set during _rebuild_ui, nulled before rebuild)
+# ---------------------------------------------------------------------------
+var _username_input_lbl: Label = null      # username screen input display
 
-# ---- Node references set during build ------------------------------------
-var _mode_btn_local:  Label = null
-var _mode_btn_online: Label = null
-var _settings_panel:  Panel = null
-var _online_panel:    Panel = null
-var _prompt_label:    Label = null
+var _browser_status_lbl: Label = null      # "Loading..." or ""
+var _browser_rooms_vbox: VBoxContainer = null
 
-# Online sub-panel labels updated at runtime
-var _online_title_lbl:    Label = null
-var _online_body_lbl:     Label = null
-var _online_url_lbl:      Label = null   # URL display row (select screen)
-var _online_bottom_lbl:   Label = null
+var _wait_players_vbox: VBoxContainer = null
+var _wait_settings_max_lbl: Label = null
+var _wait_settings_diff_lbl: Label = null
+var _wait_code_lbl: Label = null
+var _wait_prompt_lbl: Label = null
+var _wait_error_lbl: Label = null
 
 
 func _ready() -> void:
 	set_anchors_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
-	# Seed from GameManager defaults so re-entering the lobby keeps last values
-	_total_players   = GameManager.total_players
-	_human_count     = GameManager.human_count
-	_bot_difficulty  = GameManager.bot_difficulty
-	_lives_per_round = GameManager.lives_per_round
-	_rounds_to_win   = GameManager.rounds_to_win
-	_build_ui()
-	# Connect NetworkManager signals
-	if not NetworkManager.connected_to_room.is_connected(_on_connected_to_room):
-		NetworkManager.connected_to_room.connect(_on_connected_to_room)
-	if not NetworkManager.guest_joined.is_connected(_on_guest_joined):
-		NetworkManager.guest_joined.connect(_on_guest_joined)
-	if not NetworkManager.connection_failed.is_connected(_on_connection_failed):
-		NetworkManager.connection_failed.connect(_on_connection_failed)
-	if not NetworkManager.peer_disconnected.is_connected(_on_peer_disconnected):
-		NetworkManager.peer_disconnected.connect(_on_peer_disconnected)
+
+	# Connect NetworkManager signals once; callbacks check _screen
+	NetworkManager.rooms_fetched.connect(_on_rooms_fetched)
+	NetworkManager.connected_to_room.connect(_on_connected_to_room)
+	NetworkManager.player_list_updated.connect(_on_player_list_updated)
+	NetworkManager.settings_updated.connect(_on_settings_updated)
+	NetworkManager.game_starting.connect(_on_game_starting)
+	NetworkManager.host_disconnected.connect(_on_host_disconnected)
+	NetworkManager.peer_disconnected.connect(_on_peer_disconnected)
+	NetworkManager.connection_failed.connect(_on_connection_failed)
+
+	if UsernameManager.has_username():
+		_set_screen("browser")
+	else:
+		_set_screen("username")
 
 
-func _build_ui() -> void:
-	# --- Background ---
+func _exit_tree() -> void:
+	if NetworkManager.rooms_fetched.is_connected(_on_rooms_fetched):
+		NetworkManager.rooms_fetched.disconnect(_on_rooms_fetched)
+	if NetworkManager.connected_to_room.is_connected(_on_connected_to_room):
+		NetworkManager.connected_to_room.disconnect(_on_connected_to_room)
+	if NetworkManager.player_list_updated.is_connected(_on_player_list_updated):
+		NetworkManager.player_list_updated.disconnect(_on_player_list_updated)
+	if NetworkManager.settings_updated.is_connected(_on_settings_updated):
+		NetworkManager.settings_updated.disconnect(_on_settings_updated)
+	if NetworkManager.game_starting.is_connected(_on_game_starting):
+		NetworkManager.game_starting.disconnect(_on_game_starting)
+	if NetworkManager.host_disconnected.is_connected(_on_host_disconnected):
+		NetworkManager.host_disconnected.disconnect(_on_host_disconnected)
+	if NetworkManager.peer_disconnected.is_connected(_on_peer_disconnected):
+		NetworkManager.peer_disconnected.disconnect(_on_peer_disconnected)
+	if NetworkManager.connection_failed.is_connected(_on_connection_failed):
+		NetworkManager.connection_failed.disconnect(_on_connection_failed)
+
+
+# ---------------------------------------------------------------------------
+# Screen management
+# ---------------------------------------------------------------------------
+
+func _set_screen(screen_name: String) -> void:
+	_screen = screen_name
+	_rebuild_ui()
+
+
+func _rebuild_ui() -> void:
+	# Null out all live-update refs before freeing children
+	_username_input_lbl = null
+	_browser_status_lbl = null
+	_browser_rooms_vbox = null
+	_wait_players_vbox = null
+	_wait_settings_max_lbl = null
+	_wait_settings_diff_lbl = null
+	_wait_code_lbl = null
+	_wait_prompt_lbl = null
+	_wait_error_lbl = null
+
+	for child in get_children():
+		child.queue_free()
+
+	# Background
 	var bg := ColorRect.new()
 	bg.color = COLOR_BG
 	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
 	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(bg)
 
-	# --- Title ---
-	var title := Label.new()
-	title.text = "DARTROPE ARENA"
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.add_theme_font_size_override("font_size", 64)
-	title.add_theme_color_override("font_color", COLOR_TITLE)
-	title.add_theme_color_override("font_shadow_color", Color(0.0, 0.15, 0.5, 0.75))
-	title.add_theme_constant_override("shadow_offset_x", 3)
-	title.add_theme_constant_override("shadow_offset_y", 3)
-	title.set_anchor(SIDE_LEFT,  0.0)
-	title.set_anchor(SIDE_RIGHT, 1.0)
-	title.offset_top    = 44
-	title.offset_bottom = 124
-	add_child(title)
-
-	# --- Subtitle ---
-	var subtitle := Label.new()
-	subtitle.text = "MATCH SETUP"
-	subtitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	subtitle.add_theme_font_size_override("font_size", 20)
-	subtitle.add_theme_color_override("font_color", COLOR_DIM)
-	subtitle.set_anchor(SIDE_LEFT,  0.0)
-	subtitle.set_anchor(SIDE_RIGHT, 1.0)
-	subtitle.offset_top    = 122
-	subtitle.offset_bottom = 152
-	add_child(subtitle)
-
-	# --- Mode selector row [ LOCAL ] [ ONLINE ] ---
-	_build_mode_selector()
-
-	# --- Settings panel (local mode) ---
-	_build_settings_panel()
-
-	# --- Online panel (online mode, hidden initially) ---
-	_build_online_panel()
-
-	# --- Start prompt ---
-	_prompt_label = Label.new()
-	_prompt_label.text = "PRESS ENTER / A TO START"
-	_prompt_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_prompt_label.add_theme_font_size_override("font_size", 22)
-	_prompt_label.add_theme_color_override("font_color", COLOR_PROMPT)
-	_prompt_label.set_anchor(SIDE_LEFT,   0.0)
-	_prompt_label.set_anchor(SIDE_RIGHT,  1.0)
-	_prompt_label.set_anchor(SIDE_TOP,    1.0)
-	_prompt_label.set_anchor(SIDE_BOTTOM, 1.0)
-	_prompt_label.offset_top    = -68
-	_prompt_label.offset_bottom = -30
-	add_child(_prompt_label)
-
-	_refresh_all_rows()
-	_refresh_mode_ui()
+	match _screen:
+		"username":
+			_build_username_screen()
+		"browser":
+			_build_browser_screen()
+		"waiting":
+			_build_waiting_screen()
 
 
-func _build_mode_selector() -> void:
-	# A small centered HBox with [ LOCAL ] and [ ONLINE ] labels
-	var hbox := HBoxContainer.new()
-	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	hbox.add_theme_constant_override("separation", 24)
-	hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hbox.set_anchor(SIDE_LEFT,   0.0)
-	hbox.set_anchor(SIDE_RIGHT,  1.0)
-	hbox.offset_top    = 156
-	hbox.offset_bottom = 196
-	add_child(hbox)
+# ---------------------------------------------------------------------------
+# _process — timers for cursor, auto-refresh, error delay
+# ---------------------------------------------------------------------------
 
-	_mode_btn_local = _make_mode_btn("[ LOCAL ]")
-	_mode_btn_online = _make_mode_btn("[ ONLINE ]")
-	hbox.add_child(_mode_btn_local)
-	hbox.add_child(_mode_btn_online)
+func _process(delta: float) -> void:
+	match _screen:
+		"username":
+			_cursor_timer += delta
+			if _cursor_timer >= 0.5:
+				_cursor_timer = 0.0
+				_cursor_blink = not _cursor_blink
+				_update_username_cursor()
+		"browser":
+			if not _browser_loading:
+				_browser_refresh_timer += delta
+				if _browser_refresh_timer >= 5.0:
+					_browser_refresh_timer = 0.0
+					_do_fetch_rooms()
+		"waiting":
+			if _error_timer > 0.0:
+				_error_timer -= delta
+				if _error_timer <= 0.0:
+					_error_message = ""
+					_set_screen("browser")
 
 
-func _make_mode_btn(text: String) -> Label:
+# ===========================================================================
+# SCREEN 1: USERNAME
+# ===========================================================================
+
+func _build_username_screen() -> void:
+	_add_title("DARTROPE ARENA", 64)
+	_add_subtitle("Enter your username", 20)
+
+	const PANEL_W: int = 520
+	const PANEL_H: int = 180
+
+	var panel := _make_panel(PANEL_W, PANEL_H, 0)
+	add_child(panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vbox.offset_left = 32
+	vbox.offset_top = 24
+	vbox.offset_right = -32
+	vbox.offset_bottom = -24
+	vbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	vbox.add_theme_constant_override("separation", 16)
+	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(vbox)
+
+	var hint := Label.new()
+	hint.text = "A-Z  0-9  _   Backspace to delete   Enter to confirm"
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.add_theme_font_size_override("font_size", 15)
+	hint.add_theme_color_override("font_color", COLOR_DIM)
+	vbox.add_child(hint)
+
+	_username_input_lbl = Label.new()
+	_username_input_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_username_input_lbl.add_theme_font_size_override("font_size", 36)
+	_username_input_lbl.add_theme_color_override("font_color", COLOR_VALUE)
+	vbox.add_child(_username_input_lbl)
+
+	var min_hint := Label.new()
+	min_hint.text = "2 – 16 characters"
+	min_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	min_hint.add_theme_font_size_override("font_size", 14)
+	min_hint.add_theme_color_override("font_color", COLOR_DIM)
+	vbox.add_child(min_hint)
+
+	_update_username_cursor()
+
+
+func _update_username_cursor() -> void:
+	if _username_input_lbl == null:
+		return
+	var cursor: String = "_" if _cursor_blink else " "
+	_username_input_lbl.text = "> " + _typed_username + cursor
+
+
+# ===========================================================================
+# SCREEN 2: BROWSER
+# ===========================================================================
+
+func _build_browser_screen() -> void:
+	_add_title("DARTROPE ARENA", 64)
+	_add_subtitle("Welcome,  " + UsernameManager.username, 20)
+
+	const PANEL_W: int = 720
+	const PANEL_H: int = 440
+
+	var panel := _make_panel(PANEL_W, PANEL_H, 0)
+	add_child(panel)
+
+	var root_vbox := VBoxContainer.new()
+	root_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root_vbox.offset_left = 0
+	root_vbox.offset_top = 0
+	root_vbox.offset_right = 0
+	root_vbox.offset_bottom = 0
+	root_vbox.add_theme_constant_override("separation", 0)
+	root_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(root_vbox)
+
+	# Header row
+	var header := _make_browser_row_label("  ROOM CODE        HOST              PLAYERS     DIFFICULTY", false)
+	header.add_theme_color_override("font_color", COLOR_DIM)
+	header.add_theme_font_size_override("font_size", 15)
+	header.custom_minimum_size = Vector2(0, 36)
+	root_vbox.add_child(header)
+
+	# Separator
+	var sep := HSeparator.new()
+	sep.add_theme_color_override("color", COLOR_PANEL_BORDER)
+	sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(sep)
+
+	# Status label (loading / empty)
+	_browser_status_lbl = Label.new()
+	_browser_status_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_browser_status_lbl.add_theme_font_size_override("font_size", 20)
+	_browser_status_lbl.add_theme_color_override("font_color", COLOR_DIM)
+	_browser_status_lbl.custom_minimum_size = Vector2(0, 40)
+	_browser_status_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(_browser_status_lbl)
+
+	# Scrollable rooms list
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(scroll)
+
+	_browser_rooms_vbox = VBoxContainer.new()
+	_browser_rooms_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_browser_rooms_vbox.add_theme_constant_override("separation", 2)
+	_browser_rooms_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_browser_rooms_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(_browser_rooms_vbox)
+
+	# Bottom actions bar
+	var bottom := _make_browser_row_label("[R] Refresh     [N] New Game     [Enter/A] Join Selected", false)
+	bottom.add_theme_color_override("font_color", COLOR_PROMPT)
+	bottom.add_theme_font_size_override("font_size", 16)
+	bottom.custom_minimum_size = Vector2(0, 44)
+	root_vbox.add_child(bottom)
+
+	# Trigger initial fetch
+	_browser_loading = true
+	_browser_status_lbl.text = "Loading..."
+	_browser_refresh_timer = 0.0
+	NetworkManager.fetch_rooms()
+
+	_refresh_browser_list()
+
+
+func _make_browser_row_label(text: String, _centered: bool) -> Label:
 	var lbl := Label.new()
 	lbl.text = text
-	lbl.add_theme_font_size_override("font_size", 22)
-	lbl.add_theme_color_override("font_color", COLOR_MODE_INACTIVE)
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	lbl.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	lbl.add_theme_font_size_override("font_size", 18)
+	lbl.add_theme_color_override("font_color", COLOR_TEXT)
 	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	return lbl
 
 
-func _build_settings_panel() -> void:
-	const ROW_H:     int = 64
-	const PANEL_W:   int = 620
-	const PANEL_PAD: int = 10
-	var panel_h: int = ROW_DEFS.size() * ROW_H + PANEL_PAD * 2
+func _refresh_browser_list() -> void:
+	if _browser_rooms_vbox == null:
+		return
+	for child in _browser_rooms_vbox.get_children():
+		child.queue_free()
 
-	_settings_panel = Panel.new()
-	var panel_style := StyleBoxFlat.new()
-	panel_style.bg_color      = COLOR_PANEL_BG
-	panel_style.border_color  = COLOR_PANEL_BORDER
-	panel_style.border_width_left   = 2
-	panel_style.border_width_right  = 2
-	panel_style.border_width_top    = 2
-	panel_style.border_width_bottom = 2
-	panel_style.corner_radius_top_left     = 10
-	panel_style.corner_radius_top_right    = 10
-	panel_style.corner_radius_bottom_left  = 10
-	panel_style.corner_radius_bottom_right = 10
-	_settings_panel.add_theme_stylebox_override("panel", panel_style)
-	_settings_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_settings_panel.set_anchor(SIDE_LEFT,   0.5)
-	_settings_panel.set_anchor(SIDE_RIGHT,  0.5)
-	_settings_panel.set_anchor(SIDE_TOP,    0.5)
-	_settings_panel.set_anchor(SIDE_BOTTOM, 0.5)
-	_settings_panel.offset_left   = -PANEL_W / 2.0
-	_settings_panel.offset_right  =  PANEL_W / 2.0
-	_settings_panel.offset_top    = -panel_h / 2.0 + 24
-	_settings_panel.offset_bottom =  panel_h / 2.0 + 24
-	add_child(_settings_panel)
+	if _browser_loading:
+		return
 
-	var rows_vbox := VBoxContainer.new()
-	rows_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
-	rows_vbox.offset_left   = PANEL_PAD
-	rows_vbox.offset_top    = PANEL_PAD
-	rows_vbox.offset_right  = -PANEL_PAD
-	rows_vbox.offset_bottom = -PANEL_PAD
-	rows_vbox.add_theme_constant_override("separation", 0)
-	rows_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_settings_panel.add_child(rows_vbox)
+	if _browser_rooms.is_empty():
+		if _browser_status_lbl != null:
+			_browser_status_lbl.text = "No open games.  Create one!"
+		return
 
-	for i in ROW_DEFS.size():
-		var row_panel := Panel.new()
-		row_panel.custom_minimum_size = Vector2(0, ROW_H)
-		row_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		rows_vbox.add_child(row_panel)
-		_row_panels.append(row_panel)
+	if _browser_status_lbl != null:
+		_browser_status_lbl.text = ""
 
-		var row_hbox := HBoxContainer.new()
-		row_hbox.set_anchors_preset(Control.PRESET_FULL_RECT)
-		row_hbox.offset_left   = 20
-		row_hbox.offset_top    = 0
-		row_hbox.offset_right  = -20
-		row_hbox.offset_bottom = 0
-		row_hbox.alignment = BoxContainer.ALIGNMENT_CENTER
-		row_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		row_panel.add_child(row_hbox)
+	# Clamp selection
+	_browser_selected = clampi(_browser_selected, 0, _browser_rooms.size() - 1)
 
-		var def: Array = ROW_DEFS[i]
-		var name_lbl := Label.new()
-		name_lbl.text = def[1]
-		name_lbl.add_theme_font_size_override("font_size", 20)
-		name_lbl.add_theme_color_override("font_color", COLOR_TEXT)
-		name_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		name_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		row_hbox.add_child(name_lbl)
+	for i: int in _browser_rooms.size():
+		var room: Dictionary = _browser_rooms[i]
+		var code: String = str(room.get("code", "??????"))
+		var host_name: String = str(room.get("host", "???"))
+		var pc: int = int(room.get("player_count", 1))
+		var mp: int = int(room.get("max_players", 4))
+		var diff: int = int(room.get("bot_difficulty", 0))
+		var diff_str: String = DIFFICULTY_LABELS[clampi(diff, 0, 2)]
 
+		var row := Panel.new()
+		row.custom_minimum_size = Vector2(0, 44)
+		row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var row_style := StyleBoxFlat.new()
+		row_style.bg_color = COLOR_ROW_SELECTED if i == _browser_selected else COLOR_ROW_NORMAL
+		row_style.corner_radius_top_left = 4
+		row_style.corner_radius_top_right = 4
+		row_style.corner_radius_bottom_left = 4
+		row_style.corner_radius_bottom_right = 4
+		row.add_theme_stylebox_override("panel", row_style)
+		_browser_rooms_vbox.add_child(row)
+
+		var lbl := Label.new()
+		lbl.text = "  %-10s   %-18s   %d / %-4d   %s" % [code, host_name.left(16), pc, mp, diff_str]
+		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		lbl.add_theme_font_size_override("font_size", 18)
+		lbl.add_theme_color_override("font_color", COLOR_ACCENT if i == _browser_selected else COLOR_TEXT)
+		lbl.set_anchors_preset(Control.PRESET_FULL_RECT)
+		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		row.add_child(lbl)
+
+
+func _do_fetch_rooms() -> void:
+	_browser_loading = true
+	if _browser_status_lbl != null:
+		_browser_status_lbl.text = "Loading..."
+	if _browser_rooms_vbox != null:
+		for child in _browser_rooms_vbox.get_children():
+			child.queue_free()
+	NetworkManager.fetch_rooms()
+
+
+# ===========================================================================
+# SCREEN 3: WAITING LOBBY
+# ===========================================================================
+
+func _build_waiting_screen() -> void:
+	_add_title("DARTROPE ARENA", 56)
+
+	const PANEL_W: int = 680
+	const PANEL_H: int = 520
+
+	var panel := _make_panel(PANEL_W, PANEL_H, 20)
+	add_child(panel)
+
+	var root_vbox := VBoxContainer.new()
+	root_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root_vbox.offset_left = 28
+	root_vbox.offset_top = 20
+	root_vbox.offset_right = -28
+	root_vbox.offset_bottom = -20
+	root_vbox.add_theme_constant_override("separation", 14)
+	root_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(root_vbox)
+
+	# Room code row
+	var code_hbox := HBoxContainer.new()
+	code_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(code_hbox)
+
+	_wait_code_lbl = Label.new()
+	_wait_code_lbl.text = "Room: " + NetworkManager.room_code
+	_wait_code_lbl.add_theme_font_size_override("font_size", 22)
+	_wait_code_lbl.add_theme_color_override("font_color", COLOR_ACCENT)
+	_wait_code_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_wait_code_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	code_hbox.add_child(_wait_code_lbl)
+
+	var copy_hint := Label.new()
+	copy_hint.text = "[share this code]"
+	copy_hint.add_theme_font_size_override("font_size", 14)
+	copy_hint.add_theme_color_override("font_color", COLOR_DIM)
+	copy_hint.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	copy_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	code_hbox.add_child(copy_hint)
+
+	# Players section
+	var player_count: int = NetworkManager.room_settings.get("max_players", 4)
+	var players_header := Label.new()
+	players_header.text = "PLAYERS  (%d / %d)" % [NetworkManager.room_players.size(), player_count]
+	players_header.add_theme_font_size_override("font_size", 16)
+	players_header.add_theme_color_override("font_color", COLOR_DIM)
+	players_header.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(players_header)
+
+	_wait_players_vbox = VBoxContainer.new()
+	_wait_players_vbox.add_theme_constant_override("separation", 4)
+	_wait_players_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(_wait_players_vbox)
+	_rebuild_player_list()
+
+	# Separator
+	var sep := HSeparator.new()
+	sep.add_theme_color_override("color", COLOR_PANEL_BORDER)
+	sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(sep)
+
+	# Settings section
+	var settings_header := Label.new()
+	settings_header.text = "SETTINGS" + ("" if NetworkManager.is_host else "  (host controls)")
+	settings_header.add_theme_font_size_override("font_size", 16)
+	settings_header.add_theme_color_override("font_color", COLOR_DIM)
+	settings_header.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(settings_header)
+
+	_build_settings_rows(root_vbox)
+
+	# Separator
+	var sep2 := HSeparator.new()
+	sep2.add_theme_color_override("color", COLOR_PANEL_BORDER)
+	sep2.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(sep2)
+
+	# Prompt / action hint
+	_wait_prompt_lbl = Label.new()
+	_wait_prompt_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_wait_prompt_lbl.add_theme_font_size_override("font_size", 19)
+	_wait_prompt_lbl.add_theme_color_override("font_color", COLOR_PROMPT)
+	_wait_prompt_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(_wait_prompt_lbl)
+
+	_wait_error_lbl = Label.new()
+	_wait_error_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_wait_error_lbl.add_theme_font_size_override("font_size", 17)
+	_wait_error_lbl.add_theme_color_override("font_color", Color(0.9, 0.3, 0.3, 1.0))
+	_wait_error_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(_wait_error_lbl)
+
+	if _error_message != "":
+		_wait_error_lbl.text = _error_message
+
+	var leave_lbl := Label.new()
+	leave_lbl.text = "[Esc / B] Leave room"
+	leave_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	leave_lbl.add_theme_font_size_override("font_size", 15)
+	leave_lbl.add_theme_color_override("font_color", COLOR_DIM)
+	leave_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(leave_lbl)
+
+	_update_wait_prompt()
+
+
+func _build_settings_rows(parent: VBoxContainer) -> void:
+	var is_host: bool = NetworkManager.is_host
+	var max_p: int = NetworkManager.room_settings.get("max_players", 4)
+	var diff: int = NetworkManager.room_settings.get("bot_difficulty", 0)
+
+	# Row 0: max_players
+	var row0 := _make_settings_row(
+		"Total Players",
+		str(max_p),
+		_wait_settings_focus == 0 and is_host
+	)
+	_wait_settings_max_lbl = row0.get_node_or_null("ValueLabel")
+	parent.add_child(row0)
+
+	# Row 1: bot_difficulty
+	var row1 := _make_settings_row(
+		"Bot Difficulty",
+		DIFFICULTY_LABELS[clampi(diff, 0, 2)],
+		_wait_settings_focus == 1 and is_host
+	)
+	_wait_settings_diff_lbl = row1.get_node_or_null("ValueLabel")
+	parent.add_child(row1)
+
+
+func _make_settings_row(label_text: String, value_text: String, focused: bool) -> Panel:
+	var row := Panel.new()
+	row.custom_minimum_size = Vector2(0, 48)
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var style := StyleBoxFlat.new()
+	style.bg_color = COLOR_ROW_FOCUSED if focused else COLOR_ROW_NORMAL
+	style.border_color = COLOR_BORDER_FOCUSED if focused else COLOR_BORDER_NORMAL
+	style.border_width_left = 2
+	style.border_width_right = 2
+	style.border_width_top = 1
+	style.border_width_bottom = 1
+	style.corner_radius_top_left = 4
+	style.corner_radius_top_right = 4
+	style.corner_radius_bottom_left = 4
+	style.corner_radius_bottom_right = 4
+	row.add_theme_stylebox_override("panel", style)
+
+	var hbox := HBoxContainer.new()
+	hbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	hbox.offset_left = 16
+	hbox.offset_top = 0
+	hbox.offset_right = -16
+	hbox.offset_bottom = 0
+	hbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(hbox)
+
+	var name_lbl := Label.new()
+	name_lbl.text = label_text
+	name_lbl.add_theme_font_size_override("font_size", 18)
+	name_lbl.add_theme_color_override("font_color", COLOR_TEXT)
+	name_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	name_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	name_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hbox.add_child(name_lbl)
+
+	if NetworkManager.is_host:
 		var arrow_l := Label.new()
 		arrow_l.text = "◀"
-		arrow_l.add_theme_font_size_override("font_size", 20)
-		arrow_l.add_theme_color_override("font_color", COLOR_DIM)
+		arrow_l.add_theme_font_size_override("font_size", 18)
+		arrow_l.add_theme_color_override("font_color", COLOR_DIM if not focused else COLOR_VALUE)
 		arrow_l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		row_hbox.add_child(arrow_l)
+		arrow_l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		hbox.add_child(arrow_l)
 
-		var val_lbl := Label.new()
-		val_lbl.custom_minimum_size = Vector2(160, 0)
-		val_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		val_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		val_lbl.add_theme_font_size_override("font_size", 24)
-		val_lbl.add_theme_color_override("font_color", COLOR_VALUE)
-		row_hbox.add_child(val_lbl)
-		_value_labels.append(val_lbl)
+	var val_lbl := Label.new()
+	val_lbl.name = "ValueLabel"
+	val_lbl.text = value_text
+	val_lbl.custom_minimum_size = Vector2(120, 0)
+	val_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	val_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	val_lbl.add_theme_font_size_override("font_size", 22)
+	val_lbl.add_theme_color_override("font_color", COLOR_VALUE)
+	val_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hbox.add_child(val_lbl)
 
+	if NetworkManager.is_host:
 		var arrow_r := Label.new()
 		arrow_r.text = "▶"
-		arrow_r.add_theme_font_size_override("font_size", 20)
-		arrow_r.add_theme_color_override("font_color", COLOR_DIM)
+		arrow_r.add_theme_font_size_override("font_size", 18)
+		arrow_r.add_theme_color_override("font_color", COLOR_DIM if not focused else COLOR_VALUE)
 		arrow_r.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		row_hbox.add_child(arrow_r)
+		arrow_r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		hbox.add_child(arrow_r)
+
+	return row
 
 
-func _build_online_panel() -> void:
-	const PANEL_W: int = 620
-	_online_panel = Panel.new()
+func _rebuild_player_list() -> void:
+	if _wait_players_vbox == null:
+		return
+	for child in _wait_players_vbox.get_children():
+		child.queue_free()
+
+	var max_p: int = NetworkManager.room_settings.get("max_players", 4)
+	var players: Array = NetworkManager.room_players
+
+	for i: int in max_p:
+		var slot := Label.new()
+		slot.add_theme_font_size_override("font_size", 18)
+		slot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		if i < players.size():
+			var pd: Dictionary = players[i]
+			var uname: String = str(pd.get("username", "Player"))
+			var pid: int = int(pd.get("peer_id", i + 1))
+			var is_host_player: bool = pid == 1
+			slot.text = ("► " if i == 0 else "  ") + uname + (" (Host)" if is_host_player else "")
+			slot.add_theme_color_override("font_color", COLOR_HOST_TAG if is_host_player else COLOR_TEXT)
+		else:
+			slot.text = "  [waiting...]"
+			slot.add_theme_color_override("font_color", COLOR_DIM)
+		_wait_players_vbox.add_child(slot)
+
+
+func _update_wait_prompt() -> void:
+	if _wait_prompt_lbl == null:
+		return
+	if NetworkManager.is_host:
+		_wait_prompt_lbl.text = "Enter / A  =  START GAME     Up/Down  =  navigate settings"
+	else:
+		_wait_prompt_lbl.text = "Waiting for host to start the game..."
+
+
+# ===========================================================================
+# Shared UI helpers
+# ===========================================================================
+
+func _add_title(text: String, font_size: int) -> void:
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl.add_theme_font_size_override("font_size", font_size)
+	lbl.add_theme_color_override("font_color", COLOR_TITLE)
+	lbl.add_theme_color_override("font_shadow_color", Color(0.0, 0.15, 0.5, 0.75))
+	lbl.add_theme_constant_override("shadow_offset_x", 3)
+	lbl.add_theme_constant_override("shadow_offset_y", 3)
+	lbl.set_anchor(SIDE_LEFT, 0.0)
+	lbl.set_anchor(SIDE_RIGHT, 1.0)
+	lbl.offset_top = 36
+	lbl.offset_bottom = 36 + font_size + 20
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(lbl)
+
+
+func _add_subtitle(text: String, font_size: int) -> void:
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl.add_theme_font_size_override("font_size", font_size)
+	lbl.add_theme_color_override("font_color", COLOR_DIM)
+	lbl.set_anchor(SIDE_LEFT, 0.0)
+	lbl.set_anchor(SIDE_RIGHT, 1.0)
+	lbl.offset_top = 120
+	lbl.offset_bottom = 150
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(lbl)
+
+
+func _make_panel(w: int, h: int, v_offset: int) -> Panel:
+	var panel := Panel.new()
 	var style := StyleBoxFlat.new()
-	style.bg_color      = COLOR_PANEL_BG
-	style.border_color  = COLOR_PANEL_BORDER
-	style.border_width_left   = 2
-	style.border_width_right  = 2
-	style.border_width_top    = 2
+	style.bg_color = COLOR_PANEL_BG
+	style.border_color = COLOR_PANEL_BORDER
+	style.border_width_left = 2
+	style.border_width_right = 2
+	style.border_width_top = 2
 	style.border_width_bottom = 2
-	style.corner_radius_top_left     = 10
-	style.corner_radius_top_right    = 10
-	style.corner_radius_bottom_left  = 10
+	style.corner_radius_top_left = 10
+	style.corner_radius_top_right = 10
+	style.corner_radius_bottom_left = 10
 	style.corner_radius_bottom_right = 10
-	_online_panel.add_theme_stylebox_override("panel", style)
-	_online_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_online_panel.set_anchor(SIDE_LEFT,   0.5)
-	_online_panel.set_anchor(SIDE_RIGHT,  0.5)
-	_online_panel.set_anchor(SIDE_TOP,    0.5)
-	_online_panel.set_anchor(SIDE_BOTTOM, 0.5)
-	_online_panel.offset_left   = -PANEL_W / 2.0
-	_online_panel.offset_right  =  PANEL_W / 2.0
-	_online_panel.offset_top    = -160 + 24
-	_online_panel.offset_bottom =  160 + 24
-	_online_panel.visible = false
-	add_child(_online_panel)
-
-	var vbox := VBoxContainer.new()
-	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
-	vbox.offset_left   = 24
-	vbox.offset_top    = 20
-	vbox.offset_right  = -24
-	vbox.offset_bottom = -20
-	vbox.add_theme_constant_override("separation", 14)
-	vbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_online_panel.add_child(vbox)
-
-	_online_title_lbl = Label.new()
-	_online_title_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_online_title_lbl.add_theme_font_size_override("font_size", 26)
-	_online_title_lbl.add_theme_color_override("font_color", COLOR_ONLINE_LABEL)
-	vbox.add_child(_online_title_lbl)
-
-	_online_url_lbl = Label.new()
-	_online_url_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_online_url_lbl.add_theme_font_size_override("font_size", 15)
-	_online_url_lbl.add_theme_color_override("font_color", COLOR_DIM)
-	_online_url_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	vbox.add_child(_online_url_lbl)
-
-	_online_body_lbl = Label.new()
-	_online_body_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_online_body_lbl.add_theme_font_size_override("font_size", 22)
-	_online_body_lbl.add_theme_color_override("font_color", COLOR_TEXT)
-	_online_body_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	vbox.add_child(_online_body_lbl)
-
-	_online_bottom_lbl = Label.new()
-	_online_bottom_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_online_bottom_lbl.add_theme_font_size_override("font_size", 18)
-	_online_bottom_lbl.add_theme_color_override("font_color", COLOR_DIM)
-	vbox.add_child(_online_bottom_lbl)
+	panel.add_theme_stylebox_override("panel", style)
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.set_anchor(SIDE_LEFT, 0.5)
+	panel.set_anchor(SIDE_RIGHT, 0.5)
+	panel.set_anchor(SIDE_TOP, 0.5)
+	panel.set_anchor(SIDE_BOTTOM, 0.5)
+	panel.offset_left = -w / 2.0
+	panel.offset_right = w / 2.0
+	panel.offset_top = -h / 2.0 + v_offset
+	panel.offset_bottom = h / 2.0 + v_offset
+	return panel
 
 
-# ---------------------------------------------------------------------------
-# Value accessors
-# ---------------------------------------------------------------------------
-
-func _get_value(key: String) -> int:
-	match key:
-		"total_players":   return _total_players
-		"human_count":     return _human_count
-		"bot_difficulty":  return _bot_difficulty
-		"lives_per_round": return _lives_per_round
-		"rounds_to_win":   return _rounds_to_win
-	return 0
-
-
-func _set_value(key: String, v: int) -> void:
-	match key:
-		"total_players":
-			_total_players = v
-			_human_count = mini(_human_count, _total_players)
-		"human_count":
-			_human_count = v
-		"bot_difficulty":
-			_bot_difficulty = v
-		"lives_per_round":
-			_lives_per_round = v
-		"rounds_to_win":
-			_rounds_to_win = v
-
-
-func _value_display(key: String, v: int) -> String:
-	if key == "bot_difficulty":
-		return DIFFICULTY_LABELS[v] as String
-	return str(v)
-
-
-# ---------------------------------------------------------------------------
-# Row display
-# ---------------------------------------------------------------------------
-
-func _refresh_all_rows() -> void:
-	for i in ROW_DEFS.size():
-		var def: Array   = ROW_DEFS[i]
-		var key: String  = def[0]
-		var lbl: Label   = _value_labels[i]
-		lbl.text = _value_display(key, _get_value(key))
-		_apply_row_style(i)
-
-
-func _apply_row_style(i: int) -> void:
-	var row_panel: Panel = _row_panels[i]
-	var style := StyleBoxFlat.new()
-	if i == _focused_row:
-		style.bg_color     = COLOR_ROW_FOCUSED
-		style.border_color = COLOR_BORDER_FOCUSED
-	else:
-		style.bg_color     = COLOR_ROW_NORMAL
-		style.border_color = COLOR_BORDER_NORMAL
-	style.border_width_left   = 2
-	style.border_width_right  = 2
-	style.border_width_top    = 1
-	style.border_width_bottom = 1
-	style.corner_radius_top_left     = 4
-	style.corner_radius_top_right    = 4
-	style.corner_radius_bottom_left  = 4
-	style.corner_radius_bottom_right = 4
-	row_panel.add_theme_stylebox_override("panel", style)
-
-
-# ---------------------------------------------------------------------------
-# Mode UI refresh
-# ---------------------------------------------------------------------------
-
-func _refresh_mode_ui() -> void:
-	var local_col  := COLOR_MODE_ACTIVE   if _mode == 0 else COLOR_MODE_INACTIVE
-	var online_col := COLOR_MODE_ACTIVE   if _mode == 1 else COLOR_MODE_INACTIVE
-	_mode_btn_local.add_theme_color_override("font_color", local_col)
-	_mode_btn_online.add_theme_color_override("font_color", online_col)
-
-	if _mode == 0:
-		_settings_panel.visible = true
-		_online_panel.visible   = false
-		_prompt_label.text = "PRESS ENTER / A TO START"
-	else:
-		_settings_panel.visible = false
-		_online_panel.visible   = true
-		_refresh_online_ui()
-
-
-func _refresh_online_ui() -> void:
-	match _online_screen:
-		"select":
-			_online_title_lbl.text = "ONLINE MODE"
-			_online_url_lbl.text   = "Server: " + _signaling_url
-			_online_body_lbl.text  = "[ HOST GAME ]     [ JOIN GAME ]"
-			_online_bottom_lbl.text = "Left/Right to choose  |  Enter to confirm"
-			_prompt_label.text = ""
-		"url":
-			_online_title_lbl.text = "SIGNALING SERVER URL"
-			_online_url_lbl.text   = ""
-			_online_body_lbl.text  = _signaling_url
-			_online_bottom_lbl.text = "Type URL, Enter to confirm, Esc to cancel"
-			_prompt_label.text = ""
-		"host_wait":
-			var code_display: String = NetworkManager.room_code if NetworkManager.room_code != "" else "..."
-			_online_title_lbl.text = "WAITING FOR PLAYERS"
-			_online_url_lbl.text   = ""
-			_online_body_lbl.text  = "ROOM CODE:  " + code_display
-			_online_bottom_lbl.text = "%d / %d connected  |  Enter to start" % [_connected_peers, _total_players]
-			_prompt_label.text = "ENTER = start now  |  ESC = cancel"
-		"join_code":
-			var display: String = ""
-			for k: int in 6:
-				if k < _join_code.length():
-					display += _join_code[k] + " "
-				else:
-					display += "_ "
-			_online_title_lbl.text = "ENTER ROOM CODE"
-			_online_url_lbl.text   = ""
-			_online_body_lbl.text  = display.strip_edges()
-			_online_bottom_lbl.text = "Type 6-char code  |  Backspace to delete  |  Enter to join  |  Esc to cancel"
-			_prompt_label.text = ""
-
-# Track which button is focused on the select screen: 0=HOST, 1=JOIN
-var _online_select_focus: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Input
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# INPUT
+# ===========================================================================
 
 func _input(event: InputEvent) -> void:
 	var vp: Viewport = get_viewport()
-
-	if _mode == 0:
-		_input_local(event, vp)
-	else:
-		_input_online(event, vp)
-
-
-func _input_local(event: InputEvent, vp: Viewport) -> void:
-	if event.is_action_pressed("ui_up"):
-		_focused_row = (_focused_row - 1 + ROW_DEFS.size()) % ROW_DEFS.size()
-		_refresh_all_rows()
-		if vp: vp.set_input_as_handled()
-	elif event.is_action_pressed("ui_down"):
-		_focused_row = (_focused_row + 1) % ROW_DEFS.size()
-		_refresh_all_rows()
-		if vp: vp.set_input_as_handled()
-	elif event.is_action_pressed("ui_left"):
-		# On the first row (top), Left switches to ONLINE mode
-		if _focused_row == 0 and false:  # keep simple: Left/Right just change values
-			pass
-		_change_focused_value(-1)
-		if vp: vp.set_input_as_handled()
-	elif event.is_action_pressed("ui_right"):
-		_change_focused_value(1)
-		if vp: vp.set_input_as_handled()
-	elif event.is_action_pressed("ui_accept"):
-		if vp: vp.set_input_as_handled()
-		_start_game_local()
-	# Tab / shoulder button to switch modes
-	elif event is InputEventKey and (event as InputEventKey).pressed:
-		var key_event := event as InputEventKey
-		if key_event.keycode == KEY_TAB:
-			_mode = 1 - _mode
-			_refresh_mode_ui()
-			if vp: vp.set_input_as_handled()
+	match _screen:
+		"username":
+			_input_username(event, vp)
+		"browser":
+			_input_browser(event, vp)
+		"waiting":
+			_input_waiting(event, vp)
 
 
-func _input_online(event: InputEvent, vp: Viewport) -> void:
-	match _online_screen:
-		"select":
-			_input_online_select(event, vp)
-		"url":
-			_input_online_url(event, vp)
-		"host_wait":
-			_input_online_host_wait(event, vp)
-		"join_code":
-			_input_online_join_code(event, vp)
+func _input_username(event: InputEvent, vp: Viewport) -> void:
+	if not event is InputEventKey:
+		return
+	var ke := event as InputEventKey
+	if not ke.pressed:
+		return
 
-
-func _input_online_select(event: InputEvent, vp: Viewport) -> void:
-	if event.is_action_pressed("ui_left"):
-		_online_select_focus = 0
-		_refresh_online_ui()
-		if vp: vp.set_input_as_handled()
-	elif event.is_action_pressed("ui_right"):
-		_online_select_focus = 1
-		_refresh_online_ui()
-		if vp: vp.set_input_as_handled()
-	elif event.is_action_pressed("ui_accept"):
-		if vp: vp.set_input_as_handled()
-		if _online_select_focus == 0:
-			_begin_host()
-		else:
-			_begin_join()
-	elif event is InputEventKey and (event as InputEventKey).pressed:
-		var k := (event as InputEventKey).keycode
-		if k == KEY_TAB:
-			_mode = 0
-			_refresh_mode_ui()
-			if vp: vp.set_input_as_handled()
-		elif k == KEY_ESCAPE:
-			_mode = 0
-			_refresh_mode_ui()
-			if vp: vp.set_input_as_handled()
-		elif k == KEY_U:
-			# 'U' to edit server URL
-			_online_screen = "url"
-			_refresh_online_ui()
-			if vp: vp.set_input_as_handled()
-
-
-func _input_online_url(event: InputEvent, vp: Viewport) -> void:
-	if event is InputEventKey and (event as InputEventKey).pressed:
-		var k := (event as InputEventKey).keycode
-		match k:
-			KEY_ESCAPE:
-				_online_screen = "select"
-				_refresh_online_ui()
+	match ke.keycode:
+		KEY_ENTER, KEY_KP_ENTER:
+			if _typed_username.strip_edges().length() >= 2:
+				UsernameManager.save(_typed_username.strip_edges())
+				_set_screen("browser")
 				if vp: vp.set_input_as_handled()
-			KEY_ENTER, KEY_KP_ENTER:
-				NetworkManager.set_signaling_url(_signaling_url)
-				_online_screen = "select"
-				_refresh_online_ui()
-				if vp: vp.set_input_as_handled()
-			KEY_BACKSPACE:
-				if _signaling_url.length() > 0:
-					_signaling_url = _signaling_url.left(_signaling_url.length() - 1)
-				_refresh_online_ui()
-				if vp: vp.set_input_as_handled()
-			_:
-				var ch: String = (event as InputEventKey).as_text_char()
-				if ch.length() == 1 and ch.unicode_at(0) >= 32:
-					_signaling_url += ch
-					_refresh_online_ui()
+		KEY_BACKSPACE:
+			if _typed_username.length() > 0:
+				_typed_username = _typed_username.left(_typed_username.length() - 1)
+			_update_username_cursor()
+			if vp: vp.set_input_as_handled()
+		_:
+			if _typed_username.length() < 16 and ke.unicode > 0:
+				var ch: String = char(ke.unicode).to_upper()
+				var code: int = ch.unicode_at(0)
+				var valid: bool = (
+					(code >= 65 and code <= 90) or  # A-Z
+					(code >= 48 and code <= 57) or  # 0-9
+					code == 95                       # _
+				)
+				if valid:
+					_typed_username += ch
+					_update_username_cursor()
 					if vp: vp.set_input_as_handled()
 
 
-func _input_online_host_wait(event: InputEvent, vp: Viewport) -> void:
-	if event.is_action_pressed("ui_accept"):
+func _input_browser(event: InputEvent, vp: Viewport) -> void:
+	if event.is_action_pressed("ui_up"):
+		if _browser_rooms.size() > 0:
+			_browser_selected = (_browser_selected - 1 + _browser_rooms.size()) % _browser_rooms.size()
+			_refresh_browser_list()
 		if vp: vp.set_input_as_handled()
-		if _connected_peers >= 2:
-			_start_game_online()
-	elif event is InputEventKey and (event as InputEventKey).keycode == KEY_ESCAPE and (event as InputEventKey).pressed:
+	elif event.is_action_pressed("ui_down"):
+		if _browser_rooms.size() > 0:
+			_browser_selected = (_browser_selected + 1) % _browser_rooms.size()
+			_refresh_browser_list()
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_accept"):
+		_browser_try_join()
+		if vp: vp.set_input_as_handled()
+	elif event is InputEventKey and (event as InputEventKey).pressed:
+		var ke := event as InputEventKey
+		match ke.keycode:
+			KEY_R:
+				_browser_refresh_timer = 0.0
+				_do_fetch_rooms()
+				if vp: vp.set_input_as_handled()
+			KEY_N:
+				_begin_host()
+				if vp: vp.set_input_as_handled()
+	elif event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed:
+		var jb := event as InputEventJoypadButton
+		match jb.button_index:
+			JOY_BUTTON_Y:   # Y = refresh
+				_browser_refresh_timer = 0.0
+				_do_fetch_rooms()
+				if vp: vp.set_input_as_handled()
+			JOY_BUTTON_X:   # X = new game
+				_begin_host()
+				if vp: vp.set_input_as_handled()
+			JOY_BUTTON_A:   # A = join
+				_browser_try_join()
+				if vp: vp.set_input_as_handled()
+
+
+func _input_waiting(event: InputEvent, vp: Viewport) -> void:
+	# Esc / B = leave
+	var is_escape := (event is InputEventKey and (event as InputEventKey).pressed
+			and (event as InputEventKey).keycode == KEY_ESCAPE)
+	var is_b := (event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed
+			and (event as InputEventJoypadButton).button_index == JOY_BUTTON_B)
+	if is_escape or is_b:
 		NetworkManager.disconnect_from_room()
-		_connected_peers = 1
-		_online_screen = "select"
-		_refresh_online_ui()
+		_error_timer = 0.0
+		_error_message = ""
+		_set_screen("browser")
+		if vp: vp.set_input_as_handled()
+		return
+
+	if NetworkManager.is_host:
+		_input_waiting_host(event, vp)
+
+
+func _input_waiting_host(event: InputEvent, vp: Viewport) -> void:
+	if event.is_action_pressed("ui_up"):
+		_wait_settings_focus = (_wait_settings_focus - 1 + 2) % 2
+		_rebuild_settings_only()
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_down"):
+		_wait_settings_focus = (_wait_settings_focus + 1) % 2
+		_rebuild_settings_only()
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_left"):
+		_change_wait_setting(-1)
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_right"):
+		_change_wait_setting(1)
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_accept"):
+		_start_online_game()
 		if vp: vp.set_input_as_handled()
 
 
-func _input_online_join_code(event: InputEvent, vp: Viewport) -> void:
-	if event is InputEventKey and (event as InputEventKey).pressed:
-		var k := (event as InputEventKey).keycode
-		match k:
-			KEY_ESCAPE:
-				_join_code = ""
-				_online_screen = "select"
-				_refresh_online_ui()
-				if vp: vp.set_input_as_handled()
-			KEY_BACKSPACE:
-				if _join_code.length() > 0:
-					_join_code = _join_code.left(_join_code.length() - 1)
-				_refresh_online_ui()
-				if vp: vp.set_input_as_handled()
-			KEY_ENTER, KEY_KP_ENTER:
-				if _join_code.length() == 6:
-					NetworkManager.set_signaling_url(_signaling_url)
-					NetworkManager.join_room(_join_code)
-				if vp: vp.set_input_as_handled()
-			_:
-				if _join_code.length() < 6:
-					var ch: String = (event as InputEventKey).as_text_char().to_upper()
-					if ch.length() == 1:
-						var c: int = ch.unicode_at(0)
-						if (c >= 65 and c <= 90) or (c >= 48 and c <= 57):
-							_join_code += ch
-							_refresh_online_ui()
-				if vp: vp.set_input_as_handled()
+func _change_wait_setting(delta: int) -> void:
+	var max_p: int = NetworkManager.room_settings.get("max_players", 4)
+	var diff: int = NetworkManager.room_settings.get("bot_difficulty", 0)
+	var human_count: int = NetworkManager.room_players.size()
+
+	if _wait_settings_focus == 0:
+		var min_p: int = maxi(2, human_count)
+		max_p = clampi(max_p + delta, min_p, 6)
+		NetworkManager.update_settings(max_p, diff)
+	else:
+		diff = clampi(diff + delta, 0, 2)
+		NetworkManager.update_settings(max_p, diff)
+
+	_rebuild_settings_only()
 
 
-# ---------------------------------------------------------------------------
-# Online flow
-# ---------------------------------------------------------------------------
+func _rebuild_settings_only() -> void:
+	# Find the settings rows container and rebuild just those rows in-place.
+	# Since _make_settings_row nodes are direct children of root_vbox inside the panel,
+	# the cleanest approach for this live-update is a targeted rebuild of the waiting screen.
+	# We only do a full waiting screen rebuild when settings change to keep it simple.
+	_build_waiting_screen_in_place()
+
+
+func _build_waiting_screen_in_place() -> void:
+	# Rather than rebuilding everything, re-trigger the full waiting screen rebuild.
+	# This is called only on host key presses, so it's not per-frame.
+	_rebuild_ui()
+
+
+# ===========================================================================
+# Browser actions
+# ===========================================================================
+
+func _browser_try_join() -> void:
+	if _browser_rooms.is_empty():
+		return
+	if _browser_selected >= _browser_rooms.size():
+		return
+	var room: Dictionary = _browser_rooms[_browser_selected]
+	var code: String = str(room.get("code", ""))
+	if code.length() == 6:
+		NetworkManager.join_room(code)
+
 
 func _begin_host() -> void:
-	_connected_peers = 1
-	NetworkManager.set_signaling_url(_signaling_url)
-	NetworkManager.create_room()
-	_online_screen = "host_wait"
-	_refresh_online_ui()
+	var max_p: int = NetworkManager.room_settings.get("max_players", 4)
+	var diff: int = NetworkManager.room_settings.get("bot_difficulty", 0)
+	NetworkManager.create_room(max_p, diff)
 
 
-func _begin_join() -> void:
-	_join_code = ""
-	_online_screen = "join_code"
-	_refresh_online_ui()
+# ===========================================================================
+# NetworkManager signal callbacks
+# ===========================================================================
+
+func _on_rooms_fetched(rooms_array: Array) -> void:
+	_browser_loading = false
+	_browser_rooms = rooms_array
+	if _screen == "browser":
+		if _browser_status_lbl != null:
+			_browser_status_lbl.text = ""
+		_refresh_browser_list()
 
 
-func _on_connected_to_room(code: String, peer_count: int) -> void:
-	if NetworkManager.is_host:
-		# Already on host_wait screen; refresh to show code
-		_refresh_online_ui()
+func _on_connected_to_room(_code: String, _peer_id: int) -> void:
+	if _screen == "browser" or _screen == "waiting":
+		_set_screen("waiting")
+
+
+func _on_player_list_updated(_players: Array) -> void:
+	if _screen != "waiting":
+		return
+	_rebuild_player_list()
+	# Also update the player count in the header — simplest to do a full rebuild
+	# but to avoid recursion we update just the vbox
+	# The header label is a sibling — find it by re-querying root_vbox children
+	# Simpler: just do a full rebuild since player list changes are infrequent
+	_rebuild_ui()
+
+
+func _on_settings_updated(_settings: Dictionary) -> void:
+	if _screen != "waiting":
+		return
+	_rebuild_ui()
+
+
+func _on_game_starting() -> void:
+	_start_online_game()
+
+
+func _on_host_disconnected() -> void:
+	if _screen != "waiting":
+		return
+	_error_message = "Host left the game. Returning to browser..."
+	_error_timer = 2.0
+	NetworkManager.disconnect_from_room()
+	# Stay on waiting screen but show error; _process will transition after 2s
+	if _wait_error_lbl != null:
+		_wait_error_lbl.text = _error_message
 	else:
-		# Guest successfully joined
-		_connected_peers = peer_count
-		_online_screen = "host_wait"   # reuse wait screen to show "waiting for start"
-		_online_title_lbl.text = "JOINED ROOM"
-		_online_body_lbl.text  = "Room: " + code
-		_online_bottom_lbl.text = "Waiting for host to start..."
-		_prompt_label.text = ""
-
-
-func _on_guest_joined(_peer_id: int) -> void:
-	_connected_peers += 1
-	_refresh_online_ui()
+		# Rebuild now so error label appears
+		_rebuild_ui()
 
 
 func _on_peer_disconnected(_peer_id: int) -> void:
-	if _connected_peers > 1:
-		_connected_peers -= 1
-	_refresh_online_ui()
+	if _screen != "waiting":
+		return
+	# room_players is already updated by player_list_updated; just rebuild
+	_rebuild_player_list()
 
 
 func _on_connection_failed(reason: String) -> void:
-	_online_title_lbl.text   = "CONNECTION FAILED"
-	_online_body_lbl.text    = reason
-	_online_bottom_lbl.text  = "Press Esc to go back"
-	_prompt_label.text       = ""
+	if _screen == "browser":
+		if _browser_status_lbl != null:
+			_browser_status_lbl.text = "Connection failed: " + reason
+	elif _screen == "waiting":
+		if _wait_error_lbl != null:
+			_wait_error_lbl.text = "Error: " + reason
 
 
-# ---------------------------------------------------------------------------
-# Scene transition
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Game start
+# ===========================================================================
 
-func _change_focused_value(delta: int) -> void:
-	var def: Array  = ROW_DEFS[_focused_row]
-	var key: String = def[0]
-	var min_v: int  = def[2]
-	var max_v: int  = def[3]
-	if key == "human_count":
-		max_v = _total_players
-	var new_v: int = clamp(_get_value(key) + delta, min_v, max_v)
-	_set_value(key, new_v)
-	_refresh_all_rows()
-
-
-func _start_game_local() -> void:
-	GameManager.total_players   = _total_players
-	GameManager.human_count     = _human_count
-	GameManager.bot_difficulty  = _bot_difficulty
-	GameManager.lives_per_round = _lives_per_round
-	GameManager.rounds_to_win   = _rounds_to_win
-	GameManager.is_online       = false
-	GameManager.lobby_mode      = false
-	get_tree().change_scene_to_file("res://scenes/main.tscn")
-	GameManager.call_deferred("_init_game")
-
-
-func _start_game_online() -> void:
-	GameManager.total_players   = _connected_peers
-	GameManager.human_count     = _connected_peers  # all real humans
-	GameManager.lives_per_round = _lives_per_round
-	GameManager.rounds_to_win   = _rounds_to_win
-	GameManager.is_online       = true
-	GameManager.lobby_mode      = false
+func _start_online_game() -> void:
+	GameManager.is_online = true
+	GameManager.total_players = NetworkManager.room_settings.get("max_players", 4)
+	GameManager.bot_difficulty = NetworkManager.room_settings.get("bot_difficulty", 0)
+	GameManager.human_count = NetworkManager.room_players.size()
+	GameManager.lives_per_round = _lives_value
+	GameManager.rounds_to_win = _rounds_value
+	GameManager.lobby_mode = false
 	get_tree().change_scene_to_file("res://scenes/main.tscn")
 	GameManager.call_deferred("_init_game")

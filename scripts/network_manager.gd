@@ -4,25 +4,34 @@ extends Node
 ## Drives Godot's high-level multiplayer API (WebRTCMultiplayerPeer) so that RPC and
 ## MultiplayerSynchronizer work transparently after pairing completes.
 
-signal connected_to_room(code: String, peer_count: int)
+signal connected_to_room(code: String, peer_id: int)
 signal guest_joined(peer_id: int)
 signal peer_disconnected(peer_id: int)
 signal connection_failed(reason: String)
+signal player_list_updated(players: Array)   # Array of {username, peer_id} Dicts
+signal settings_updated(settings: Dictionary)
+signal game_starting
+signal host_disconnected
+signal rooms_fetched(rooms: Array)           # Array of room Dicts from /rooms
 
 const MAX_PLAYERS := 6
 
 var is_host := false
 var my_peer_id := 0
 var room_code := ""
+var room_settings: Dictionary = {"max_players": 4, "bot_difficulty": 0}
+var room_players: Array = []   # [{username, peer_id}]
 
-var _signaling_url := "wss://ropedart-arena.onrender.com"
+var _signaling_url := "wss://dartrope-signaling.onrender.com"
 
 var _ws: WebSocketPeer = null
-var _ws_open := false        # true once the WS handshake is complete
-var _pending_send: Array = [] # messages queued before WS is open
+var _ws_open := false
+var _pending_send: Array = []
 
 var _rtc: WebRTCMultiplayerPeer = null
-var _peer_connections: Dictionary = {}  # peer_id (int) -> WebRTCPeerConnection
+var _peer_connections: Dictionary = {}   # peer_id (int) -> WebRTCPeerConnection
+
+var _http: HTTPRequest = null
 
 
 func _ready() -> void:
@@ -37,16 +46,24 @@ func set_signaling_url(url: String) -> void:
 # Public API
 # ---------------------------------------------------------------------------
 
-func create_room() -> void:
+func create_room(max_players: int = 4, bot_difficulty: int = 0) -> void:
 	is_host = true
 	my_peer_id = 1
+	room_settings = {"max_players": max_players, "bot_difficulty": bot_difficulty}
 	_connect_signaling()
+	# Queue create message — will be sent in _flush_pending after WS opens
+	_pending_send.append(JSON.stringify({
+		"type": "create",
+		"max_players": max_players,
+		"bot_difficulty": bot_difficulty,
+	}))
 
 
 func join_room(code: String) -> void:
 	is_host = false
 	room_code = code.to_upper()
 	_connect_signaling()
+	_pending_send.append(JSON.stringify({"type": "join", "code": room_code}))
 
 
 func disconnect_from_room() -> void:
@@ -62,8 +79,27 @@ func disconnect_from_room() -> void:
 	is_host = false
 	my_peer_id = 0
 	room_code = ""
-	# Reset Godot's multiplayer peer so local play still works
+	room_players.clear()
+	room_settings = {"max_players": 4, "bot_difficulty": 0}
 	multiplayer.multiplayer_peer = null
+
+
+func update_settings(max_players: int, bot_difficulty: int) -> void:
+	_send_signal({"type": "update_settings", "max_players": max_players, "bot_difficulty": bot_difficulty})
+	room_settings = {"max_players": max_players, "bot_difficulty": bot_difficulty}
+
+
+func send_start_game() -> void:
+	_send_signal({"type": "start_game"})
+
+
+func fetch_rooms() -> void:
+	if _http == null:
+		_http = HTTPRequest.new()
+		add_child(_http)
+		_http.request_completed.connect(_on_rooms_fetched)
+	var base_url: String = _signaling_url.replace("wss://", "https://").replace("ws://", "http://")
+	_http.request(base_url + "/rooms")
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +109,6 @@ func disconnect_from_room() -> void:
 func _connect_signaling() -> void:
 	_ws = WebSocketPeer.new()
 	_ws_open = false
-	_pending_send.clear()
 	var err := _ws.connect_to_url(_signaling_url)
 	if err != OK:
 		emit_signal("connection_failed", "Could not connect to signaling server (err %d)" % err)
@@ -91,6 +126,8 @@ func _send_signal(obj: Dictionary) -> void:
 
 
 func _flush_pending() -> void:
+	# Always send username first so the server registers it before create/join
+	_ws.send_text(JSON.stringify({"type": "set_username", "username": UsernameManager.username}))
 	for text: String in _pending_send:
 		_ws.send_text(text)
 	_pending_send.clear()
@@ -108,14 +145,8 @@ func _process(_delta: float) -> void:
 		if not _ws_open and ws_state == WebSocketPeer.STATE_OPEN:
 			_ws_open = true
 			_flush_pending()
-			# First message after open: announce intent
-			if is_host:
-				_send_signal({"type": "create"})
-			else:
-				_send_signal({"type": "join", "code": room_code})
 
 		if ws_state == WebSocketPeer.STATE_CLOSED and _ws_open:
-			# Unexpected close after we were open
 			_ws_open = false
 
 		while _ws != null and _ws.get_available_packet_count() > 0:
@@ -137,24 +168,46 @@ func _handle_signal(msg: Dictionary) -> void:
 	match msg_type:
 		"created":
 			room_code = str(msg.get("code", ""))
-			var err := _rtc.create_mesh(1)   # host is always multiplayer peer 1
+			# Add host as first player in local list
+			room_players = [{"username": UsernameManager.username, "peer_id": 1}]
+			var err := _rtc.create_mesh(1)
 			if err != OK:
 				emit_signal("connection_failed", "WebRTCMultiplayerPeer.create_mesh failed: %d" % err)
 				return
 			multiplayer.multiplayer_peer = _rtc
-			emit_signal("connected_to_room", room_code, 0)
+			emit_signal("connected_to_room", room_code, 1)
 
 		"joined":
 			my_peer_id = int(msg.get("peer_id", 2))
+			var joined_settings: Variant = msg.get("settings", null)
+			if joined_settings is Dictionary:
+				room_settings = joined_settings
 			var err := _rtc.create_client(my_peer_id)
 			if err != OK:
 				emit_signal("connection_failed", "WebRTCMultiplayerPeer.create_client failed: %d" % err)
 				return
 			multiplayer.multiplayer_peer = _rtc
-			emit_signal("connected_to_room", room_code, int(msg.get("peer_count", 1)))
+			emit_signal("connected_to_room", room_code, my_peer_id)
+
+		"player_list":
+			var players: Variant = msg.get("players", [])
+			if players is Array:
+				room_players = players
+				emit_signal("player_list_updated", room_players)
+
+		"settings_updated":
+			var new_settings: Variant = msg.get("settings", null)
+			if new_settings is Dictionary:
+				room_settings = new_settings
+				emit_signal("settings_updated", room_settings)
+
+		"game_starting":
+			emit_signal("game_starting")
+
+		"host_disconnected":
+			emit_signal("host_disconnected")
 
 		"guest_joined":
-			# Host received: a new guest joined — initiate offer to them
 			var peer_id: int = int(msg.get("peer_id", 0))
 			if peer_id > 0:
 				_create_peer_connection(peer_id, true)
@@ -192,12 +245,27 @@ func _handle_signal(msg: Dictionary) -> void:
 
 
 # ---------------------------------------------------------------------------
+# HTTP rooms fetch
+# ---------------------------------------------------------------------------
+
+func _on_rooms_fetched(result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or response_code != 200:
+		emit_signal("rooms_fetched", [])
+		return
+	var parsed: Variant = JSON.parse_string(body.get_string_from_utf8())
+	if parsed is Array:
+		emit_signal("rooms_fetched", parsed)
+	else:
+		emit_signal("rooms_fetched", [])
+
+
+# ---------------------------------------------------------------------------
 # WebRTC peer connection management
 # ---------------------------------------------------------------------------
 
 func _create_peer_connection(peer_id: int, create_offer: bool) -> void:
 	if _peer_connections.has(peer_id):
-		return  # already exists
+		return
 	var pc := WebRTCPeerConnection.new()
 	var init_err := pc.initialize({
 		"iceServers": [
@@ -208,7 +276,6 @@ func _create_peer_connection(peer_id: int, create_offer: bool) -> void:
 	if init_err != OK:
 		emit_signal("connection_failed", "WebRTCPeerConnection.initialize failed: %d" % init_err)
 		return
-	# Bind with peer_id so the lambda knows which peer generated the event
 	pc.session_description_created.connect(_on_sdp_created.bind(peer_id))
 	pc.ice_candidate_created.connect(_on_ice_candidate.bind(peer_id))
 	var add_err := _rtc.add_peer(pc, peer_id)
@@ -224,7 +291,6 @@ func _on_sdp_created(type: String, sdp: String, target_peer_id: int) -> void:
 	if not _peer_connections.has(target_peer_id):
 		return
 	_peer_connections[target_peer_id].set_local_description(type, sdp)
-	# The server routes by msg.peer_id = destination peer; it stamps sender's id for the recipient.
 	_send_signal({
 		"type": type,
 		"code": room_code,
@@ -234,7 +300,6 @@ func _on_sdp_created(type: String, sdp: String, target_peer_id: int) -> void:
 
 
 func _on_ice_candidate(mid: String, index: int, candidate: String, target_peer_id: int) -> void:
-	# Route the candidate to the correct target peer via the signaling server.
 	_send_signal({
 		"type": "candidate",
 		"code": room_code,
