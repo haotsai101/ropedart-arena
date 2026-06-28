@@ -45,6 +45,11 @@ var _wait_settings_focus: int = 0   # 0 = max_players row, 1 = bot_difficulty ro
 var _lives_value: int = 3
 var _rounds_value: int = 3
 
+# Local config screen
+var _local_total_players: int = 4
+var _local_bot_difficulty: int = 0
+var _local_focus: int = 0   # 0 = total players, 1 = difficulty
+
 # Error/transition timer
 var _error_timer: float = 0.0
 var _error_message: String = ""
@@ -63,6 +68,9 @@ var _wait_settings_diff_lbl: Label = null
 var _wait_code_lbl: Label = null
 var _wait_prompt_lbl: Label = null
 var _wait_error_lbl: Label = null
+
+var _local_total_lbl: Label = null
+var _local_diff_lbl: Label = null
 
 
 func _ready() -> void:
@@ -124,6 +132,8 @@ func _rebuild_ui() -> void:
 	_wait_code_lbl = null
 	_wait_prompt_lbl = null
 	_wait_error_lbl = null
+	_local_total_lbl = null
+	_local_diff_lbl = null
 
 	for child in get_children():
 		child.queue_free()
@@ -142,6 +152,8 @@ func _rebuild_ui() -> void:
 			_build_browser_screen()
 		"waiting":
 			_build_waiting_screen()
+		"local_config":
+			_build_local_config_screen()
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +297,7 @@ func _build_browser_screen() -> void:
 	scroll.add_child(_browser_rooms_vbox)
 
 	# Bottom actions bar
-	var bottom := _make_browser_row_label("[R] Refresh     [N] New Game     [Enter/A] Join Selected", false)
+	var bottom := _make_browser_row_label("[R] Refresh     [N] New Game     [B] Play with Bots     [Enter/A] Join", false)
 	bottom.add_theme_color_override("font_color", COLOR_PROMPT)
 	bottom.add_theme_font_size_override("font_size", 16)
 	bottom.custom_minimum_size = Vector2(0, 44)
@@ -506,7 +518,7 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 	parent.add_child(row1)
 
 
-func _make_settings_row(label_text: String, value_text: String, focused: bool) -> Panel:
+func _make_settings_row(label_text: String, value_text: String, focused: bool, force_arrows: bool = false) -> Panel:
 	var row := Panel.new()
 	row.custom_minimum_size = Vector2(0, 48)
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -542,7 +554,7 @@ func _make_settings_row(label_text: String, value_text: String, focused: bool) -
 	name_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hbox.add_child(name_lbl)
 
-	if NetworkManager.is_host:
+	if NetworkManager.is_host or force_arrows:
 		var arrow_l := Label.new()
 		arrow_l.text = "◀"
 		arrow_l.add_theme_font_size_override("font_size", 18)
@@ -562,7 +574,7 @@ func _make_settings_row(label_text: String, value_text: String, focused: bool) -
 	val_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hbox.add_child(val_lbl)
 
-	if NetworkManager.is_host:
+	if NetworkManager.is_host or force_arrows:
 		var arrow_r := Label.new()
 		arrow_r.text = "▶"
 		arrow_r.add_theme_font_size_override("font_size", 18)
@@ -683,6 +695,8 @@ func _input(event: InputEvent) -> void:
 			_input_browser(event, vp)
 		"waiting":
 			_input_waiting(event, vp)
+		"local_config":
+			_input_local_config(event, vp)
 
 
 func _input_username(event: InputEvent, vp: Viewport) -> void:
@@ -741,6 +755,9 @@ func _input_browser(event: InputEvent, vp: Viewport) -> void:
 				if vp: vp.set_input_as_handled()
 			KEY_N:
 				_begin_host()
+				if vp: vp.set_input_as_handled()
+			KEY_B:
+				_begin_local_game()
 				if vp: vp.set_input_as_handled()
 	elif event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed:
 		var jb := event as InputEventJoypadButton
@@ -915,6 +932,117 @@ func _on_connection_failed(reason: String) -> void:
 	elif _screen == "waiting":
 		if _wait_error_lbl != null:
 			_wait_error_lbl.text = "Error: " + reason
+
+
+# ===========================================================================
+# LOCAL PLAY — config screen and game start
+# ===========================================================================
+
+func _begin_local_game() -> void:
+	_set_screen("local_config")
+
+
+func _build_local_config_screen() -> void:
+	_add_title("PLAY WITH BOTS", 56)
+
+	const PANEL_W: int = 580
+	const PANEL_H: int = 300
+
+	var panel := _make_panel(PANEL_W, PANEL_H, 20)
+	add_child(panel)
+
+	var root_vbox := VBoxContainer.new()
+	root_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root_vbox.offset_left = 28
+	root_vbox.offset_top = 20
+	root_vbox.offset_right = -28
+	root_vbox.offset_bottom = -20
+	root_vbox.add_theme_constant_override("separation", 14)
+	root_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(root_vbox)
+
+	var settings_header := Label.new()
+	settings_header.text = "SETTINGS"
+	settings_header.add_theme_font_size_override("font_size", 16)
+	settings_header.add_theme_color_override("font_color", COLOR_DIM)
+	settings_header.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(settings_header)
+
+	var row0 := _make_settings_row(
+		"Total Players",
+		str(_local_total_players),
+		_local_focus == 0,
+		true
+	)
+	_local_total_lbl = row0.get_node_or_null("HBoxContainer/ValueLabel")
+	root_vbox.add_child(row0)
+
+	var row1 := _make_settings_row(
+		"Bot Difficulty",
+		DIFFICULTY_LABELS[clampi(_local_bot_difficulty, 0, 2)],
+		_local_focus == 1,
+		true
+	)
+	_local_diff_lbl = row1.get_node_or_null("HBoxContainer/ValueLabel")
+	root_vbox.add_child(row1)
+
+	var sep := HSeparator.new()
+	sep.add_theme_color_override("color", COLOR_PANEL_BORDER)
+	sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(sep)
+
+	var prompt_lbl := Label.new()
+	prompt_lbl.text = "Enter = Start   Esc = Back"
+	prompt_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	prompt_lbl.add_theme_font_size_override("font_size", 19)
+	prompt_lbl.add_theme_color_override("font_color", COLOR_PROMPT)
+	prompt_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(prompt_lbl)
+
+
+func _change_local_setting(delta: int) -> void:
+	if _local_focus == 0:
+		_local_total_players = clampi(_local_total_players + delta, 2, 6)
+	else:
+		_local_bot_difficulty = clampi(_local_bot_difficulty + delta, 0, 2)
+	_rebuild_ui()
+
+
+func _input_local_config(event: InputEvent, vp: Viewport) -> void:
+	if event.is_action_pressed("ui_up"):
+		_local_focus = (_local_focus - 1 + 2) % 2
+		_rebuild_ui()
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_down"):
+		_local_focus = (_local_focus + 1) % 2
+		_rebuild_ui()
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_left"):
+		_change_local_setting(-1)
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_right"):
+		_change_local_setting(1)
+		if vp: vp.set_input_as_handled()
+	elif event.is_action_pressed("ui_accept"):
+		_start_local_game()
+		if vp: vp.set_input_as_handled()
+	elif event is InputEventKey and (event as InputEventKey).pressed:
+		var ke := event as InputEventKey
+		if ke.keycode == KEY_ESCAPE:
+			_set_screen("browser")
+			if vp: vp.set_input_as_handled()
+
+
+func _start_local_game() -> void:
+	GameManager.is_online = false
+	GameManager.lobby_mode = false
+	GameManager.total_players = _local_total_players
+	GameManager.human_count = 1
+	GameManager.bot_difficulty = _local_bot_difficulty
+	GameManager.lives_per_round = 3
+	GameManager.rounds_to_win = 3
+	get_tree().change_scene_to_file("res://scenes/main.tscn")
+	GameManager.call_deferred("_init_game")
 
 
 # ===========================================================================
