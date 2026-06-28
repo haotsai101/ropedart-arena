@@ -1,0 +1,12 @@
+# Godot
+.godot/
+*.import
+export_presets.cfg
+export.cfg
+
+# Signaling server
+signaling-server/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

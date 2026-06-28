@@ -1,0 +1,12 @@
+[gd_resource type="Environment" format=3 uid="uid://catiuvdqor052"]
+
+[sub_resource type="Sky" id="Sky_1"]
+
+[resource]
+background_mode = 2
+sky = SubResource("Sky_1")
+ambient_light_source = 3
+ambient_light_color = Color(0.6, 0.65, 0.75, 1)
+ambient_light_energy = 0.5
+tonemap_mode = 2
+ssao_enabled = true
