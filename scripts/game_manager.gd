@@ -53,10 +53,13 @@ func _ready() -> void:
 func _init_game() -> void:
 	if lobby_mode:
 		return
-	# Safety re-defer: if change_scene_to_file hasn't completed yet, wait one more frame.
 	var main: Node = get_tree().current_scene
+	# Safety re-defer: if change_scene_to_file hasn't completed yet, wait one more frame.
+	# Using a 0-second SceneTreeTimer instead of call_deferred() so each retry happens
+	# at a frame boundary — this prevents the tight re-defer loop that would otherwise
+	# block the MessageQueue and prevent the scene change from ever executing.
 	if main == null or main.scene_file_path == "res://scenes/lobby.tscn":
-		call_deferred("_init_game")
+		get_tree().create_timer(0.0).timeout.connect(func(): _init_game())
 		return
 
 	if is_online:
