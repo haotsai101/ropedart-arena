@@ -21,6 +21,7 @@ config/features=PackedStringArray("4.7", "Forward Plus")
 [autoload]
 
 GameManager="*res://scripts/game_manager.gd"
+NetworkManager="*res://scripts/network_manager.gd"
 
 [dotnet]
 

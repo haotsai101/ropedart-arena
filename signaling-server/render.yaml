@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: dartrope-signaling
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        generateValue: false
+    plan: free

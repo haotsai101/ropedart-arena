@@ -35,6 +35,10 @@ var is_dead: bool = false
 var spawn_pos: Vector3
 var bot_controller: Node = null
 
+# Online multiplayer
+var player_peer_id: int = 1          # which multiplayer peer owns this player
+var is_network_controlled: bool = false  # true when a remote peer drives this player
+
 var _prev_throw: bool = false
 var _respawn_timer: SceneTreeTimer = null
 var _player_material: StandardMaterial3D = null
@@ -48,6 +52,11 @@ var _trip_timer: float = 0.0
 var _slow_timer: float = 0.0
 var _is_tripped: bool = false
 
+# Network input cache — written by _rpc_set_input, read by _physics_process
+var _net_move: Vector2 = Vector2.ZERO
+var _net_aim: Vector2 = Vector2.ZERO
+var _net_throwing: bool = false
+
 
 func _ready() -> void:
 	add_to_group("players")
@@ -59,6 +68,35 @@ func _ready() -> void:
 	_player_material = mat
 	if is_bot:
 		bot_controller = get_node_or_null("BotController")
+	# Online: set up authority and sync — only when multiplayer peer is active
+	if GameManager.is_online and multiplayer.multiplayer_peer != null:
+		set_multiplayer_authority(player_peer_id)
+		_setup_multiplayer_sync()
+
+
+func _setup_multiplayer_sync() -> void:
+	var sync := MultiplayerSynchronizer.new()
+	sync.name = "NetSync"
+	sync.set_multiplayer_authority(player_peer_id)
+	var config := SceneReplicationConfig.new()
+	config.add_property(NodePath(".:global_position"))
+	config.add_property(NodePath(".:rotation"))
+	sync.replication_config = config
+	add_child(sync)
+
+
+# RPC: authority peer (the client that owns this player) sends its input to the host.
+# The host applies it; local authority doesn't need this path.
+@rpc("any_peer", "call_local", "unreliable_ordered")
+func _rpc_set_input(move: Vector2, aim: Vector2, throwing: bool) -> void:
+	# Only the host (server) stores the received input; the authority peer drives locally.
+	if not multiplayer.is_server():
+		return
+	if multiplayer.get_remote_sender_id() != player_peer_id:
+		return  # reject spoofed input from wrong peer
+	_net_move = move
+	_net_aim = aim
+	_net_throwing = throwing
 
 
 func _physics_process(delta: float) -> void:
@@ -70,6 +108,23 @@ func _physics_process(delta: float) -> void:
 		move_and_slide()
 		_is_charging = false
 		return
+
+	# Network-controlled players (remote peers): position is handled by
+	# MultiplayerSynchronizer; we still need move_and_slide() for the physics
+	# engine to register the body, but we don't apply local input.
+	if is_network_controlled:
+		velocity = Vector3.ZERO
+		move_and_slide()
+		return
+
+	# If we are the authority peer for an online player, gather input locally
+	# and send it to the host via RPC so the host can run kill logic.
+	if GameManager.is_online and multiplayer.multiplayer_peer != null:
+		if is_multiplayer_authority() and not multiplayer.is_server():
+			var move_in := _get_move_input()
+			var aim_in  := _get_aim_input()
+			var throw_h := _get_throw_held()
+			rpc_id(1, "_rpc_set_input", move_in, aim_in, throw_h)
 
 	# --- Trip / slow countdown ---
 	var effective_speed: float = move_speed
@@ -91,9 +146,20 @@ func _physics_process(delta: float) -> void:
 		else:
 			effective_speed = move_speed * 0.5
 
-	# --- Inputs ---
-	var move_input := _get_move_input()
-	var aim_input := _get_aim_input()
+	# --- Inputs: online host uses _net_* cache; everyone else reads locally ---
+	var move_input: Vector2
+	var aim_input: Vector2
+	var throw_held: bool
+
+	if GameManager.is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server() and not is_multiplayer_authority():
+		# Host driving a remote-owned player from its cached RPC input
+		move_input = _net_move
+		aim_input  = _net_aim
+		throw_held = _net_throwing
+	else:
+		move_input = _get_move_input()
+		aim_input  = _get_aim_input()
+		throw_held = _get_throw_held()
 
 	# --- Velocity ---
 	if movement_blocked:
@@ -123,7 +189,6 @@ func _physics_process(delta: float) -> void:
 				dart.recall()
 	else:
 		# Human players: hold to charge, release to fire
-		var throw_held: bool = _get_throw_held()
 		var throw_just_pressed: bool = throw_held and not _prev_throw
 		var throw_just_released: bool = not throw_held and _prev_throw
 		_prev_throw = throw_held

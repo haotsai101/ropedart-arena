@@ -15,7 +15,8 @@ signal match_ended(winner_index: int)
 @export var human_count: int = 1
 @export var bot_difficulty: int = 0   # 0=Easy 1=Medium 2=Hard
 
-var lobby_mode: bool = true  # set to false by lobby.gd before transitioning
+var lobby_mode: bool = true   # set to false by lobby.gd before transitioning
+var is_online: bool = false   # set to true by lobby.gd when launching online match
 
 var current_state: int = RoundState.LOBBY
 var round_wins: Dictionary = {}
@@ -57,9 +58,18 @@ func _init_game() -> void:
 	if main == null or main.scene_file_path == "res://scenes/lobby.tscn":
 		call_deferred("_init_game")
 		return
+
+	if is_online:
+		_init_game_online(main)
+	else:
+		_init_game_local(main)
+
+	start_round()
+
+
+func _init_game_local(main: Node) -> void:
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
 	var bot_script := load("res://scripts/bot_controller.gd")
-
 	for i in total_players:
 		var p = player_scene.instantiate()
 		p.name = "Player%d" % i
@@ -76,7 +86,30 @@ func _init_game() -> void:
 			bc.difficulty = bot_difficulty
 			p.add_child(bc)
 
-	start_round()  # start_round() calls reset_for_round() for all players
+
+func _init_game_online(main: Node) -> void:
+	# In online mode, each peer owns exactly one player.
+	# Host (peer_id=1) owns player_index 0; guests own their peer_id-1 index.
+	# All peers spawn all player nodes so scene state is consistent, but each
+	# player node's set_multiplayer_authority() limits which peer drives movement.
+	var player_scene := load("res://scenes/player.tscn") as PackedScene
+	var my_id: int = multiplayer.get_unique_id()
+
+	for i in total_players:
+		var p = player_scene.instantiate()
+		p.name = "Player%d" % i
+		p.player_index = i
+		p.is_bot = false  # no bots in online mode
+		# peer_id 1 owns player 0; peer_id 2 owns player 1, etc.
+		var owner_peer_id: int = i + 1
+		p.player_peer_id = owner_peer_id
+		# Only the owning peer controls this player
+		p.is_network_controlled = (my_id != owner_peer_id)
+		main.add_child(p)
+		round_wins[i] = 0
+		p.player_killed.connect(_on_player_killed)
+		p.player_eliminated.connect(_on_player_eliminated)
+		_all_players.append(p)
 
 
 func _process(delta: float) -> void:
@@ -93,6 +126,18 @@ func _process(delta: float) -> void:
 
 
 func _set_state(new_state: int) -> void:
+	if is_online and multiplayer.multiplayer_peer != null:
+		# Only the host drives state; it broadcasts to all clients including itself.
+		if multiplayer.is_server():
+			rpc("_rpc_set_state", new_state)
+		# Clients receive _rpc_set_state; do not set locally here.
+		return
+	current_state = new_state
+	state_changed.emit(new_state)
+
+
+@rpc("authority", "call_local", "reliable")
+func _rpc_set_state(new_state: int) -> void:
 	current_state = new_state
 	state_changed.emit(new_state)
 
@@ -102,6 +147,9 @@ func get_countdown_remaining() -> float:
 
 
 func start_round() -> void:
+	# In online mode, only the host starts rounds; the RPC propagates the state.
+	if is_online and multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		return
 	var spawn_positions := _get_spawn_positions()
 	for i in _all_players.size():
 		var p = _all_players[i]
