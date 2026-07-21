@@ -21,6 +21,9 @@ const SPEED_MULT    := [0.65, 0.85, 1.0]
 const ARENA_HALF: float = 15.0
 const EDGE_MARGIN: float = 1.5
 
+# Must match player.gd's MELEE_RANGE.
+const SLASH_RANGE: float = 1.4
+
 var player  # untyped for duck-typed access to player_index, get_pos_2d(), dart, etc.
 var _state: int = BotState.CHASE
 var _timer: float = 0.0
@@ -28,6 +31,7 @@ var _desired_move: Vector2 = Vector2.ZERO
 var _desired_aim: Vector2 = Vector2(0.0, 1.0)
 var _throw_pending: bool = false
 var _dash_pending: bool = false
+var _slash_pending: bool = false  # true while a live target is within melee range
 var _dodge_dir: Vector2 = Vector2.ZERO  # committed dodge direction; reset when threat clears
 
 
@@ -55,6 +59,9 @@ func get_desired_dash() -> bool:
 		return true
 	return false
 
+func get_desired_slash() -> bool:
+	return _slash_pending
+
 
 func _physics_process(delta: float) -> void:
 	if GameManager.current_state != GameManager.RoundState.PLAYING:
@@ -67,6 +74,7 @@ func _physics_process(delta: float) -> void:
 	var target = _find_target()
 	if target == null:
 		_desired_move = Vector2.ZERO
+		_slash_pending = false
 		return
 
 	var my_pos: Vector2 = player.get_pos_2d()
@@ -76,6 +84,11 @@ func _physics_process(delta: float) -> void:
 	var dir: Vector2 = to_target.normalized() if dist > 0.01 else Vector2.ZERO
 
 	_timer -= delta
+
+	# Opportunistic melee: slash whenever a live target is within range,
+	# regardless of CHASE/AIM/RETREAT state -- mirrors how dart-dodging
+	# overrides the state machine below.
+	_slash_pending = dist <= SLASH_RANGE
 
 	# Dodge incoming darts (medium and hard bots only)
 	if difficulty >= Difficulty.MEDIUM:

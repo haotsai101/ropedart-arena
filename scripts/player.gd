@@ -24,7 +24,13 @@ const MAX_CHARGE_TIME := 1.5
 const BOT_CHARGE_RATIOS := [0.3, 0.6, 1.0]
 const DASH_SPEED: float = 20.0
 const DASH_DURATION: float = 0.15
-const DASH_COOLDOWN: float = 0.75
+const DASH_COOLDOWN: float = 0.25
+const SLASH_COOLDOWN: float = 0.25
+## Short-range directional melee: hits anything within MELEE_RANGE of the
+## attacker AND within a MELEE_CONE_DEG half-angle of aim_dir, so it reads as
+## a forward swing rather than an omnidirectional pulse.
+const MELEE_RANGE: float = 1.4
+const MELEE_CONE_DEG: float = 50.0
 const WALK_ANIM_SPEED: float = 2.0
 ## Half-extent of the platform on the XZ plane — must match the ground
 ## PlaneMesh/BoxShape3D size (30x30) in scenes/main.tscn. Stepping past this
@@ -107,6 +113,9 @@ var _dash_cooldown_timer: float = 0.0
 var _is_dashing: bool = false
 var _dash_dir: Vector2 = Vector2.ZERO
 var _prev_dash: bool = false
+
+# Slash state
+var _slash_cooldown_timer: float = 0.0
 
 # Procedural animation state
 var _run_bob_time: float = 0.0
@@ -496,6 +505,20 @@ func _physics_process(delta: float) -> void:
 			_dash_dir = dash_dir.normalized()
 		_prev_dash = dash_held
 
+	# --- Slash cooldown countdown ---
+	if _slash_cooldown_timer > 0.0:
+		_slash_cooldown_timer -= delta
+
+	# --- Slash activation: cooldown-gated only, no press-edge requirement
+	# (unlike dash) -- holding the button attacks again as soon as the 0.25s
+	# cooldown clears, since this is a fast repeatable melee poke rather than
+	# a one-shot burst like dash. Blocked while dashing/charging/tripped so
+	# the two moves stay distinct and it can't fire during spawn invincibility.
+	if _slash_cooldown_timer <= 0.0 and not movement_blocked and not _is_dashing and _spawn_invincible_timer <= 0.0:
+		if _get_slash_held():
+			_perform_slash()
+			_slash_cooldown_timer = SLASH_COOLDOWN
+
 	# --- Velocity ---
 	if _is_dashing:
 		velocity = Vector3(_dash_dir.x, 0.0, _dash_dir.y) * DASH_SPEED
@@ -564,6 +587,16 @@ func _get_dash_pressed() -> bool:
 	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_LEFT_SHOULDER)
 
 
+func _get_slash_held() -> bool:
+	if is_bot and bot_controller != null:
+		return bot_controller.get_desired_slash()
+	if player_index == 0:
+		if _virtual_controls != null and _virtual_controls.get_slash_held():
+			return true
+		return Input.is_key_pressed(KEY_E)
+	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_X)
+
+
 func _get_move_input() -> Vector2:
 	if is_bot and bot_controller != null:
 		return bot_controller.get_desired_move()
@@ -630,6 +663,28 @@ func _throw(ratio: float) -> void:
 
 func get_pos_2d() -> Vector2:
 	return Vector2(global_position.x, global_position.z)
+
+
+func _perform_slash() -> void:
+	## Lethal if the attacker still has their dagger in hand (dart == null) --
+	## same one-hit-kill economy as a dagger throw. Otherwise (dagger thrown
+	## and unavailable) it's a non-lethal kick: reuses trip()'s stagger so a
+	## disarmed player still has a way to disrupt an armed opponent up close.
+	var my_pos: Vector2 = get_pos_2d()
+	var cone_cos: float = cos(deg_to_rad(MELEE_CONE_DEG))
+	for p in get_tree().get_nodes_in_group("players"):
+		if p == self or p.is_dead:
+			continue
+		var to_target: Vector2 = p.get_pos_2d() - my_pos
+		var dist: float = to_target.length()
+		if dist > MELEE_RANGE or dist < 0.001:
+			continue
+		if to_target.normalized().dot(aim_dir) < cone_cos:
+			continue
+		if dart == null:
+			p.kill()
+		else:
+			p.trip()
 
 
 func _check_boundary_fall() -> void:
@@ -761,6 +816,7 @@ func reset_for_round(new_lives: int, start_pos: Vector3) -> void:
 	_dash_timer = 0.0
 	_dash_cooldown_timer = 0.0
 	_prev_dash = false
+	_slash_cooldown_timer = 0.0
 	if not _player_materials.is_empty():
 		_reset_player_tint()
 	if dart != null:
