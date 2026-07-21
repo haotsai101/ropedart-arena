@@ -60,6 +60,9 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 var player_mesh: Node3D = null
 var character_id: String = "char_barbarian"
 var _mesh_base_scale: Vector3 = Vector3.ONE
+## Dagger model held in the character's hand until thrown -- see
+## _setup_dagger_in_hand(); visibility mirrors (dart == null) every frame.
+var _dagger_in_hand: Node3D = null
 
 var player_color: Color
 var character_color: Color = Color(0.85, 0.08, 0.04, 1.0)   # set in _ready from CHARACTER_DEFS
@@ -166,6 +169,7 @@ func _ready() -> void:
 			_player_materials.append(mat)
 	_reset_player_tint()
 	_setup_animation()
+	_setup_dagger_in_hand()
 	if show_hitbox_debug:
 		_setup_hitbox_debug()
 	if is_bot:
@@ -240,9 +244,18 @@ func _rpc_set_input(move: Vector2, aim: Vector2, throwing: bool) -> void:
 ## renamed at runtime to match clips retargeted against one specific rig) —
 ## so the shared clips' "Rig_Medium/Skeleton3D:<bone>" track paths already
 ## resolve correctly against every character with no renaming at all.
+## combat_moves.glb is not a KayKit source file -- it's Spell_Simple_Shoot/
+## Sword_Attack/Punch_Jab from Quaternius's Universal Animation Library
+## (assets/animations/UAL1_Standard.glb), retargeted onto a bare "Rig_Medium"
+## armature via world-space Copy Rotation constraints in Blender (same
+## technique as assets/animations/build_character_locomotion.py used for the
+## old fruit rig, just with a fuller ~20-bone map and re-exported under the
+## "Rig_Medium" name so its track paths resolve the same way as the two
+## KayKit files below).
 const ANIM_SOURCES: Array[String] = [
 	"res://assets/kaykit_adventurers/animations/Rig_Medium_MovementBasic.glb",
 	"res://assets/kaykit_adventurers/animations/Rig_Medium_General.glb",
+	"res://assets/animations/combat_moves.glb",
 ]
 
 ## The old fruit-character locomotion clips were authored with a "_Loop"
@@ -258,10 +271,10 @@ const LOOPING_CLIPS: Array[String] = [
 	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B",
 ]
 
-## One-shot action clips triggered from gameplay code (kick / getting kicked)
-## -- _process()'s per-frame locomotion selection must not stomp these
-## mid-play, see the action_playing guard there.
-const ONE_SHOT_ACTION_CLIPS: Array[String] = ["Hit_A", "Hit_B"]
+## One-shot action clips triggered from gameplay code (throw/slash/kick) --
+## _process()'s per-frame locomotion selection must not stomp these mid-play,
+## see the action_playing guard there.
+const ONE_SHOT_ACTION_CLIPS: Array[String] = ["Spell_Simple_Shoot", "Sword_Attack", "Punch_Jab"]
 
 func _setup_animation() -> void:
 	## Attach a fresh AnimationPlayer next to this character's Skeleton3D and
@@ -304,6 +317,33 @@ func _setup_animation() -> void:
 			merged_lib.get_animation(clip_name).loop_mode = Animation.LOOP_LINEAR
 	anim_player.add_animation_library("", merged_lib)
 	_anim_player = anim_player
+
+
+func _setup_dagger_in_hand() -> void:
+	## Every character rig has a "handslot.r" bone -- a KayKit-authored
+	## attachment point parented right under hand.r, positioned at the palm
+	## with its local -Y axis as the grip direction (confirmed by inspecting
+	## its rest transform) -- exactly what BoneAttachment3D needs. Reuses
+	## dagger.gd's own dart_head.glb model so the in-hand and in-flight dagger
+	## look identical. Visibility is kept in sync with (dart == null) in
+	## _process() rather than at each of _throw()/_on_dart_returned()/kill()/
+	## reset_for_round(), so there's a single source of truth for it.
+	if player_mesh == null:
+		return
+	var skeleton: Skeleton3D = _find_skeleton(player_mesh)
+	if skeleton == null:
+		return
+	var dagger_scene: PackedScene = load("res://assets/characters/dart_head.glb")
+	if dagger_scene == null:
+		return
+	var attachment := BoneAttachment3D.new()
+	attachment.name = "DaggerAttachment"
+	attachment.bone_name = "handslot.r"
+	skeleton.add_child(attachment)
+	var dagger_instance: Node3D = dagger_scene.instantiate()
+	dagger_instance.name = "DaggerInHand"
+	attachment.add_child(dagger_instance)
+	_dagger_in_hand = attachment
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:
@@ -366,7 +406,11 @@ func _process(delta: float) -> void:
 	var speed_ratio: float = velocity.length() / move_speed
 	_move_speed_smooth = lerp(_move_speed_smooth, speed_ratio, 10.0 * delta)
 
-	if player_mesh == null or is_dead or is_falling:
+	if player_mesh == null:
+		return
+	if _dagger_in_hand != null:
+		_dagger_in_hand.visible = (dart == null)
+	if is_dead or is_falling:
 		return
 
 	var is_moving: bool = _move_speed_smooth > 0.1 and not _is_dashing
@@ -670,6 +714,7 @@ func _throw(ratio: float) -> void:
 	dart = dart_scene.instantiate()
 	get_parent().add_child(dart)
 	dart.launch(self, get_pos_2d(), aim_dir, ratio)
+	_play_anim("Spell_Simple_Shoot")
 
 
 func get_pos_2d() -> Vector2:
@@ -678,14 +723,11 @@ func get_pos_2d() -> Vector2:
 
 func _perform_slash() -> void:
 	## Lethal if the attacker still has their dagger in hand (dart == null) --
-	## same one-hit-kill economy as a dagger throw; no dedicated animation for
-	## this since the kill itself already reads as the impact. Otherwise
-	## (dagger thrown and unavailable) it's a non-lethal kick: reuses trip()'s
-	## stagger, with Hit_A on the attacker (the kicking motion -- no dedicated
-	## attack clip exists in the KayKit set, see ANIM_SOURCES' comment) and
-	## Hit_B on whichever target actually gets kicked (their reaction).
-	if dart != null:
-		_play_anim("Hit_A")
+	## same one-hit-kill economy as a dagger throw, with Sword_Attack as the
+	## swing. Otherwise (dagger thrown and unavailable) it's a non-lethal kick
+	## (Punch_Jab): reuses trip()'s stagger so a disarmed player still has a
+	## way to disrupt an armed opponent up close.
+	_play_anim("Sword_Attack" if dart == null else "Punch_Jab")
 	var my_pos: Vector2 = get_pos_2d()
 	var cone_cos: float = cos(deg_to_rad(MELEE_CONE_DEG))
 	for p in get_tree().get_nodes_in_group("players"):
@@ -701,7 +743,6 @@ func _perform_slash() -> void:
 			p.kill()
 		else:
 			p.trip()
-			p._play_anim("Hit_B")
 
 
 func _check_boundary_fall() -> void:
