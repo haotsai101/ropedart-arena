@@ -8,6 +8,7 @@ enum BotState { CHASE, AIM, RETREAT }
 @export var difficulty: int = Difficulty.EASY
 
 const DART_STATE_EXTENDING = 0  # mirrors RopeDart.State.EXTENDING ordinal
+const SLASH_RANGE := 1.4  # mirrors player.gd's MELEE_RANGE
 
 const THROW_RANGE   := [4.0, 5.5, 7.0]
 const AIM_DURATION  := [1.4, 0.7, 0.25]
@@ -21,6 +22,7 @@ var _timer: float = 0.0
 var _desired_move: Vector2 = Vector2.ZERO
 var _desired_aim: Vector2 = Vector2(0.0, 1.0)
 var _throw_pending: bool = false
+var _slash_pending: bool = false
 var _dodge_dir: Vector2 = Vector2.ZERO  # committed dodge direction; reset when threat clears
 
 
@@ -39,6 +41,12 @@ func get_desired_aim() -> Vector2:
 func get_desired_throw() -> bool:
 	if _throw_pending:
 		_throw_pending = false
+		return true
+	return false
+
+func get_desired_slash() -> bool:
+	if _slash_pending:
+		_slash_pending = false
 		return true
 	return false
 
@@ -63,6 +71,12 @@ func _physics_process(delta: float) -> void:
 	var dir: Vector2 = to_target.normalized() if dist > 0.01 else Vector2.ZERO
 
 	_timer -= delta
+
+	# Opportunistic melee slash: any live target within range gets slashed,
+	# regardless of CHASE/AIM/RETREAT — same idea as dodge overriding the state machine.
+	if dist <= SLASH_RANGE:
+		_desired_aim = dir
+		_slash_pending = true
 
 	# Dodge incoming darts (medium and hard bots only)
 	if difficulty >= Difficulty.MEDIUM:

@@ -23,6 +23,11 @@ const MAX_CHARGE_TIME := 1.5
 # Bot charge ratios indexed by difficulty: Easy=0.3, Medium=0.6, Hard=1.0
 const BOT_CHARGE_RATIOS := [0.3, 0.6, 1.0]
 
+# Melee slash — short-range directional attack, independent of the dart/throw system.
+const SLASH_COOLDOWN: float = 0.25
+const MELEE_RANGE: float = 1.4
+const MELEE_CONE_DEG: float = 50.0  # half-angle around aim_dir counted as a hit
+
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
 @onready var player_mesh: Node3D = $char_fruit
@@ -54,6 +59,10 @@ var _is_charging: bool = false
 var _trip_timer: float = 0.0
 var _slow_timer: float = 0.0
 var _is_tripped: bool = false
+
+# Melee slash state
+var _slash_cooldown_timer: float = 0.0
+var _prev_slash: bool = false
 
 # Network input cache — written by _rpc_set_input, read by _physics_process
 var _net_move: Vector2 = Vector2.ZERO
@@ -158,6 +167,9 @@ func _physics_process(delta: float) -> void:
 		else:
 			effective_speed = move_speed * 0.5
 
+	if _slash_cooldown_timer > 0.0:
+		_slash_cooldown_timer -= delta
+
 	# --- Inputs: online host uses _net_* cache; everyone else reads locally ---
 	var move_input: Vector2
 	var aim_input: Vector2
@@ -220,6 +232,17 @@ func _physics_process(delta: float) -> void:
 				_throw(ratio)
 				_is_charging = false
 
+	# --- Melee slash ---
+	if is_bot and bot_controller != null:
+		if bot_controller.get_desired_slash():
+			_try_slash()
+	else:
+		var slash_held: bool = _get_slash_held()
+		var slash_just_pressed: bool = slash_held and not _prev_slash
+		_prev_slash = slash_held
+		if slash_just_pressed:
+			_try_slash()
+
 
 func _get_throw_held() -> bool:
 	if player_index == 0:
@@ -227,6 +250,14 @@ func _get_throw_held() -> bool:
 			return true
 		return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_A)
+
+
+func _get_slash_held() -> bool:
+	if player_index == 0:
+		if _virtual_controls != null and _virtual_controls.get_slash_held():
+			return true
+		return Input.is_key_pressed(KEY_E)
+	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_X)
 
 
 func _get_move_input() -> Vector2:
@@ -295,6 +326,42 @@ func get_pos_2d() -> Vector2:
 	return Vector2(global_position.x, global_position.z)
 
 
+func _try_slash() -> void:
+	## Gates a slash on the same conditions the throw/charge logic respects.
+	if is_dead:
+		return
+	if GameManager.current_state != GameManager.RoundState.PLAYING:
+		return
+	if _is_charging or _is_tripped:
+		return
+	if _slash_cooldown_timer > 0.0:
+		return
+	_slash_cooldown_timer = SLASH_COOLDOWN
+	_perform_slash()
+
+
+func _perform_slash() -> void:
+	## Short-range directional melee: hits any non-self, alive player within
+	## MELEE_RANGE and inside a forward-facing cone around aim_dir (a swing,
+	## not a pulse). Lethal when the dart is in hand (dart == null); otherwise
+	## it's a non-lethal kick — reuses the dart's trip() stagger effect.
+	var my_pos: Vector2 = get_pos_2d()
+	var cone_cos: float = cos(deg_to_rad(MELEE_CONE_DEG))
+	for p in get_tree().get_nodes_in_group("players"):
+		if p == self or p.is_dead:
+			continue
+		var to_target: Vector2 = p.get_pos_2d() - my_pos
+		var dist: float = to_target.length()
+		if dist < 0.01 or dist > MELEE_RANGE:
+			continue
+		if to_target.normalized().dot(aim_dir) < cone_cos:
+			continue
+		if dart == null:
+			p.kill()
+		else:
+			p.trip()
+
+
 func trip() -> void:
 	## Apply a trip effect: freeze 0.4s then slow to 50% for 1.5s.
 	## No-ops if already frozen or slowed (immunity window).
@@ -350,6 +417,8 @@ func reset_for_round(new_lives: int, start_pos: Vector3) -> void:
 	_trip_timer = 0.0
 	_slow_timer = 0.0
 	_is_tripped = false
+	_slash_cooldown_timer = 0.0
+	_prev_slash = false
 	if _player_material != null:
 		_player_material.albedo_color = player_color
 	if dart != null:
