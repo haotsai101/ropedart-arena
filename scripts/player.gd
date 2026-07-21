@@ -258,6 +258,11 @@ const LOOPING_CLIPS: Array[String] = [
 	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B",
 ]
 
+## One-shot action clips triggered from gameplay code (throw/slash/kick) --
+## _process()'s per-frame locomotion selection must not stomp these mid-play,
+## see the action_playing guard there.
+const ONE_SHOT_ACTION_CLIPS: Array[String] = ["Throw", "Hit_A", "Hit_B"]
+
 func _setup_animation() -> void:
 	## Attach a fresh AnimationPlayer next to this character's Skeleton3D and
 	## merge in clips from every file in ANIM_SOURCES (Walking_A/Running_A/
@@ -372,7 +377,13 @@ func _process(delta: float) -> void:
 	# Dash takes priority over the is_moving check — while dashing we're moving
 	# far faster than a walk, so cut straight to the run clip regardless of the
 	# (dash-excluded) is_moving state used for Walk/Idle and the procedural bob.
-	if _is_dashing:
+	# A one-shot action clip (throw/slash/kick) gets to finish playing first --
+	# otherwise this per-frame selection would stomp it within a single frame
+	# of it starting, since nothing here else calls _play_anim() at all.
+	var action_playing: bool = _anim_player != null and _current_anim in ONE_SHOT_ACTION_CLIPS and _anim_player.is_playing()
+	if action_playing:
+		pass
+	elif _is_dashing:
 		_play_anim("Running_A")
 	elif is_moving:
 		_play_anim("Walking_A", WALK_ANIM_SPEED)
@@ -659,6 +670,7 @@ func _throw(ratio: float) -> void:
 	dart = dart_scene.instantiate()
 	get_parent().add_child(dart)
 	dart.launch(self, get_pos_2d(), aim_dir, ratio)
+	_play_anim("Throw")
 
 
 func get_pos_2d() -> Vector2:
@@ -670,6 +682,11 @@ func _perform_slash() -> void:
 	## same one-hit-kill economy as a dagger throw. Otherwise (dagger thrown
 	## and unavailable) it's a non-lethal kick: reuses trip()'s stagger so a
 	## disarmed player still has a way to disrupt an armed opponent up close.
+	## No dedicated attack clip exists in the KayKit set (see ANIM_SOURCES'
+	## comment), so the two Hit reaction clips stand in for the attacker's own
+	## swing: Hit_A for the slash, Hit_B for the kick -- plays on every attempt,
+	## whether or not it actually connects, same as Throw always playing on launch.
+	_play_anim("Hit_A" if dart == null else "Hit_B")
 	var my_pos: Vector2 = get_pos_2d()
 	var cone_cos: float = cos(deg_to_rad(MELEE_CONE_DEG))
 	for p in get_tree().get_nodes_in_group("players"):
