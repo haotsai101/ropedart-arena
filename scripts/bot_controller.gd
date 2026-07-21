@@ -7,7 +7,7 @@ enum BotState { CHASE, AIM, RETREAT }
 
 @export var difficulty: int = Difficulty.EASY
 
-const DART_STATE_EXTENDING = 0  # mirrors RopeDart.State.EXTENDING ordinal
+const DART_STATE_FLYING = 0  # mirrors Dagger.State.FLYING ordinal
 
 const THROW_RANGE   := [4.0, 5.5, 7.0]
 const AIM_DURATION  := [1.4, 0.7, 0.25]
@@ -15,12 +15,19 @@ const AIM_NOISE_DEG := [35.0, 15.0, 3.0]
 const RETREAT_TIME  := [1.2, 0.9, 0.6]
 const SPEED_MULT    := [0.65, 0.85, 1.0]
 
+# Ring-out safety: must match player.gd's ARENA_HALF. Bots stop steering
+# further outward once within EDGE_MARGIN of the platform edge (dodge/retreat
+# can otherwise pick a direction that walks them straight off the boundary).
+const ARENA_HALF: float = 15.0
+const EDGE_MARGIN: float = 1.5
+
 var player  # untyped for duck-typed access to player_index, get_pos_2d(), dart, etc.
 var _state: int = BotState.CHASE
 var _timer: float = 0.0
 var _desired_move: Vector2 = Vector2.ZERO
 var _desired_aim: Vector2 = Vector2(0.0, 1.0)
 var _throw_pending: bool = false
+var _dash_pending: bool = false
 var _dodge_dir: Vector2 = Vector2.ZERO  # committed dodge direction; reset when threat clears
 
 
@@ -39,6 +46,12 @@ func get_desired_aim() -> Vector2:
 func get_desired_throw() -> bool:
 	if _throw_pending:
 		_throw_pending = false
+		return true
+	return false
+
+func get_desired_dash() -> bool:
+	if _dash_pending:
+		_dash_pending = false
 		return true
 	return false
 
@@ -68,7 +81,7 @@ func _physics_process(delta: float) -> void:
 	if difficulty >= Difficulty.MEDIUM:
 		var dodge := _get_dodge_dir(my_pos)
 		if dodge != Vector2.ZERO:
-			_desired_move = dodge * SPEED_MULT[difficulty]
+			_set_desired_move(my_pos, dodge * SPEED_MULT[difficulty])
 			_desired_aim = dir
 			return
 
@@ -76,7 +89,7 @@ func _physics_process(delta: float) -> void:
 		BotState.CHASE:
 			_desired_aim = dir
 			if player.dart != null or dist > THROW_RANGE[difficulty]:
-				_desired_move = dir * SPEED_MULT[difficulty]
+				_set_desired_move(my_pos, dir * SPEED_MULT[difficulty])
 			else:
 				_desired_move = Vector2.ZERO
 				_state = BotState.AIM
@@ -93,9 +106,29 @@ func _physics_process(delta: float) -> void:
 				_timer = RETREAT_TIME[difficulty]
 
 		BotState.RETREAT:
-			_desired_move = -_desired_aim * SPEED_MULT[difficulty]
+			_set_desired_move(my_pos, -_desired_aim * SPEED_MULT[difficulty])
 			if _timer <= 0.0:
+				# No rope to recall anymore -- if the dagger's still out
+				# (flying, or landed somewhere waiting for pickup), there's
+				# nothing to do here but go back to chasing; player.dart
+				# clears itself once the bot walks over its landed dagger.
 				_state = BotState.CHASE
+
+
+func _set_desired_move(pos: Vector2, move: Vector2) -> void:
+	## Clamp outward movement once near the platform edge so dodge/retreat
+	## steering can't walk a bot off the ring-out boundary. Only zeroes the
+	## component pushing further out; doesn't attempt to steer back inward.
+	var result: Vector2 = move
+	if pos.x > ARENA_HALF - EDGE_MARGIN and result.x > 0.0:
+		result.x = 0.0
+	elif pos.x < -(ARENA_HALF - EDGE_MARGIN) and result.x < 0.0:
+		result.x = 0.0
+	if pos.y > ARENA_HALF - EDGE_MARGIN and result.y > 0.0:
+		result.y = 0.0
+	elif pos.y < -(ARENA_HALF - EDGE_MARGIN) and result.y < 0.0:
+		result.y = 0.0
+	_desired_move = result
 
 
 func _find_target():  # returns untyped player node for duck-typed access
@@ -115,7 +148,7 @@ func _get_dodge_dir(my_pos: Vector2) -> Vector2:
 	for dart in get_tree().get_nodes_in_group("darts"):
 		if not is_instance_valid(dart):
 			continue
-		if dart.owner_player == player or dart.state != DART_STATE_EXTENDING:
+		if dart.owner_player == player or dart.state != DART_STATE_FLYING:
 			continue
 		var to_me: Vector2 = my_pos - (dart.head_2d as Vector2)
 		if to_me.length() > 8.0:
@@ -125,6 +158,7 @@ func _get_dodge_dir(my_pos: Vector2) -> Vector2:
 			if _dodge_dir == Vector2.ZERO:
 				var side: float = 1.0 if randf() > 0.5 else -1.0
 				_dodge_dir = (dart.dir_2d as Vector2).rotated(PI * 0.5 * side)
+				_dash_pending = true  # burst out of the way instead of just sidestepping
 			return _dodge_dir
 	_dodge_dir = Vector2.ZERO  # no threat — reset so next dart picks fresh side
 	return Vector2.ZERO

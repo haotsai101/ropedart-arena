@@ -17,9 +17,11 @@ signal match_ended(winner_index: int)
 
 var lobby_mode: bool = true   # set to false by lobby.gd before transitioning
 var is_online: bool = false   # set to true by lobby.gd when launching online match
+var selected_map_scene: String = "res://scenes/main.tscn"   # set by lobby.gd before change_scene_to_file
 
 var current_state: int = RoundState.LOBBY
 var round_wins: Dictionary = {}
+var player_characters: Dictionary = {}   # player_index (int) → character id (String)
 var _all_players: Array = []
 var _alive_players: Array = []
 var _timer: float = 0.0
@@ -32,6 +34,22 @@ const PLAYER_COLORS := [
 	Color(0.9, 0.8, 0.1),
 	Color(0.9, 0.4, 0.8),
 	Color(0.4, 0.9, 0.9),
+]
+
+## KayKit Adventurers 2.0 characters. Unlike the old fruit set, these share
+## one identical skeleton wrapper name ("Rig_Medium") across every character
+## and both animation source files, so no body_mesh_name / per-character
+## rig-renaming hack is needed (see player.gd's _setup_animation()) — color
+## identification is applied as an emission tint across every mesh part
+## instead of overriding one named body mesh, since these are fully textured
+## models, not flat-shaded shapes.
+const CHARACTER_DEFS: Array = [
+	{"id": "char_barbarian",    "glb_path": "res://assets/kaykit_adventurers/characters/Barbarian.glb",    "display_name": "Barbarian",      "character_color": Color(0.85, 0.08, 0.04, 1.0)},
+	{"id": "char_knight",       "glb_path": "res://assets/kaykit_adventurers/characters/Knight.glb",       "display_name": "Knight",         "character_color": Color(0.30, 0.50, 0.90, 1.0)},
+	{"id": "char_mage",         "glb_path": "res://assets/kaykit_adventurers/characters/Mage.glb",         "display_name": "Mage",           "character_color": Color(0.60, 0.20, 0.85, 1.0)},
+	{"id": "char_ranger",       "glb_path": "res://assets/kaykit_adventurers/characters/Ranger.glb",       "display_name": "Ranger",         "character_color": Color(0.18, 0.62, 0.18, 1.0)},
+	{"id": "char_rogue",        "glb_path": "res://assets/kaykit_adventurers/characters/Rogue.glb",        "display_name": "Rogue",          "character_color": Color(0.98, 0.78, 0.08, 1.0)},
+	{"id": "char_rogue_hooded", "glb_path": "res://assets/kaykit_adventurers/characters/Rogue_Hooded.glb", "display_name": "Rogue (Hooded)", "character_color": Color(0.42, 0.26, 0.62, 1.0)},
 ]
 
 const PLAYER_HALF_HEIGHT := 0.7  # half-height of the player capsule; added to spawn marker Y
@@ -71,6 +89,8 @@ func _init_game() -> void:
 
 
 func _init_game_local(main: Node) -> void:
+	if player_characters.is_empty():
+		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
 	var bot_script := load("res://scripts/bot_controller.gd")
 	for i in total_players:
@@ -78,6 +98,7 @@ func _init_game_local(main: Node) -> void:
 		p.name = "Player%d" % i
 		p.player_index = i
 		p.is_bot = (i >= human_count)
+		p.character_id = player_characters.get(i, "char_barbarian")
 		main.add_child(p)
 		round_wins[i] = 0
 		p.player_killed.connect(_on_player_killed)
@@ -95,24 +116,71 @@ func _init_game_online(main: Node) -> void:
 	# Host (peer_id=1) owns player_index 0; guests own their peer_id-1 index.
 	# All peers spawn all player nodes so scene state is consistent, but each
 	# player node's set_multiplayer_authority() limits which peer drives movement.
+	# Slots without a connected human peer become host-driven bots.
+	if player_characters.is_empty():
+		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
+	var bot_script := load("res://scripts/bot_controller.gd")
 	var my_id: int = multiplayer.get_unique_id()
+
+	# Build the set of peer IDs that have actual human players in this room
+	var connected_peers: Dictionary = {}
+	for entry in NetworkManager.room_players:
+		if entry is Dictionary and entry.has("peer_id"):
+			connected_peers[int(entry["peer_id"])] = true
 
 	for i in total_players:
 		var p = player_scene.instantiate()
 		p.name = "Player%d" % i
 		p.player_index = i
-		p.is_bot = false  # no bots in online mode
 		# peer_id 1 owns player 0; peer_id 2 owns player 1, etc.
 		var owner_peer_id: int = i + 1
-		p.player_peer_id = owner_peer_id
-		# Only the owning peer controls this player
-		p.is_network_controlled = (my_id != owner_peer_id)
+		var is_human_slot: bool = connected_peers.has(owner_peer_id)
+
+		if is_human_slot:
+			p.is_bot = false
+			p.player_peer_id = owner_peer_id
+			p.is_network_controlled = (my_id != owner_peer_id)
+		else:
+			# No human for this slot — host drives it as a bot
+			p.is_bot = true
+			p.player_peer_id = 1  # host is authoritative; its MultiplayerSynchronizer replicates position
+			p.is_network_controlled = (my_id != 1)
+
+		p.character_id = player_characters.get(i, CHARACTER_DEFS[i % CHARACTER_DEFS.size()]["id"])
 		main.add_child(p)
 		round_wins[i] = 0
 		p.player_killed.connect(_on_player_killed)
 		p.player_eliminated.connect(_on_player_eliminated)
 		_all_players.append(p)
+		if p.is_bot and multiplayer.is_server():
+			var bc = bot_script.new()
+			bc.name = "BotController"
+			bc.difficulty = bot_difficulty
+			p.add_child(bc)
+
+
+func assign_default_characters() -> void:
+	player_characters.clear()
+	var shuffled: Array = CHARACTER_DEFS.duplicate()
+	shuffled.shuffle()
+	var slot: int = 0
+	for def in shuffled:
+		if slot >= total_players:
+			break
+		player_characters[slot] = def["id"]
+		slot += 1
+
+
+@rpc("authority", "call_local", "reliable")
+func _rpc_sync_characters(chars: Dictionary) -> void:
+	player_characters = chars
+
+
+func sync_characters_rpc() -> void:
+	## Lobby calls this before changing scene so all peers know the char assignments.
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		rpc("_rpc_sync_characters", player_characters)
 
 
 func _process(delta: float) -> void:
@@ -165,6 +233,9 @@ func start_round() -> void:
 	# Sync match settings to all clients before starting countdown.
 	if is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server():
 		rpc("_rpc_sync_settings", total_players, human_count, bot_difficulty, lives_per_round, rounds_to_win)
+		if player_characters.is_empty():
+			assign_default_characters()
+		rpc("_rpc_sync_characters", player_characters)
 	var spawn_positions := _get_spawn_positions()
 	for i in _all_players.size():
 		var p = _all_players[i]

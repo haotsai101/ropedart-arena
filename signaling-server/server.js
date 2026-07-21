@@ -15,7 +15,7 @@ const USERNAME_TIMEOUT_MS = 5000;
 //   host_socket,
 //   host_username,
 //   players: [ { socket, username, peer_id } ],  // index 0 = host (peer_id 1)
-//   settings: { max_players: 4, bot_difficulty: 0 },
+//   settings: { max_players: 4, bot_difficulty: 0, map_id: 0 },
 //   started: false
 // }
 const rooms = {};
@@ -79,13 +79,14 @@ function handleMessage(ws, raw) {
       const code = generateCode();
       const max_players = Math.min(6, Math.max(2, parseInt(msg.max_players) || 4));
       const bot_difficulty = Math.min(2, Math.max(0, parseInt(msg.bot_difficulty) || 0));
+      const map_id = Math.min(1, Math.max(0, parseInt(msg.map_id) || 0));
       const username = ws.username || "Player";
       rooms[code] = {
         code,
         host_socket: ws,
         host_username: username,
         players: [{ socket: ws, username, peer_id: 1 }],
-        settings: { max_players, bot_difficulty },
+        settings: { max_players, bot_difficulty, map_id },
         started: false,
       };
       ws_meta.set(ws, { code, peer_id: 1 });
@@ -139,6 +140,7 @@ function handleMessage(ws, raw) {
 
       const new_max = Math.min(6, Math.max(2, parseInt(msg.max_players) || room.settings.max_players));
       const new_diff = Math.min(2, Math.max(0, parseInt(msg.bot_difficulty) ?? room.settings.bot_difficulty));
+      const new_map = Math.min(1, Math.max(0, parseInt(msg.map_id) ?? room.settings.map_id ?? 0));
 
       // max_players cannot be set below the current human player count
       if (new_max < room.players.length) {
@@ -151,6 +153,7 @@ function handleMessage(ws, raw) {
 
       room.settings.max_players = new_max;
       room.settings.bot_difficulty = new_diff;
+      room.settings.map_id = new_map;
 
       broadcastToRoom(room, { type: "settings_updated", settings: room.settings });
       break;
@@ -238,6 +241,7 @@ const httpServer = http.createServer((req, res) => {
         player_count: r.players.length,
         max_players: r.settings.max_players,
         bot_difficulty: r.settings.bot_difficulty,
+        map_id: r.settings.map_id || 0,
       }));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(public_rooms));

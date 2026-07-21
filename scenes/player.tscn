@@ -1,13 +1,8 @@
-[gd_scene load_steps=7 format=3 uid="uid://player_scene_01"]
+[gd_scene format=3 uid="uid://c5ptlxswbqu2s"]
 
-[ext_resource type="Script" path="res://scripts/player.gd" id="1_player"]
-[ext_resource type="PackedScene" uid="uid://dart_scene_01" path="res://scenes/rope_dart.tscn" id="2_dart"]
-
+[ext_resource type="Script" uid="uid://vxgbjq1ea8n7" path="res://scripts/player.gd" id="1_player"]
+[ext_resource type="PackedScene" path="res://scenes/dagger.tscn" id="2_dart"]
 [sub_resource type="CapsuleShape3D" id="PlayerShape"]
-radius = 0.4
-height = 1.2
-
-[sub_resource type="CapsuleMesh" id="PlayerMesh"]
 radius = 0.4
 height = 1.2
 
@@ -16,20 +11,18 @@ radius = 0.15
 height = 0.3
 
 [sub_resource type="StandardMaterial3D" id="AimMat"]
-albedo_color = Color(1, 1, 1, 0.7)
 transparency = 1
+albedo_color = Color(1, 1, 1, 0.7)
 
-[node name="Player" type="CharacterBody3D"]
+[node name="Player" type="CharacterBody3D" unique_id=1399352812]
 script = ExtResource("1_player")
 dart_scene = ExtResource("2_dart")
 
-[node name="PlayerCollision" type="CollisionShape3D" parent="."]
+[node name="PlayerCollision" type="CollisionShape3D" parent="." unique_id=382113702]
 shape = SubResource("PlayerShape")
 
-[node name="PlayerMeshInstance" type="MeshInstance3D" parent="."]
-mesh = SubResource("PlayerMesh")
-
-[node name="AimIndicator" type="MeshInstance3D" parent="."]
+[node name="AimIndicator" type="MeshInstance3D" parent="." unique_id=1530867289]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1.2)
 mesh = SubResource("AimMesh")
 surface_material_override/0 = SubResource("AimMat")
+

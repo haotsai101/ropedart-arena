@@ -86,12 +86,14 @@ func _build_skeleton() -> void:
 		var dots_row := HBoxContainer.new()
 		dots_row.alignment = BoxContainer.ALIGNMENT_CENTER
 		dots_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		dots_row.add_theme_constant_override("separation", 4)
 		vbox.add_child(dots_row)
 		_dots_containers[i] = dots_row
 
 		var pips_row := HBoxContainer.new()
 		pips_row.alignment = BoxContainer.ALIGNMENT_CENTER
 		pips_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		pips_row.add_theme_constant_override("separation", 4)
 		vbox.add_child(pips_row)
 		_pips_containers[i] = pips_row
 
@@ -129,18 +131,21 @@ func _setup_player_panels() -> void:
 		var color: Color = p.player_color
 		_player_colors[idx] = color
 
-		# Style panel background
+		# Style panel background — colored tint with rounded corners and drop shadow
+		# so it stays readable over the bright arena floor.
 		var style := StyleBoxFlat.new()
-		style.bg_color = Color(color.r, color.g, color.b, 0.35)
-		style.border_width_left   = 2
-		style.border_width_right  = 2
-		style.border_width_top    = 2
-		style.border_width_bottom = 2
-		style.border_color = Color(color.r, color.g, color.b, 0.85)
-		style.corner_radius_top_left    = 5
-		style.corner_radius_top_right   = 5
-		style.corner_radius_bottom_left = 5
-		style.corner_radius_bottom_right = 5
+		style.bg_color = Color(color.r, color.g, color.b, 0.55)
+		style.border_width_left   = 3
+		style.border_width_right  = 3
+		style.border_width_top    = 3
+		style.border_width_bottom = 3
+		style.border_color = Color(color.r, color.g, color.b, 1.0)
+		style.corner_radius_top_left    = 8
+		style.corner_radius_top_right   = 8
+		style.corner_radius_bottom_left = 8
+		style.corner_radius_bottom_right = 8
+		style.shadow_color = Color(0.0, 0.0, 0.0, 0.35)
+		style.shadow_size = 5
 		_panels[idx].add_theme_stylebox_override("panel", style)
 		_panels[idx].visible = true
 
@@ -148,19 +153,42 @@ func _setup_player_panels() -> void:
 		label.text = ("P%d" % (idx + 1)) + (" [BOT]" if p.is_bot else "")
 		label.add_theme_color_override("font_color", color)
 
-		# Life dots
+		# Life dots — rounded panels so they feel impactful and read against bright arena.
+		# Each dot stores its StyleBoxFlat in metadata for quick color updates on kill/reset.
 		for _i in GameManager.lives_per_round:
-			var dot := ColorRect.new()
-			dot.custom_minimum_size = Vector2(11, 11)
-			dot.color = color
+			var dot := Panel.new()
+			dot.custom_minimum_size = Vector2(14, 14)
+			dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			var dot_style := StyleBoxFlat.new()
+			dot_style.bg_color = color
+			dot_style.corner_radius_top_left    = 7
+			dot_style.corner_radius_top_right   = 7
+			dot_style.corner_radius_bottom_left = 7
+			dot_style.corner_radius_bottom_right = 7
+			dot_style.shadow_color = Color(0.0, 0.0, 0.0, 0.30)
+			dot_style.shadow_size = 2
+			dot.add_theme_stylebox_override("panel", dot_style)
+			dot.set_meta("style", dot_style)
+			dot.set_meta("alive_color", color)
 			_dots_containers[idx].add_child(dot)
 			_life_dots[idx].append(dot)
 
-		# Win pips
+		# Win pips — same rounded approach, dim until earned.
+		var pip_dim := Color(color.r, color.g, color.b, 0.22)
 		for _i in GameManager.rounds_to_win:
-			var pip := ColorRect.new()
-			pip.custom_minimum_size = Vector2(7, 7)
-			pip.color = Color(color.r, color.g, color.b, 0.25)
+			var pip := Panel.new()
+			pip.custom_minimum_size = Vector2(10, 10)
+			pip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			var pip_style := StyleBoxFlat.new()
+			pip_style.bg_color = pip_dim
+			pip_style.corner_radius_top_left    = 5
+			pip_style.corner_radius_top_right   = 5
+			pip_style.corner_radius_bottom_left = 5
+			pip_style.corner_radius_bottom_right = 5
+			pip.add_theme_stylebox_override("panel", pip_style)
+			pip.set_meta("style", pip_style)
+			pip.set_meta("alive_color", color)
+			pip.set_meta("dim_color", pip_dim)
 			_pips_containers[idx].add_child(pip)
 			_win_pips[idx].append(pip)
 
@@ -187,8 +215,14 @@ func _process(_delta: float) -> void:
 func _on_player_killed(player: Variant) -> void:
 	var idx: int = player.player_index
 	var remaining: int = player.lives
+	# Grey out spent lives rather than hiding them — keeps the "total lives" count visible.
 	for i in _life_dots[idx].size():
-		_life_dots[idx][i].visible = i < remaining
+		var dot = _life_dots[idx][i]
+		var dot_style := dot.get_meta("style") as StyleBoxFlat
+		if i < remaining:
+			dot_style.bg_color = dot.get_meta("alive_color")
+		else:
+			dot_style.bg_color = Color(0.45, 0.45, 0.45, 0.30)
 
 
 func _on_player_eliminated(player: Variant) -> void:
@@ -209,10 +243,12 @@ func _on_round_ended(winner_index: int) -> void:
 		_overlay.add_theme_color_override("font_color", color)
 		_subtitle.text = "Round wins: %d / %d" % [wins, GameManager.rounds_to_win]
 		_subtitle.visible = true
-		# Light up a win pip
+		# Light up a win pip — set the stylebox bg_color directly.
 		var pip_idx := wins - 1
 		if pip_idx >= 0 and pip_idx < _win_pips[winner_index].size():
-			_win_pips[winner_index][pip_idx].color = color
+			var pip = _win_pips[winner_index][pip_idx]
+			var pip_style := pip.get_meta("style") as StyleBoxFlat
+			pip_style.bg_color = color
 	else:
 		_overlay.text = "DRAW"
 		_overlay.add_theme_color_override("font_color", Color.WHITE)
@@ -224,7 +260,9 @@ func _reset_panels_for_round() -> void:
 	for idx: int in _player_colors.keys():
 		_panels[idx].modulate.a = 1.0
 		for i in _life_dots[idx].size():
-			_life_dots[idx][i].visible = true
+			var dot = _life_dots[idx][i]
+			var dot_style := dot.get_meta("style") as StyleBoxFlat
+			dot_style.bg_color = dot.get_meta("alive_color")
 
 
 func _on_match_ended(winner_index: int) -> void:

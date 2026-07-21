@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://d4y2mg7z8w1qr"]
+
+[ext_resource type="Script" path="res://tests/test_player_map_boundary.gd" id="1_boundary"]
+
+[node name="TestPlayerMapBoundary" type="Node"]
+script = ExtResource("1_boundary")

@@ -24,6 +24,11 @@ GameManager="*res://scripts/game_manager.gd"
 NetworkManager="*res://scripts/network_manager.gd"
 UsernameManager="*res://scripts/username_manager.gd"
 
+[display]
+
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+
 [dotnet]
 
 project/assembly_name="Dartrope Arena"
@@ -84,6 +89,11 @@ throw_dart={
 , Object(InputEventJoypadButton,"resource_local_to_scene":false,"resource_name":"","device":0,"button_index":7,"pressure":0.0,"pressed":false,"script":null)
 ]
 }
+
+[layer_names]
+
+3d_physics/layer_1="default"
+3d_physics/layer_2="rope_obstacles"
 
 [rendering]
 

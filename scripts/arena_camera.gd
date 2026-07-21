@@ -38,6 +38,14 @@ func _process(delta: float) -> void:
 		min_x = minf(min_x, pos.x); max_x = maxf(max_x, pos.x)
 		min_z = minf(min_z, pos.y); max_z = maxf(max_z, pos.y)
 
+	# Thrown daggers can fly well past their owner (up to max_range) and then
+	# sit there landed until picked up -- without this, one lying out near
+	# the edge of a wide shot can end up outside the frame entirely.
+	for d in get_tree().get_nodes_in_group("darts"):
+		var dpos: Vector2 = d.head_2d
+		min_x = minf(min_x, dpos.x); max_x = maxf(max_x, dpos.x)
+		min_z = minf(min_z, dpos.y); max_z = maxf(max_z, dpos.y)
+
 	min_x = maxf(min_x - margin, -arena_clamp)
 	max_x = minf(max_x + margin,  arena_clamp)
 	min_z = maxf(min_z - margin, -arena_clamp)

@@ -1,0 +1,199 @@
+[gd_scene load_steps=45 format=3 uid="uid://main_scene_forest_01"]
+
+[ext_resource type="Script" path="res://scripts/arena_camera.gd" id="1_cam"]
+[ext_resource type="Script" path="res://scripts/arena_obstacle.gd" id="2_obs"]
+[ext_resource type="Script" path="res://scripts/nature_scatter.gd" id="4_scatter"]
+[ext_resource type="PackedScene" uid="uid://hud_scene_01" path="res://scenes/hud.tscn" id="3_hud"]
+
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/tileLarge_forest.gltf.glb" id="50_tilelarge"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/tileHigh_forest.gltf.glb" id="51_tilehigh"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/plantA_forest.gltf.glb" id="52_planta"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/plantB_forest.gltf.glb" id="53_plantb"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/rocksA_forest.gltf.glb" id="54_rocksa"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/rocksB_forest.gltf.glb" id="55_rocksb"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/detail_forest.gltf.glb" id="56_detail"]
+[ext_resource type="PackedScene" path="res://assets/kaykit_minigame/Models/gltf/tree_forest.gltf.glb" id="60_tree"]
+
+[sub_resource type="BoxShape3D" id="GroundShape"]
+size = Vector3(30, 0.2, 30)
+
+[sub_resource type="BoxShape3D" id="PillarShape"]
+size = Vector3(2, 2, 2)
+
+[node name="Main" type="Node3D"]
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.7, -0.5, 0.5, 0, 0.7, 0.7, -0.7, -0.5, 0.5, 4, 8, 4)
+light_color = Color(0.99, 0.94, 0.85, 1)
+light_energy = 1.2
+shadow_enabled = true
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.707, 0.707, 0, -0.707, 0.707, 0, 14, 12)
+projection = 1
+size = 16.0
+script = ExtResource("1_cam")
+
+[node name="Ground" type="StaticBody3D" parent="."]
+
+[node name="GroundCollision" type="CollisionShape3D" parent="Ground"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.1, 0)
+shape = SubResource("GroundShape")
+
+[node name="PillarA" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5, 1.0, -5)
+script = ExtResource("2_obs")
+half_size = Vector2(1.0, 1.0)
+
+[node name="PillarABlock" parent="PillarA" instance=ExtResource("51_tilehigh")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, 0)
+
+[node name="PillarACollision" type="CollisionShape3D" parent="PillarA"]
+shape = SubResource("PillarShape")
+
+[node name="PillarB" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 1.0, 5)
+script = ExtResource("2_obs")
+half_size = Vector2(1.0, 1.0)
+
+[node name="PillarBBlock" parent="PillarB" instance=ExtResource("51_tilehigh")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, 0)
+
+[node name="PillarBCollision" type="CollisionShape3D" parent="PillarB"]
+shape = SubResource("PillarShape")
+
+[node name="Spawn0" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -10, 0, -10)
+groups = ["spawn_points"]
+
+[node name="Spawn1" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, -10)
+groups = ["spawn_points"]
+
+[node name="Spawn2" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -10, 0, 10)
+groups = ["spawn_points"]
+
+[node name="Spawn3" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, 10)
+groups = ["spawn_points"]
+
+[node name="Spawn4" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -11)
+groups = ["spawn_points"]
+
+[node name="Spawn5" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 11)
+groups = ["spawn_points"]
+
+[node name="FloorTiles" type="Node3D" parent="."]
+
+[node name="Tile_01" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -12, -1.0, -12)
+
+[node name="Tile_02" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -12, -1.0, -6)
+
+[node name="Tile_03" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -12, -1.0, 0)
+
+[node name="Tile_04" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -12, -1.0, 6)
+
+[node name="Tile_05" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -12, -1.0, 12)
+
+[node name="Tile_06" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6, -1.0, -12)
+
+[node name="Tile_07" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6, -1.0, -6)
+
+[node name="Tile_08" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6, -1.0, 0)
+
+[node name="Tile_09" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6, -1.0, 6)
+
+[node name="Tile_10" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6, -1.0, 12)
+
+[node name="Tile_11" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, -12)
+
+[node name="Tile_12" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, -6)
+
+[node name="Tile_13" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, 0)
+
+[node name="Tile_14" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, 6)
+
+[node name="Tile_15" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1.0, 12)
+
+[node name="Tile_16" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6, -1.0, -12)
+
+[node name="Tile_17" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6, -1.0, -6)
+
+[node name="Tile_18" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6, -1.0, 0)
+
+[node name="Tile_19" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6, -1.0, 6)
+
+[node name="Tile_20" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 6, -1.0, 12)
+
+[node name="Tile_21" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 12, -1.0, -12)
+
+[node name="Tile_22" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 12, -1.0, -6)
+
+[node name="Tile_23" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 12, -1.0, 0)
+
+[node name="Tile_24" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 12, -1.0, 6)
+
+[node name="Tile_25" parent="FloorTiles" instance=ExtResource("50_tilelarge")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 12, -1.0, 12)
+
+[node name="Decor" type="Node3D" parent="."]
+
+[node name="Decor_W_PlantA" parent="Decor" instance=ExtResource("52_planta")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -13.2, 0.02, -4.0)
+
+[node name="Decor_E_PlantB" parent="Decor" instance=ExtResource("53_plantb")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 13.3, 0.02, -4.2)
+
+[node name="Decor_W_RocksA" parent="Decor" instance=ExtResource("54_rocksa")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -13.0, 0.02, 4.3)
+
+[node name="Decor_E_RocksB" parent="Decor" instance=ExtResource("55_rocksb")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 13.1, 0.02, 4.5)
+
+[node name="Decor_N_Detail" parent="Decor" instance=ExtResource("56_detail")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.3, 0.02, -13.2)
+
+[node name="TreeScatter" type="Node3D" parent="."]
+script = ExtResource("4_scatter")
+mesh_scenes = Array[PackedScene]([ExtResource("60_tree")])
+instances_per_mesh = 6
+min_scale = 0.85
+max_scale = 1.15
+square_limit = 13.5
+clear_radius = 8.0
+obstacle_rects = Array[Rect2]([Rect2(-6.45, -6.45, 2.9, 2.9), Rect2(3.55, 3.55, 2.9, 2.9)])
+avoid_points = Array[Vector2]([Vector2(-10, -10), Vector2(10, -10), Vector2(-10, 10), Vector2(10, 10), Vector2(0, -11), Vector2(0, 11)])
+avoid_radius = 1.4
+use_individual_instances = true
+rng_seed = 3002
+mesh_obstacle_footprint = Array[Vector2]([Vector2(0.7639, 0.7523)])
+mesh_obstacle_outline = Array[PackedVector2Array]([PackedVector2Array(0.7682, 0.1354, 0.2409, 0.344, -0.125, 0.7091, -0.3464, 0.2, -0.7727, -0.2071, -0.1606, -0.3444, 0.2531, -0.6954, 0.3988, -0.186)])
+
+[node name="HUD" parent="." instance=ExtResource("3_hud")]

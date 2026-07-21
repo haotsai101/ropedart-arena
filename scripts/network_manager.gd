@@ -13,14 +13,16 @@ signal settings_updated(settings: Dictionary)
 signal game_starting
 signal host_disconnected
 signal rooms_fetched(rooms: Array)           # Array of room Dicts from /rooms
+signal character_chosen(peer_id: int, char_id: String)
 
 const MAX_PLAYERS := 6
 
 var is_host := false
 var my_peer_id := 0
 var room_code := ""
-var room_settings: Dictionary = {"max_players": 4, "bot_difficulty": 0}
+var room_settings: Dictionary = {"max_players": 4, "bot_difficulty": 0, "map_id": 0}
 var room_players: Array = []   # [{username, peer_id}]
+var peer_characters: Dictionary = {}   # peer_id (int) → character id (String)
 
 var _signaling_url := "wss://ropedart-arena.onrender.com"
 
@@ -47,16 +49,17 @@ func set_signaling_url(url: String) -> void:
 # Public API
 # ---------------------------------------------------------------------------
 
-func create_room(max_players: int = 4, bot_difficulty: int = 0) -> void:
+func create_room(max_players: int = 4, bot_difficulty: int = 0, map_id: int = 0) -> void:
 	is_host = true
 	my_peer_id = 1
-	room_settings = {"max_players": max_players, "bot_difficulty": bot_difficulty}
+	room_settings = {"max_players": max_players, "bot_difficulty": bot_difficulty, "map_id": map_id}
 	_connect_signaling()
 	# Queue create message — will be sent in _flush_pending after WS opens
 	_pending_send.append(JSON.stringify({
 		"type": "create",
 		"max_players": max_players,
 		"bot_difficulty": bot_difficulty,
+		"map_id": map_id,
 	}))
 
 
@@ -82,17 +85,26 @@ func disconnect_from_room() -> void:
 	my_peer_id = 0
 	room_code = ""
 	room_players.clear()
-	room_settings = {"max_players": 4, "bot_difficulty": 0}
+	room_settings = {"max_players": 4, "bot_difficulty": 0, "map_id": 0}
+	peer_characters.clear()
 	multiplayer.multiplayer_peer = null
 
 
-func update_settings(max_players: int, bot_difficulty: int) -> void:
-	_send_signal({"type": "update_settings", "max_players": max_players, "bot_difficulty": bot_difficulty})
-	room_settings = {"max_players": max_players, "bot_difficulty": bot_difficulty}
+func update_settings(max_players: int, bot_difficulty: int, map_id: int = 0) -> void:
+	_send_signal({"type": "update_settings", "max_players": max_players, "bot_difficulty": bot_difficulty, "map_id": map_id})
+	room_settings = {"max_players": max_players, "bot_difficulty": bot_difficulty, "map_id": map_id}
 
 
 func send_start_game() -> void:
 	_send_signal({"type": "start_game"})
+
+
+func send_character_choice(char_id: String) -> void:
+	## Broadcast local player's character pick to all peers in the room.
+	## Stores locally immediately; remote peers receive it if the server relays it.
+	peer_characters[my_peer_id] = char_id
+	emit_signal("character_chosen", my_peer_id, char_id)
+	_send_signal({"type": "character_choice", "char_id": char_id})
 
 
 func fetch_rooms() -> void:
@@ -246,6 +258,14 @@ func _handle_signal(msg: Dictionary) -> void:
 		"peer_disconnected":
 			var peer_id: int = int(msg.get("peer_id", 0))
 			emit_signal("peer_disconnected", peer_id)
+
+		"character_choice":
+			# Relayed by the signaling server when a peer broadcasts their character pick.
+			var peer_id: int = int(msg.get("peer_id", 0))
+			var char_id: String = str(msg.get("char_id", "char_barbarian"))
+			if peer_id > 0 and peer_id != my_peer_id:
+				peer_characters[peer_id] = char_id
+				emit_signal("character_chosen", peer_id, char_id)
 
 		"error":
 			emit_signal("connection_failed", str(msg.get("message", "Unknown signaling error")))
