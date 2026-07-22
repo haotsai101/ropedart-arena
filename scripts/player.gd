@@ -31,6 +31,11 @@ const SLASH_COOLDOWN: float = 0.25
 ## a forward swing rather than an omnidirectional pulse.
 const MELEE_RANGE: float = 1.4
 const MELEE_CONE_DEG: float = 50.0
+## Winding up a throw: the dart head orbits the hand on a short taut rope --
+## see _update_charge_spin(). Radius is in the handslot.r attachment's local
+## space (small, hand-relative), speed is angular (rad/s).
+const CHARGE_SPIN_RADIUS: float = 0.35
+const CHARGE_SPIN_SPEED: float = TAU * 2.2  # ~2.2 revolutions/sec
 const WALK_ANIM_SPEED: float = 2.0
 ## Half-extent of the platform on the XZ plane — must match the ground
 ## PlaneMesh/BoxShape3D size (30x30) in scenes/main.tscn. Stepping past this
@@ -60,14 +65,26 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 var player_mesh: Node3D = null
 var character_id: String = "char_barbarian"
 var _mesh_base_scale: Vector3 = Vector3.ONE
-## Dart head held in the character's hand until thrown -- see
-## _setup_dagger_in_hand(); visibility mirrors (dart == null) every frame.
+## The handslot.r BoneAttachment3D itself -- stays visible=true always;
+## _static_dagger_mesh and the charge-spin visuals (its children) each
+## control their own visibility independently.
 var _dagger_in_hand: Node3D = null
+## The actual held-dagger mesh, a child of _dagger_in_hand -- see
+## _setup_dagger_in_hand(); visible while (dart == null and not charging),
+## since the charge-spin visuals take over depicting the weapon while
+## winding up a throw.
+var _static_dagger_mesh: Node3D = null
 ## Coiled rope worn around the forearm until thrown -- separate attachment
 ## point from _dagger_in_hand (lowerarm.r, not handslot.r) so it doesn't
 ## overlap the dagger's own geometry; visibility mirrors (dart == null)
-## alongside it.
+## alongside it (stays visible through a charge, unlike the dagger itself --
+## the rope is still feeding from the arm while the weight spins).
 var _rope_coil_in_hand: Node3D = null
+## Dart head that orbits the hand on a taut rope while charging, depicting
+## winding up the throw -- see _update_charge_spin().
+var _charge_spin_dart: Node3D = null
+var _charge_spin_rope: MeshInstance3D = null
+var _charge_spin_angle: float = 0.0
 
 var player_color: Color
 var character_color: Color = Color(0.85, 0.08, 0.04, 1.0)   # set in _ready from CHARACTER_DEFS
@@ -356,6 +373,11 @@ func _setup_dagger_in_hand() -> void:
 	## Both props are kept in sync with (dart == null) in _process() rather
 	## than at each of _throw()/_on_dart_returned()/kill()/reset_for_round(),
 	## so there's a single source of truth for it.
+	##
+	## Also builds the charge-spin visuals (a second dart-head instance plus
+	## a short rope) as extra children of the same handslot.r attachment --
+	## they inherit the exact same hand tracking with no extra bone lookups,
+	## and stay hidden except while _is_charging (see _update_charge_spin()).
 	if player_mesh == null:
 		return
 	var skeleton: Skeleton3D = _find_skeleton(player_mesh)
@@ -366,12 +388,43 @@ func _setup_dagger_in_hand() -> void:
 	dagger_attachment.name = "DaggerAttachment"
 	dagger_attachment.bone_name = "handslot.r"
 	skeleton.add_child(dagger_attachment)
+	_dagger_in_hand = dagger_attachment
+
 	var dagger_scene: PackedScene = load("res://assets/characters/dart_head.glb")
 	if dagger_scene != null:
 		var dagger_instance: Node3D = dagger_scene.instantiate()
 		dagger_instance.name = "DaggerInHand"
 		dagger_attachment.add_child(dagger_instance)
-	_dagger_in_hand = dagger_attachment
+		_static_dagger_mesh = dagger_instance
+
+		var spin_instance: Node3D = dagger_scene.instantiate()
+		spin_instance.name = "ChargeSpinDart"
+		spin_instance.visible = false
+		dagger_attachment.add_child(spin_instance)
+		_charge_spin_dart = spin_instance
+
+	# Rope material/mesh duplicated here rather than shared with
+	# rope_dart.tscn's sub-resources -- see HITBOX_DEBUG_RADIUS's comment for
+	# this codebase's existing precedent of tolerating a small hand-synced
+	# duplication over loading/instancing a whole separate scene just to
+	# borrow two resources.
+	var spin_rope_mat := StandardMaterial3D.new()
+	spin_rope_mat.albedo_color = Color(0.22, 0.16, 0.12)
+	spin_rope_mat.metallic = 0.1
+	spin_rope_mat.roughness = 0.75
+	spin_rope_mat.emission_enabled = true
+	spin_rope_mat.emission = Color(0.1, 0.07, 0.05)
+	var spin_rope_shape := CylinderMesh.new()
+	spin_rope_shape.top_radius = 0.02
+	spin_rope_shape.bottom_radius = 0.02
+	spin_rope_shape.height = 1.0
+	var spin_rope := MeshInstance3D.new()
+	spin_rope.name = "ChargeSpinRope"
+	spin_rope.mesh = spin_rope_shape
+	spin_rope.set_surface_override_material(0, spin_rope_mat)
+	spin_rope.visible = false
+	dagger_attachment.add_child(spin_rope)
+	_charge_spin_rope = spin_rope
 
 	var coil_attachment := BoneAttachment3D.new()
 	coil_attachment.name = "RopeCoilAttachment"
@@ -385,6 +438,39 @@ func _setup_dagger_in_hand() -> void:
 		coil_instance.rotation_degrees = Vector3(90.0, 0.0, 0.0)
 		coil_attachment.add_child(coil_instance)
 	_rope_coil_in_hand = coil_attachment
+
+
+func _update_charge_spin(delta: float) -> void:
+	## Winding up: the dart orbits the hand on a short taut rope while
+	## charging, in the handslot.r attachment's own local space -- both the
+	## dart's offset and the rope endpoint are local positions within that
+	## same space, so this needs no bone-pose queries or cross-space math.
+	## Depicts "spinning the rope" during the windup, distinct from the
+	## Wrap/Grapple-Bind design note in CLAUDE.md (that's about the thrown
+	## dart's arc, not this pre-throw animation).
+	if _charge_spin_dart == null or _charge_spin_rope == null:
+		return
+	if not _is_charging:
+		_charge_spin_dart.visible = false
+		_charge_spin_rope.visible = false
+		return
+	_charge_spin_angle = fmod(_charge_spin_angle + CHARGE_SPIN_SPEED * delta, TAU)
+	var offset := Vector3(cos(_charge_spin_angle), 0.0, sin(_charge_spin_angle)) * CHARGE_SPIN_RADIUS
+	_charge_spin_dart.visible = true
+	_charge_spin_dart.position = offset
+
+	var length: float = offset.length()
+	if length < 0.001:
+		_charge_spin_rope.visible = false
+		return
+	_charge_spin_rope.visible = true
+	var y_axis: Vector3 = offset / length
+	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
+	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
+	# Local (not global) transform -- both endpoints (origin = the hand, and
+	# offset) are already expressed in the attachment's own local space.
+	_charge_spin_rope.transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), offset * 0.5)
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:
@@ -449,10 +535,11 @@ func _process(delta: float) -> void:
 
 	if player_mesh == null:
 		return
-	if _dagger_in_hand != null:
-		_dagger_in_hand.visible = (dart == null)
+	if _static_dagger_mesh != null:
+		_static_dagger_mesh.visible = (dart == null and not _is_charging)
 	if _rope_coil_in_hand != null:
 		_rope_coil_in_hand.visible = (dart == null)
+	_update_charge_spin(delta)
 	if is_dead or is_falling:
 		return
 
