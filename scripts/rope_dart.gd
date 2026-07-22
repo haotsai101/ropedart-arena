@@ -7,11 +7,12 @@ extends Node3D
 ## over unchanged from the previous straight-thrown-dagger weapon, which is
 ## current codebase, not the old (discarded) rope dart design.
 ##
-## Unlike that dagger, this weapon stays tethered: a rope is drawn from the
-## owner's hand to the head every frame in every state, and the owner can
-## actively recall it (see recall()) from anywhere -- flying or anchored --
-## instead of only retrieving it by walking over it (still also supported;
-## walking within pickup_radius always retrieves it too).
+## Unlike that dagger, this weapon stays tethered: a multi-segment sagging
+## rope (see ROPE_SEGMENTS) is drawn from the owner's hand to the head every
+## frame in every state, and the owner can actively recall it (see recall())
+## from anywhere -- flying or anchored -- instead of only retrieving it by
+## walking over it (still also supported; walking within pickup_radius
+## always retrieves it too).
 ##
 ## Hit resolution distinguishes head vs. body: a head hit (tight radius right
 ## at the top of the target's capsule) is an instant kill, same as the old
@@ -62,15 +63,43 @@ const BASE_MAX_RANGE: float = 7.0
 const CAPSULE_DIR: Vector2 = Vector2(0, -1)
 @export var capsule_height: float = 1.4
 
+## Number of straight segments the rope is drawn as between hand and head --
+## a single stretched segment (the old approach) reads as a rigid rod
+## recalculated every frame rather than an actual rope, since it's always
+## the exact straight-line distance between the two points. Sampling
+## several points along a sagging curve and drawing a short segment between
+## each pair gives it a real hanging-rope silhouette instead.
+const ROPE_SEGMENTS: int = 8
+## World-space vertical droop applied at the rope's midpoint, scaled by its
+## current length (a fully-extended throw sags more than a rope that's
+## mostly reeled back in during RECALLING).
+const ROPE_SAG_FACTOR: float = 0.12
+const ROPE_SAG_MAX: float = 0.35
+
 var state: int = State.FLYING
 var owner_player: Node3D = null
 var head_2d: Vector2 = Vector2.ZERO
 var origin_2d: Vector2 = Vector2.ZERO
 var dir_2d: Vector2 = Vector2.ZERO
 var charge_ratio: float = 0.0
+var _rope_segments: Array[MeshInstance3D] = []
 
 @onready var head_mesh: Node3D = $Head
 @onready var rope_mesh: MeshInstance3D = $Rope
+
+
+func _ready() -> void:
+	# $Rope (authored in rope_dart.tscn, with the actual rope material) is
+	# segment 0; build the rest by sharing its mesh + material rather than
+	# duplicating the scene-authored resources.
+	_rope_segments.append(rope_mesh)
+	var shared_mat: Material = rope_mesh.get_surface_override_material(0)
+	for i in range(ROPE_SEGMENTS - 1):
+		var seg := MeshInstance3D.new()
+		seg.mesh = rope_mesh.mesh
+		seg.set_surface_override_material(0, shared_mat)
+		add_child(seg)
+		_rope_segments.append(seg)
 
 
 func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) -> void:
@@ -297,15 +326,39 @@ func _update_rope() -> void:
 	var owner_pos_2d: Vector2 = owner_player.get_pos_2d()
 	var from: Vector3 = Vector3(owner_pos_2d.x, owner_player.global_position.y + rope_hand_height, owner_pos_2d.y)
 	var to: Vector3 = head_mesh.global_position
-	var diff: Vector3 = to - from
-	var length: float = diff.length()
-	if length < 0.05:
-		rope_mesh.visible = false
+	var total_length: float = from.distance_to(to)
+	if total_length < 0.05:
+		for seg in _rope_segments:
+			seg.visible = false
 		return
-	rope_mesh.visible = true
+
+	# Sample points along a shallow hanging curve (parabolic droop, zero at
+	# both ends, peak at the midpoint) instead of a single straight line --
+	# see ROPE_SEGMENTS' comment for why.
+	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
+	var n: int = _rope_segments.size()
+	var points: Array[Vector3] = []
+	points.resize(n + 1)
+	for i in range(n + 1):
+		var t: float = float(i) / float(n)
+		var p: Vector3 = from.lerp(to, t)
+		p.y -= sag * 4.0 * t * (1.0 - t)
+		points[i] = p
+
+	for i in range(n):
+		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
+
+
+func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
+	var diff: Vector3 = to_pt - from_pt
+	var length: float = diff.length()
+	if length < 0.001:
+		seg.visible = false
+		return
+	seg.visible = true
 	var y_axis: Vector3 = diff / length
 	# Any vector not parallel to y_axis works as a basis seed for building an
-	# orthonormal frame around it; UP fails only when the rope points
+	# orthonormal frame around it; UP fails only when a segment points
 	# (near-)vertically, which never happens here since both endpoints share
 	# roughly the same height band, but guard it anyway.
 	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
@@ -314,4 +367,4 @@ func _update_rope() -> void:
 	# CylinderMesh's unit height runs along local Y -- encode the stretch
 	# directly into that basis column rather than touching .scale separately,
 	# so this single assignment can't fight with any other transform write.
-	rope_mesh.global_transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), (from + to) * 0.5)
+	seg.global_transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), (from_pt + to_pt) * 0.5)

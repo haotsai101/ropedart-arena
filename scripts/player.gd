@@ -60,9 +60,14 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 var player_mesh: Node3D = null
 var character_id: String = "char_barbarian"
 var _mesh_base_scale: Vector3 = Vector3.ONE
-## Dart head + coiled rope held in the character's hand until thrown -- see
+## Dart head held in the character's hand until thrown -- see
 ## _setup_dagger_in_hand(); visibility mirrors (dart == null) every frame.
 var _dagger_in_hand: Node3D = null
+## Coiled rope worn around the forearm until thrown -- separate attachment
+## point from _dagger_in_hand (lowerarm.r, not handslot.r) so it doesn't
+## overlap the dagger's own geometry; visibility mirrors (dart == null)
+## alongside it.
+var _rope_coil_in_hand: Node3D = null
 
 var player_color: Color
 var character_color: Color = Color(0.85, 0.08, 0.04, 1.0)   # set in _ready from CHARACTER_DEFS
@@ -331,39 +336,55 @@ func _setup_dagger_in_hand() -> void:
 	## Every character rig has a "handslot.r" bone -- a KayKit-authored
 	## attachment point parented right under hand.r, positioned at the palm
 	## with its local -Y axis as the grip direction (confirmed by inspecting
-	## its rest transform) -- exactly what BoneAttachment3D needs. Holds two
-	## permanent props: the dart head (reuses rope_dart.gd's own dart_head.glb
-	## so the in-hand and in-flight weapon look identical) and a coiled rope
-	## (rope_coil.glb, matching rope_dart.tscn's rope material so the coiled
-	## and extended-while-thrown rope read as the same physical object)
-	## offset slightly so it doesn't clip through the dart head. Both are
-	## kept in sync with (dart == null) in _process() rather than at each of
-	## _throw()/_on_dart_returned()/kill()/reset_for_round(), so there's a
-	## single source of truth for it.
+	## its rest transform) -- exactly what BoneAttachment3D needs for the
+	## dart head (reuses rope_dart.gd's own dart_head.glb so the in-hand and
+	## in-flight weapon look identical).
+	##
+	## The coiled rope is a SEPARATE attachment on "lowerarm.r" instead --
+	## sharing handslot.r with the dagger put both props in the same small
+	## span of space, and the coil (built with a small inner radius) ended up
+	## overlapping/clipping inside the dagger's grip geometry. lowerarm.r
+	## measures 0.26 units head-to-tail along its own local -Y (bone length
+	## axis), and the actual character mesh's forearm radius there measures
+	## ~0.09-0.15 (sampled directly from Barbarian.glb's skinned vertices) --
+	## rope_coil.glb's inner radius (0.16) was sized to clear that. Rotating
+	## 90 deg around local X maps the coil's flat spiral normal (local +Z)
+	## onto the bone's length axis (local -Y), so it encircles the forearm
+	## like a wrapped coil instead of lying flat against it. Positioned at
+	## the bone's local half-length (-0.13) to sit at the forearm's midpoint.
+	##
+	## Both props are kept in sync with (dart == null) in _process() rather
+	## than at each of _throw()/_on_dart_returned()/kill()/reset_for_round(),
+	## so there's a single source of truth for it.
 	if player_mesh == null:
 		return
 	var skeleton: Skeleton3D = _find_skeleton(player_mesh)
 	if skeleton == null:
 		return
-	var attachment := BoneAttachment3D.new()
-	attachment.name = "DaggerAttachment"
-	attachment.bone_name = "handslot.r"
-	skeleton.add_child(attachment)
 
+	var dagger_attachment := BoneAttachment3D.new()
+	dagger_attachment.name = "DaggerAttachment"
+	dagger_attachment.bone_name = "handslot.r"
+	skeleton.add_child(dagger_attachment)
 	var dagger_scene: PackedScene = load("res://assets/characters/dart_head.glb")
 	if dagger_scene != null:
 		var dagger_instance: Node3D = dagger_scene.instantiate()
 		dagger_instance.name = "DaggerInHand"
-		attachment.add_child(dagger_instance)
+		dagger_attachment.add_child(dagger_instance)
+	_dagger_in_hand = dagger_attachment
 
+	var coil_attachment := BoneAttachment3D.new()
+	coil_attachment.name = "RopeCoilAttachment"
+	coil_attachment.bone_name = "lowerarm.r"
+	skeleton.add_child(coil_attachment)
 	var coil_scene: PackedScene = load("res://assets/characters/rope_coil.glb")
 	if coil_scene != null:
 		var coil_instance: Node3D = coil_scene.instantiate()
 		coil_instance.name = "RopeCoilInHand"
-		coil_instance.position = Vector3(0.0, -0.05, 0.05)
-		attachment.add_child(coil_instance)
-
-	_dagger_in_hand = attachment
+		coil_instance.position = Vector3(0.0, -0.13, 0.0)
+		coil_instance.rotation_degrees = Vector3(90.0, 0.0, 0.0)
+		coil_attachment.add_child(coil_instance)
+	_rope_coil_in_hand = coil_attachment
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:
@@ -430,6 +451,8 @@ func _process(delta: float) -> void:
 		return
 	if _dagger_in_hand != null:
 		_dagger_in_hand.visible = (dart == null)
+	if _rope_coil_in_hand != null:
+		_rope_coil_in_hand.visible = (dart == null)
 	if is_dead or is_falling:
 		return
 
