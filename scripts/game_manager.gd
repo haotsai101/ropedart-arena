@@ -22,6 +22,12 @@ var selected_map_scene: String = "res://scenes/main.tscn"   # set by lobby.gd be
 var current_state: int = RoundState.LOBBY
 var round_wins: Dictionary = {}
 var player_characters: Dictionary = {}   # player_index (int) → character id (String)
+## "" means "use the base character's native accessory" (see CHARACTER_DEFS'
+## native_headwear/native_cloth fields, resolved via resolve_headwear_id/
+## resolve_cloth_id below) -- an explicit "none" id means the player
+## deliberately picked no accessory, distinct from "hasn't chosen yet".
+var player_headwear: Dictionary = {}     # player_index (int) → headwear id (String)
+var player_cloth: Dictionary = {}        # player_index (int) → cloth id (String)
 var _all_players: Array = []
 var _alive_players: Array = []
 var _timer: float = 0.0
@@ -43,14 +49,83 @@ const PLAYER_COLORS := [
 ## identification is applied as an emission tint across every mesh part
 ## instead of overriding one named body mesh, since these are fully textured
 ## models, not flat-shaded shapes.
+## native_headwear/native_cloth record which HEADWEAR_DEFS/CLOTH_DEFS id (below)
+## this character models natively in its own glb -- "" means it has none.
+## Picking a base character defaults its two accessory slots to these (see
+## GameManager.resolve_headwear_id/resolve_cloth_id) rather than forcing
+## everything to "none"; the player can still override either slot from there.
 const CHARACTER_DEFS: Array = [
-	{"id": "char_barbarian",    "glb_path": "res://assets/kaykit_adventurers/characters/Barbarian.glb",    "display_name": "Barbarian",      "character_color": Color(0.85, 0.08, 0.04, 1.0)},
-	{"id": "char_knight",       "glb_path": "res://assets/kaykit_adventurers/characters/Knight.glb",       "display_name": "Knight",         "character_color": Color(0.30, 0.50, 0.90, 1.0)},
-	{"id": "char_mage",         "glb_path": "res://assets/kaykit_adventurers/characters/Mage.glb",         "display_name": "Mage",           "character_color": Color(0.60, 0.20, 0.85, 1.0)},
-	{"id": "char_ranger",       "glb_path": "res://assets/kaykit_adventurers/characters/Ranger.glb",       "display_name": "Ranger",         "character_color": Color(0.18, 0.62, 0.18, 1.0)},
-	{"id": "char_rogue",        "glb_path": "res://assets/kaykit_adventurers/characters/Rogue.glb",        "display_name": "Rogue",          "character_color": Color(0.98, 0.78, 0.08, 1.0)},
-	{"id": "char_rogue_hooded", "glb_path": "res://assets/kaykit_adventurers/characters/Rogue_Hooded.glb", "display_name": "Rogue (Hooded)", "character_color": Color(0.42, 0.26, 0.62, 1.0)},
+	{"id": "char_barbarian",    "glb_path": "res://assets/kaykit_adventurers/characters/Barbarian.glb",    "display_name": "Barbarian",      "character_color": Color(0.85, 0.08, 0.04, 1.0), "native_headwear": "barbarian_bearhat",  "native_cloth": "none"},
+	{"id": "char_knight",       "glb_path": "res://assets/kaykit_adventurers/characters/Knight.glb",       "display_name": "Knight",         "character_color": Color(0.30, 0.50, 0.90, 1.0), "native_headwear": "knight_helmet",      "native_cloth": "knight_cape"},
+	{"id": "char_mage",         "glb_path": "res://assets/kaykit_adventurers/characters/Mage.glb",         "display_name": "Mage",           "character_color": Color(0.60, 0.20, 0.85, 1.0), "native_headwear": "mage_hat",           "native_cloth": "mage_cape"},
+	{"id": "char_ranger",       "glb_path": "res://assets/kaykit_adventurers/characters/Ranger.glb",       "display_name": "Ranger",         "character_color": Color(0.18, 0.62, 0.18, 1.0), "native_headwear": "none",               "native_cloth": "ranger_cape"},
+	{"id": "char_rogue",        "glb_path": "res://assets/kaykit_adventurers/characters/Rogue.glb",        "display_name": "Rogue",          "character_color": Color(0.98, 0.78, 0.08, 1.0), "native_headwear": "none",               "native_cloth": "rogue_cape"},
+	{"id": "char_rogue_hooded", "glb_path": "res://assets/kaykit_adventurers/characters/Rogue_Hooded.glb", "display_name": "Rogue (Hooded)", "character_color": Color(0.42, 0.26, 0.62, 1.0), "native_headwear": "rogue_hooded_mask",  "native_cloth": "rogue_hooded_cape"},
 ]
+
+## Headwear pool, poolable across ALL base characters (unlike base character
+## picks, duplicates are allowed here -- see CLAUDE.md's uniqueness note).
+## Each non-"none" entry's mesh_names are pulled from source_char_id's own
+## glb and reparented onto whichever base character the player picked -- see
+## scripts/character_builder.gd for how, and its header comment for why this
+## skins correctly (every character shares one skeleton, "Rig_Medium", with
+## identical bone names). Mesh names verified directly against each glb's
+## exported node names (Rogue_Hooded's parts are prefixed "RogueHooded_", not
+## "Rogue_Hooded_" -- deliberately not a naming-convention typo here).
+const HEADWEAR_DEFS: Array = [
+	{"id": "none",               "display_name": "None",        "source_char_id": "",                "mesh_names": []},
+	{"id": "barbarian_bearhat",  "display_name": "Bear Hat",     "source_char_id": "char_barbarian",    "mesh_names": ["Barbarian_BearHat"]},
+	{"id": "knight_helmet",      "display_name": "Helmet",       "source_char_id": "char_knight",       "mesh_names": ["Knight_Helmet", "Knight_HelmetVisor"]},
+	{"id": "mage_hat",           "display_name": "Wizard Hat",   "source_char_id": "char_mage",         "mesh_names": ["Mage_Hat"]},
+	{"id": "rogue_hooded_mask",  "display_name": "Hood & Mask",  "source_char_id": "char_rogue_hooded", "mesh_names": ["RogueHooded_Mask"]},
+]
+
+## Cloth/cape pool, poolable across all base characters (same rules as
+## HEADWEAR_DEFS above). Ranger/Rogue/Rogue_Hooded's own capes are included
+## here as pickable options too, not just Knight/Mage's.
+const CLOTH_DEFS: Array = [
+	{"id": "none",               "display_name": "None",        "source_char_id": "",                "mesh_names": []},
+	{"id": "knight_cape",        "display_name": "Knight Cape",  "source_char_id": "char_knight",       "mesh_names": ["Knight_Cape"]},
+	{"id": "mage_cape",          "display_name": "Mage Cape",    "source_char_id": "char_mage",         "mesh_names": ["Mage_Cape"]},
+	{"id": "ranger_cape",        "display_name": "Ranger Cape",  "source_char_id": "char_ranger",       "mesh_names": ["Ranger_Cape"]},
+	{"id": "rogue_cape",         "display_name": "Rogue Cape",   "source_char_id": "char_rogue",        "mesh_names": ["Rogue_Cape"]},
+	{"id": "rogue_hooded_cape",  "display_name": "Hooded Cape",  "source_char_id": "char_rogue_hooded", "mesh_names": ["RogueHooded_Cape"]},
+]
+
+
+func get_character_def(char_id: String) -> Dictionary:
+	for def: Dictionary in CHARACTER_DEFS:
+		if def.get("id", "") == char_id:
+			return def
+	return CHARACTER_DEFS[0]
+
+
+func get_headwear_def(headwear_id: String) -> Dictionary:
+	for def: Dictionary in HEADWEAR_DEFS:
+		if def.get("id", "") == headwear_id:
+			return def
+	return HEADWEAR_DEFS[0]  # "none"
+
+
+func get_cloth_def(cloth_id: String) -> Dictionary:
+	for def: Dictionary in CLOTH_DEFS:
+		if def.get("id", "") == cloth_id:
+			return def
+	return CLOTH_DEFS[0]  # "none"
+
+
+func resolve_headwear_id(base_char_id: String, choice: String) -> String:
+	## "" (unset) falls back to the base character's own native headwear;
+	## any other value (including the explicit "none") is used as-is.
+	if choice != "":
+		return choice
+	return str(get_character_def(base_char_id).get("native_headwear", "none"))
+
+
+func resolve_cloth_id(base_char_id: String, choice: String) -> String:
+	if choice != "":
+		return choice
+	return str(get_character_def(base_char_id).get("native_cloth", "none"))
 
 const PLAYER_HALF_HEIGHT := 0.7  # half-height of the player capsule; added to spawn marker Y
 
@@ -99,6 +174,8 @@ func _init_game_local(main: Node) -> void:
 		p.player_index = i
 		p.is_bot = (i >= human_count)
 		p.character_id = player_characters.get(i, "char_barbarian")
+		p.character_headwear_id = str(player_headwear.get(i, ""))
+		p.character_cloth_id = str(player_cloth.get(i, ""))
 		main.add_child(p)
 		round_wins[i] = 0
 		p.player_killed.connect(_on_player_killed)
@@ -148,6 +225,8 @@ func _init_game_online(main: Node) -> void:
 			p.is_network_controlled = (my_id != 1)
 
 		p.character_id = player_characters.get(i, CHARACTER_DEFS[i % CHARACTER_DEFS.size()]["id"])
+		p.character_headwear_id = str(player_headwear.get(i, ""))
+		p.character_cloth_id = str(player_cloth.get(i, ""))
 		main.add_child(p)
 		round_wins[i] = 0
 		p.player_killed.connect(_on_player_killed)
@@ -162,6 +241,11 @@ func _init_game_online(main: Node) -> void:
 
 func assign_default_characters() -> void:
 	player_characters.clear()
+	# Fresh match: reset accessory picks to "" (native) too -- a stale
+	# headwear/cloth id left over from a previous match's roster shouldn't
+	# silently carry over onto whichever base character now lands in that slot.
+	player_headwear.clear()
+	player_cloth.clear()
 	var shuffled: Array = CHARACTER_DEFS.duplicate()
 	shuffled.shuffle()
 	var slot: int = 0
@@ -181,6 +265,19 @@ func sync_characters_rpc() -> void:
 	## Lobby calls this before changing scene so all peers know the char assignments.
 	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
 		rpc("_rpc_sync_characters", player_characters)
+
+
+@rpc("authority", "call_local", "reliable")
+func _rpc_sync_accessories(headwear: Dictionary, cloth: Dictionary) -> void:
+	player_headwear = headwear
+	player_cloth = cloth
+
+
+func sync_accessories_rpc() -> void:
+	## Lobby calls this alongside sync_characters_rpc(), before changing scene,
+	## so all peers know each other's headwear/cloth picks too.
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		rpc("_rpc_sync_accessories", player_headwear, player_cloth)
 
 
 func _process(delta: float) -> void:
@@ -236,6 +333,7 @@ func start_round() -> void:
 		if player_characters.is_empty():
 			assign_default_characters()
 		rpc("_rpc_sync_characters", player_characters)
+		rpc("_rpc_sync_accessories", player_headwear, player_cloth)
 	var spawn_positions := _get_spawn_positions()
 	for i in _all_players.size():
 		var p = _all_players[i]

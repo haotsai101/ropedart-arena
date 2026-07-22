@@ -57,10 +57,16 @@ var _local_map_id: int = 0
 var _local_focus: int = 0   # 0 = total players, 1 = difficulty, 2 = map
 
 # Character selection — local game
-var _char_cursor: int = 0   # index into GameManager.CHARACTER_DEFS
+var _char_cursor: int = 0       # index into GameManager.CHARACTER_DEFS
+var _headwear_cursor: int = 0   # index into GameManager.HEADWEAR_DEFS
+var _cloth_cursor: int = 0      # index into GameManager.CLOTH_DEFS
+var _char_slot: int = 0         # which cycler row L/R affects: 0=base 1=headwear 2=cloth
 
 # Character selection — online waiting lobby
-var _wait_char_cursor: int = 0   # index into GameManager.CHARACTER_DEFS
+var _wait_char_cursor: int = 0       # index into GameManager.CHARACTER_DEFS
+var _wait_headwear_cursor: int = 0   # index into GameManager.HEADWEAR_DEFS
+var _wait_cloth_cursor: int = 0      # index into GameManager.CLOTH_DEFS
+var _wait_char_slot: int = 0      # which cycler row L/R affects within the char area: 0=base 1=headwear 2=cloth
 var _wait_area: int = 0           # 0=settings area (host), 1=char-picker area
 
 # Error/transition timer
@@ -105,6 +111,8 @@ func _ready() -> void:
 	NetworkManager.peer_disconnected.connect(_on_peer_disconnected)
 	NetworkManager.connection_failed.connect(_on_connection_failed)
 	NetworkManager.character_chosen.connect(_on_character_chosen)
+	NetworkManager.headwear_chosen.connect(_on_character_chosen)
+	NetworkManager.cloth_chosen.connect(_on_character_chosen)
 
 	if UsernameManager.has_username():
 		_set_screen("browser")
@@ -131,6 +139,10 @@ func _exit_tree() -> void:
 		NetworkManager.connection_failed.disconnect(_on_connection_failed)
 	if NetworkManager.character_chosen.is_connected(_on_character_chosen):
 		NetworkManager.character_chosen.disconnect(_on_character_chosen)
+	if NetworkManager.headwear_chosen.is_connected(_on_character_chosen):
+		NetworkManager.headwear_chosen.disconnect(_on_character_chosen)
+	if NetworkManager.cloth_chosen.is_connected(_on_character_chosen):
+		NetworkManager.cloth_chosen.disconnect(_on_character_chosen)
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +433,18 @@ func _do_fetch_rooms() -> void:
 # ===========================================================================
 
 func _build_waiting_screen() -> void:
-	_add_title("ROPE DART ARENA", 64)
+	# Smaller title than other screens -- this screen grew a 3-row accessory
+	# customizer + live preview on top of an already-tall settings/players
+	# layout, and there isn't enough vertical room in the default 1152x648
+	# window for both a full-size title and zero content clipping.
+	_add_title("ROPE DART ARENA", 44)
 
 	var vp_size: Vector2 = get_viewport_rect().size
 	var vw: float = vp_size.x
 	var vh: float = vp_size.y
-	var panel_w: float = vw * 0.72
-	var panel_h: float = vh * 0.78
-	var v_offset: float = vh * 0.025
+	var panel_w: float = vw * 0.76
+	var panel_h: float = vh * 0.885
+	var v_offset: float = vh * 0.05
 
 	var panel := _make_panel(int(panel_w), int(panel_h), int(v_offset))
 	add_child(panel)
@@ -437,10 +453,10 @@ func _build_waiting_screen() -> void:
 	var root_vbox := VBoxContainer.new()
 	root_vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
 	root_vbox.offset_left = inset
-	root_vbox.offset_top = vh * 0.025
+	root_vbox.offset_top = vh * 0.015
 	root_vbox.offset_right = -inset
-	root_vbox.offset_bottom = -(vh * 0.025)
-	root_vbox.add_theme_constant_override("separation", 14)
+	root_vbox.offset_bottom = -(vh * 0.015)
+	root_vbox.add_theme_constant_override("separation", 6)
 	root_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	panel.add_child(root_vbox)
 
@@ -502,7 +518,9 @@ func _build_waiting_screen() -> void:
 	sep2.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root_vbox.add_child(sep2)
 
-	# Character picker — all players (host navigates here with Down from settings)
+	# Character picker — all players (host navigates here with Down from settings).
+	# Three cyclable rows (base/headwear/cloth) side-by-side with a live preview --
+	# _wait_char_slot picks which row is highlighted/active when _wait_area == 1.
 	var char_header := Label.new()
 	char_header.text = "YOUR CHARACTER"
 	char_header.add_theme_font_size_override("font_size", _fs(16))
@@ -510,20 +528,47 @@ func _build_waiting_screen() -> void:
 	char_header.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root_vbox.add_child(char_header)
 
-	var my_char_id: String = (GameManager.CHARACTER_DEFS[_wait_char_cursor] as Dictionary).get("id", "char_barbarian")
-	var my_char_display: String = (GameManager.CHARACTER_DEFS[_wait_char_cursor] as Dictionary).get("display_name", "?")
-	var is_taken: bool = _is_char_taken_by_other(my_char_id)
-	var char_value_text: String = my_char_display + (" (taken!)" if is_taken else "")
+	var char_body_hbox := HBoxContainer.new()
+	char_body_hbox.add_theme_constant_override("separation", 16)
+	char_body_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(char_body_hbox)
+
+	var char_rows_vbox := VBoxContainer.new()
+	char_rows_vbox.add_theme_constant_override("separation", 6)
+	char_rows_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	char_rows_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	char_body_hbox.add_child(char_rows_vbox)
+
 	var char_area_focused: bool = (_wait_area == 1)
-	var char_row := _make_settings_row("Character", char_value_text, char_area_focused, true)
-	root_vbox.add_child(char_row)
+	var my_char_def: Dictionary = GameManager.CHARACTER_DEFS[_wait_char_cursor]
+	var my_char_id: String = str(my_char_def.get("id", "char_barbarian"))
+	var my_headwear_def: Dictionary = GameManager.HEADWEAR_DEFS[_wait_headwear_cursor]
+	var my_cloth_def: Dictionary = GameManager.CLOTH_DEFS[_wait_cloth_cursor]
+	var is_taken: bool = _is_char_taken_by_other(my_char_id)
+	var char_value_text: String = str(my_char_def.get("display_name", "?")) + (" (taken!)" if is_taken else "")
+
+	var base_row := _make_settings_row("Character", char_value_text, char_area_focused and _wait_char_slot == 0, true, 0.042)
+	char_rows_vbox.add_child(base_row)
+	var headwear_row := _make_settings_row("Headwear", str(my_headwear_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 1, true, 0.042)
+	char_rows_vbox.add_child(headwear_row)
+	var cloth_row := _make_settings_row("Cloth / Cape", str(my_cloth_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 2, true, 0.042)
+	char_rows_vbox.add_child(cloth_row)
+
+	var preview_size := Vector2(vw * 0.11, vh * 0.135)
+	var char_preview := _make_character_preview(
+		my_char_id,
+		str(my_headwear_def.get("id", "none")),
+		str(my_cloth_def.get("id", "none")),
+		preview_size
+	)
+	char_body_hbox.add_child(char_preview)
 
 	var nav_hint := Label.new()
 	nav_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	nav_hint.add_theme_font_size_override("font_size", _fs(14))
 	nav_hint.add_theme_color_override("font_color", COLOR_DIM)
 	nav_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	nav_hint.text = "◀ ▶ to pick your character" + (" (Up/Down to switch areas)" if NetworkManager.is_host else "")
+	nav_hint.text = "◀ ▶ = cycle     Up/Down = switch row" + ("   (Down from settings enters here)" if NetworkManager.is_host else "")
 	root_vbox.add_child(nav_hint)
 
 	# Separator
@@ -571,7 +616,8 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 	var row0 := _make_settings_row(
 		"Total Players",
 		str(max_p),
-		_wait_settings_focus == 0 and is_host
+		_wait_settings_focus == 0 and is_host,
+		false, 0.052
 	)
 	_wait_settings_max_lbl = row0.get_node_or_null("ValueLabel")
 	parent.add_child(row0)
@@ -580,7 +626,8 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 	var row1 := _make_settings_row(
 		"Bot Difficulty",
 		DIFFICULTY_LABELS[clampi(diff, 0, 2)],
-		_wait_settings_focus == 1 and is_host
+		_wait_settings_focus == 1 and is_host,
+		false, 0.052
 	)
 	_wait_settings_diff_lbl = row1.get_node_or_null("ValueLabel")
 	parent.add_child(row1)
@@ -589,15 +636,16 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 	var row2 := _make_settings_row(
 		"Map",
 		MAP_LABELS[clampi(map_id, 0, MAP_LABELS.size() - 1)],
-		_wait_settings_focus == 2 and is_host
+		_wait_settings_focus == 2 and is_host,
+		false, 0.052
 	)
 	_wait_settings_map_lbl = row2.get_node_or_null("ValueLabel")
 	parent.add_child(row2)
 
 
-func _make_settings_row(label_text: String, value_text: String, focused: bool, force_arrows: bool = false) -> Panel:
+func _make_settings_row(label_text: String, value_text: String, focused: bool, force_arrows: bool = false, height_ratio: float = 0.065) -> Panel:
 	var row := Panel.new()
-	row.custom_minimum_size = Vector2(0, get_viewport_rect().size.y * 0.065)
+	row.custom_minimum_size = Vector2(0, get_viewport_rect().size.y * height_ratio)
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var style := StyleBoxFlat.new()
 	style.bg_color = COLOR_ROW_FOCUSED if focused else COLOR_ROW_NORMAL
@@ -804,6 +852,80 @@ func _make_panel(w: int, h: int, v_offset: int) -> Panel:
 	return panel
 
 
+func _make_character_preview(base_id: String, headwear_id: String, cloth_id: String, preview_size: Vector2) -> Control:
+	## Live 3D preview of the assembled character (base + headwear + cloth),
+	## used by both the local and online character customizer screens.
+	## Rebuilt from scratch on every call -- callers already do a full
+	## _rebuild_ui() on any cursor move, so this matches that brute-force
+	## pattern rather than trying to update an existing SubViewport in place.
+	var frame := PanelContainer.new()
+	frame.custom_minimum_size = preview_size
+	var frame_style := StyleBoxFlat.new()
+	frame_style.bg_color = Color(0.90, 0.93, 0.84, 1.0)
+	frame_style.border_color = COLOR_PANEL_BORDER
+	frame_style.border_width_left = 2
+	frame_style.border_width_right = 2
+	frame_style.border_width_top = 2
+	frame_style.border_width_bottom = 2
+	frame_style.corner_radius_top_left = 8
+	frame_style.corner_radius_top_right = 8
+	frame_style.corner_radius_bottom_left = 8
+	frame_style.corner_radius_bottom_right = 8
+	frame.add_theme_stylebox_override("panel", frame_style)
+	frame.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	var container := SubViewportContainer.new()
+	container.stretch = true
+	container.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	frame.add_child(container)
+
+	var vp := SubViewport.new()
+	vp.size = Vector2i(maxi(int(preview_size.x), 1), maxi(int(preview_size.y), 1))
+	vp.transparent_bg = false
+	vp.own_world_3d = true
+	vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	container.add_child(vp)
+
+	var world := Node3D.new()
+	vp.add_child(world)
+
+	var env_node := WorldEnvironment.new()
+	var environment := Environment.new()
+	environment.background_mode = Environment.BG_COLOR
+	environment.background_color = Color(0.90, 0.93, 0.84, 1.0)
+	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	environment.ambient_light_color = Color(1.0, 1.0, 1.0)
+	environment.ambient_light_energy = 0.7
+	env_node.environment = environment
+	world.add_child(env_node)
+
+	var key_light := DirectionalLight3D.new()
+	key_light.rotation_degrees = Vector3(-40.0, -35.0, 0.0)
+	key_light.light_energy = 1.2
+	world.add_child(key_light)
+
+	var char_visual: Node3D = CharacterBuilder.build_character_visual(base_id, headwear_id, cloth_id)
+	if char_visual != null:
+		char_visual.scale = Vector3(0.85, 0.85, 0.85)
+		char_visual.position = Vector3(0.0, -0.7, 0.0)
+		# KayKit's modeled forward is +Z after import (see player.gd's facing
+		# comment) -- the preview camera sits on +Z looking back toward the
+		# origin, so leaving rotation at identity already faces the character
+		# toward it; a slight yaw just reads as a more natural 3/4 pose.
+		char_visual.rotation_degrees.y = -20.0
+		world.add_child(char_visual)
+
+	var cam := Camera3D.new()
+	# look_at_from_position() (rather than setting .position then calling
+	# .look_at()) works before the node is added to the tree -- Node3D.look_at()
+	# needs a valid global_transform, which requires tree membership first.
+	cam.look_at_from_position(Vector3(0.0, 0.85, 2.6), Vector3(0.0, 0.75, 0.0), Vector3.UP)
+	cam.current = true
+	world.add_child(cam)
+
+	return frame
+
+
 # ===========================================================================
 # INPUT
 # ===========================================================================
@@ -915,27 +1037,59 @@ func _input_waiting(event: InputEvent) -> void:
 	if NetworkManager.is_host:
 		_input_waiting_host(event)
 	else:
-		# Non-host: Left/Right always navigates character picker
-		if event.is_action_pressed("ui_left"):
-			_navigate_wait_char(-1)
+		# Non-host: Up/Down switches which of the 3 rows is active, Left/Right
+		# cycles that row's value (mirrors the host's char-area controls below).
+		if event.is_action_pressed("ui_up"):
+			_wait_char_slot = (_wait_char_slot - 1 + 3) % 3
+			_rebuild_ui()
+		elif event.is_action_pressed("ui_down"):
+			_wait_char_slot = (_wait_char_slot + 1) % 3
+			_rebuild_ui()
+		elif event.is_action_pressed("ui_left"):
+			_cycle_wait_slot(-1)
 		elif event.is_action_pressed("ui_right"):
-			_navigate_wait_char(1)
+			_cycle_wait_slot(1)
 
 
-func _navigate_wait_char(delta: int) -> void:
-	var char_count: int = GameManager.CHARACTER_DEFS.size()
-	_wait_char_cursor = (_wait_char_cursor + delta + char_count) % char_count
-	var char_id: String = (GameManager.CHARACTER_DEFS[_wait_char_cursor] as Dictionary).get("id", "char_barbarian")
-	NetworkManager.send_character_choice(char_id)
+func _cycle_wait_slot(delta: int) -> void:
+	## Left/Right cycles whichever of the 3 rows (_wait_char_slot) is active,
+	## broadcasting the change to other peers via NetworkManager -- mirrors
+	## _cycle_local_slot()'s single-player equivalent.
+	match _wait_char_slot:
+		0:
+			var char_count: int = GameManager.CHARACTER_DEFS.size()
+			_wait_char_cursor = (_wait_char_cursor + delta + char_count) % char_count
+			_sync_wait_accessory_defaults()
+			var char_id: String = (GameManager.CHARACTER_DEFS[_wait_char_cursor] as Dictionary).get("id", "char_barbarian")
+			NetworkManager.send_character_choice(char_id)
+			NetworkManager.send_headwear_choice(str((GameManager.HEADWEAR_DEFS[_wait_headwear_cursor] as Dictionary).get("id", "none")))
+			NetworkManager.send_cloth_choice(str((GameManager.CLOTH_DEFS[_wait_cloth_cursor] as Dictionary).get("id", "none")))
+		1:
+			var headwear_count: int = GameManager.HEADWEAR_DEFS.size()
+			_wait_headwear_cursor = (_wait_headwear_cursor + delta + headwear_count) % headwear_count
+			NetworkManager.send_headwear_choice(str((GameManager.HEADWEAR_DEFS[_wait_headwear_cursor] as Dictionary).get("id", "none")))
+		2:
+			var cloth_count: int = GameManager.CLOTH_DEFS.size()
+			_wait_cloth_cursor = (_wait_cloth_cursor + delta + cloth_count) % cloth_count
+			NetworkManager.send_cloth_choice(str((GameManager.CLOTH_DEFS[_wait_cloth_cursor] as Dictionary).get("id", "none")))
 	_rebuild_ui()
+
+
+func _sync_wait_accessory_defaults() -> void:
+	var char_def: Dictionary = GameManager.CHARACTER_DEFS[_wait_char_cursor]
+	_wait_headwear_cursor = _index_of_def_id(GameManager.HEADWEAR_DEFS, str(char_def.get("native_headwear", "none")))
+	_wait_cloth_cursor = _index_of_def_id(GameManager.CLOTH_DEFS, str(char_def.get("native_cloth", "none")))
 
 
 func _input_waiting_host(event: InputEvent) -> void:
 	if event.is_action_pressed("ui_up"):
 		if _wait_area == 1:
-			# Move from char area back to settings
-			_wait_area = 0
-			_wait_settings_focus = 2
+			if _wait_char_slot == 0:
+				# Move from char area back to settings
+				_wait_area = 0
+				_wait_settings_focus = 2
+			else:
+				_wait_char_slot -= 1
 		else:
 			_wait_settings_focus = (_wait_settings_focus - 1 + 3) % 3
 		_rebuild_settings_only()
@@ -946,17 +1100,20 @@ func _input_waiting_host(event: InputEvent) -> void:
 			else:
 				# Move from last settings row down into char area
 				_wait_area = 1
+				_wait_char_slot = 0
+		else:
+			_wait_char_slot = mini(_wait_char_slot + 1, 2)
 		_rebuild_settings_only()
 	elif event.is_action_pressed("ui_left"):
 		if _wait_area == 0:
 			_change_wait_setting(-1)
 		else:
-			_navigate_wait_char(-1)
+			_cycle_wait_slot(-1)
 	elif event.is_action_pressed("ui_right"):
 		if _wait_area == 0:
 			_change_wait_setting(1)
 		else:
-			_navigate_wait_char(1)
+			_cycle_wait_slot(1)
 	elif event.is_action_pressed("ui_accept"):
 		_start_online_game()
 
@@ -1035,6 +1192,8 @@ func _on_connected_to_room(_code: String, _peer_id: int) -> void:
 		# Non-hosts start directly in the char-picker area; hosts start in settings area.
 		_wait_area = 0 if NetworkManager.is_host else 1
 		_wait_char_cursor = 0
+		_wait_char_slot = 0
+		_sync_wait_accessory_defaults()
 		_set_screen("waiting")
 
 
@@ -1203,6 +1362,8 @@ func _input_local_config(event: InputEvent) -> void:
 func _start_local_game() -> void:
 	# Show character selection before launching — config settings stay in _local_* vars
 	_char_cursor = randi() % GameManager.CHARACTER_DEFS.size()
+	_char_slot = 0
+	_sync_local_accessory_defaults()
 	_set_screen("char_select_local")
 
 
@@ -1211,7 +1372,7 @@ func _start_local_game() -> void:
 # ===========================================================================
 
 func _build_char_select_local_screen() -> void:
-	_add_title("CHOOSE YOUR CHARACTER", 52)
+	_add_title("CUSTOMIZE YOUR FIGHTER", 52)
 
 	var vp_size: Vector2 = get_viewport_rect().size
 	var vw: float = vp_size.x
@@ -1235,127 +1396,67 @@ func _build_char_select_local_screen() -> void:
 	panel.add_child(root_vbox)
 
 	var hint := Label.new()
-	hint.text = "No two fighters can share the same fruit!"
+	hint.text = "No two fighters can share the same base character (headwear/cloth may repeat)"
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_font_size_override("font_size", _fs(16))
 	hint.add_theme_color_override("font_color", COLOR_DIM)
 	hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root_vbox.add_child(hint)
 
-	# Character icon mapping keyed by character ID
-	var char_icons: Dictionary = {
-		"char_barbarian":    "🪓",
-		"char_knight":       "🛡️",
-		"char_mage":         "🧙",
-		"char_ranger":       "🏹",
-		"char_rogue":        "🗡️",
-		"char_rogue_hooded": "🥷",
-	}
+	# Split body: cycler rows on the left, live 3D preview on the right.
+	var body_hbox := HBoxContainer.new()
+	body_hbox.add_theme_constant_override("separation", 20)
+	body_hbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	body_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(body_hbox)
 
-	# Character grid — 4 columns, larger tiles
-	var grid := GridContainer.new()
-	grid.columns = 4
-	grid.add_theme_constant_override("h_separation", 10)
-	grid.add_theme_constant_override("v_separation", 10)
-	grid.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root_vbox.add_child(grid)
+	var rows_vbox := VBoxContainer.new()
+	rows_vbox.add_theme_constant_override("separation", 12)
+	rows_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	rows_vbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	rows_vbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	rows_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	body_hbox.add_child(rows_vbox)
 
-	for idx: int in GameManager.CHARACTER_DEFS.size():
-		var def: Dictionary = GameManager.CHARACTER_DEFS[idx]
-		var char_id: String = def.get("id", "")
-		var display_name: String = def.get("display_name", "?")
-		var is_selected: bool = (idx == _char_cursor)
-		var icon: String = char_icons.get(char_id, "✦")
+	var base_def: Dictionary = GameManager.CHARACTER_DEFS[_char_cursor]
+	var headwear_def: Dictionary = GameManager.HEADWEAR_DEFS[_headwear_cursor]
+	var cloth_def: Dictionary = GameManager.CLOTH_DEFS[_cloth_cursor]
 
-		var btn := Button.new()
-		btn.text = ""
-		btn.custom_minimum_size = Vector2(vw * 0.14, vh * 0.12)
-		btn.focus_mode = Control.FOCUS_NONE   # keyboard nav via _char_cursor
-		btn.clip_contents = false
+	var base_row := _make_settings_row("Character", str(base_def.get("display_name", "?")), _char_slot == 0, true)
+	rows_vbox.add_child(base_row)
+	var headwear_row := _make_settings_row("Headwear", str(headwear_def.get("display_name", "?")), _char_slot == 1, true)
+	rows_vbox.add_child(headwear_row)
+	var cloth_row := _make_settings_row("Cloth / Cape", str(cloth_def.get("display_name", "?")), _char_slot == 2, true)
+	rows_vbox.add_child(cloth_row)
 
-		var selected_bg := Color(0.98, 0.88, 0.70, 1.0)
-		var normal_style := StyleBoxFlat.new()
-		normal_style.bg_color = selected_bg if is_selected else COLOR_ROW_NORMAL
-		normal_style.border_color = COLOR_BORDER_FOCUSED if is_selected else COLOR_BORDER_NORMAL
-		normal_style.border_width_left   = 4 if is_selected else 1
-		normal_style.border_width_right  = 4 if is_selected else 1
-		normal_style.border_width_top    = 4 if is_selected else 1
-		normal_style.border_width_bottom = 4 if is_selected else 1
-		normal_style.corner_radius_top_left     = 8
-		normal_style.corner_radius_top_right    = 8
-		normal_style.corner_radius_bottom_left  = 8
-		normal_style.corner_radius_bottom_right = 8
-		btn.add_theme_stylebox_override("normal",  normal_style)
-		btn.add_theme_stylebox_override("hover",   normal_style)
-		btn.add_theme_stylebox_override("pressed", normal_style)
-		btn.add_theme_stylebox_override("focus",   normal_style)
+	var slot_hint := Label.new()
+	slot_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	slot_hint.add_theme_font_size_override("font_size", _fs(15))
+	slot_hint.add_theme_color_override("font_color", COLOR_PROMPT)
+	slot_hint.text = "Up/Down = switch slot     Left/Right = cycle"
+	slot_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rows_vbox.add_child(slot_hint)
 
-		# Inner VBoxContainer: emoji + name + optional checkmark
-		var inner := VBoxContainer.new()
-		inner.set_anchors_preset(Control.PRESET_FULL_RECT)
-		inner.alignment = BoxContainer.ALIGNMENT_CENTER
-		inner.add_theme_constant_override("separation", 2)
-		inner.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		btn.add_child(inner)
-
-		var icon_lbl := Label.new()
-		icon_lbl.text = icon
-		icon_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		icon_lbl.add_theme_font_size_override("font_size", _fs(26))
-		icon_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		inner.add_child(icon_lbl)
-
-		var name_lbl := Label.new()
-		name_lbl.text = display_name
-		name_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		name_lbl.add_theme_font_size_override("font_size", _fs(15))
-		name_lbl.add_theme_color_override("font_color", COLOR_ACCENT if is_selected else COLOR_TEXT)
-		name_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		inner.add_child(name_lbl)
-
-		if is_selected:
-			var check_lbl := Label.new()
-			check_lbl.text = "✓ SELECTED"
-			check_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-			check_lbl.add_theme_font_size_override("font_size", _fs(11))
-			check_lbl.add_theme_color_override("font_color", COLOR_ACCENT)
-			check_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-			inner.add_child(check_lbl)
-
-		var capture_idx: int = idx   # capture for lambda
-		btn.pressed.connect(func():
-			_char_cursor = capture_idx
-			_commit_local_char_select()
-		)
-		grid.add_child(btn)
+	var preview_size := Vector2(vw * 0.22, vh * 0.42)
+	var preview := _make_character_preview(
+		str(base_def.get("id", "char_barbarian")),
+		str(headwear_def.get("id", "none")),
+		str(cloth_def.get("id", "none")),
+		preview_size
+	)
+	body_hbox.add_child(preview)
 
 	var sep := HSeparator.new()
 	sep.add_theme_color_override("color", COLOR_PANEL_BORDER)
 	sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root_vbox.add_child(sep)
 
-	# Bottom: selected-name display + navigation hints
-	var bottom_vbox := VBoxContainer.new()
-	bottom_vbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	bottom_vbox.add_theme_constant_override("separation", 6)
-	bottom_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root_vbox.add_child(bottom_vbox)
-
-	var selected_def: Dictionary = GameManager.CHARACTER_DEFS[_char_cursor]
-	var selected_name: String = selected_def.get("display_name", "?")
-	var selected_lbl := Label.new()
-	selected_lbl.text = "Selected:  " + selected_name
-	selected_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	selected_lbl.add_theme_font_size_override("font_size", _fs(20))
-	selected_lbl.add_theme_color_override("font_color", COLOR_VALUE)
-	selected_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	bottom_vbox.add_child(selected_lbl)
-
+	# Bottom: navigation hints
 	var action_hbox := HBoxContainer.new()
 	action_hbox.alignment = BoxContainer.ALIGNMENT_CENTER
 	action_hbox.add_theme_constant_override("separation", 40)
 	action_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	bottom_vbox.add_child(action_hbox)
+	root_vbox.add_child(action_hbox)
 
 	var back_lbl := Label.new()
 	back_lbl.text = "[Esc] Back"
@@ -1365,7 +1466,7 @@ func _build_char_select_local_screen() -> void:
 	action_hbox.add_child(back_lbl)
 
 	var nav_lbl := Label.new()
-	nav_lbl.text = "Arrow keys to browse   •   Enter or click to pick"
+	nav_lbl.text = "Enter to start the match"
 	nav_lbl.add_theme_font_size_override("font_size", _fs(16))
 	nav_lbl.add_theme_color_override("font_color", COLOR_PROMPT)
 	nav_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1373,19 +1474,16 @@ func _build_char_select_local_screen() -> void:
 
 
 func _input_char_select_local(event: InputEvent) -> void:
-	var char_count: int = GameManager.CHARACTER_DEFS.size()
-	if event.is_action_pressed("ui_left"):
-		_char_cursor = (_char_cursor - 1 + char_count) % char_count
-		_rebuild_ui()
-	elif event.is_action_pressed("ui_right"):
-		_char_cursor = (_char_cursor + 1) % char_count
-		_rebuild_ui()
-	elif event.is_action_pressed("ui_up"):
-		_char_cursor = (_char_cursor - 4 + char_count) % char_count
+	if event.is_action_pressed("ui_up"):
+		_char_slot = (_char_slot - 1 + 3) % 3
 		_rebuild_ui()
 	elif event.is_action_pressed("ui_down"):
-		_char_cursor = (_char_cursor + 4) % char_count
+		_char_slot = (_char_slot + 1) % 3
 		_rebuild_ui()
+	elif event.is_action_pressed("ui_left"):
+		_cycle_local_slot(-1)
+	elif event.is_action_pressed("ui_right"):
+		_cycle_local_slot(1)
 	elif event.is_action_pressed("ui_accept"):
 		_commit_local_char_select()
 	elif event is InputEventKey and (event as InputEventKey).pressed:
@@ -1398,12 +1496,52 @@ func _input_char_select_local(event: InputEvent) -> void:
 			_set_screen("local_config")
 
 
+func _cycle_local_slot(delta: int) -> void:
+	## Left/Right cycles whichever of the 3 rows (_char_slot) is active.
+	## Changing the base character resets headwear/cloth to ITS native picks
+	## (see _sync_local_accessory_defaults()) rather than leaving a mismatched
+	## accessory choice hanging over from a previous base character.
+	match _char_slot:
+		0:
+			var char_count: int = GameManager.CHARACTER_DEFS.size()
+			_char_cursor = (_char_cursor + delta + char_count) % char_count
+			_sync_local_accessory_defaults()
+		1:
+			var headwear_count: int = GameManager.HEADWEAR_DEFS.size()
+			_headwear_cursor = (_headwear_cursor + delta + headwear_count) % headwear_count
+		2:
+			var cloth_count: int = GameManager.CLOTH_DEFS.size()
+			_cloth_cursor = (_cloth_cursor + delta + cloth_count) % cloth_count
+	_rebuild_ui()
+
+
+func _sync_local_accessory_defaults() -> void:
+	var char_def: Dictionary = GameManager.CHARACTER_DEFS[_char_cursor]
+	_headwear_cursor = _index_of_def_id(GameManager.HEADWEAR_DEFS, str(char_def.get("native_headwear", "none")))
+	_cloth_cursor = _index_of_def_id(GameManager.CLOTH_DEFS, str(char_def.get("native_cloth", "none")))
+
+
+func _index_of_def_id(defs_pool: Array, def_id: String) -> int:
+	for i: int in defs_pool.size():
+		if (defs_pool[i] as Dictionary).get("id", "") == def_id:
+			return i
+	return 0
+
+
 func _commit_local_char_select() -> void:
 	var human_char: String = (GameManager.CHARACTER_DEFS[_char_cursor] as Dictionary).get("id", "char_barbarian")
+	var human_headwear: String = (GameManager.HEADWEAR_DEFS[_headwear_cursor] as Dictionary).get("id", "none")
+	var human_cloth: String = (GameManager.CLOTH_DEFS[_cloth_cursor] as Dictionary).get("id", "none")
 
-	# Assign human slot, then fill bots with remaining characters in order
+	# Assign human slot, then fill bots with remaining characters in order.
+	# Bots' headwear/cloth are left unset ("") so they default to each bot's
+	# own native accessory rather than forcing everything to none.
 	GameManager.player_characters.clear()
+	GameManager.player_headwear.clear()
+	GameManager.player_cloth.clear()
 	GameManager.player_characters[0] = human_char
+	GameManager.player_headwear[0] = human_headwear
+	GameManager.player_cloth[0] = human_cloth
 
 	var remaining: Array = []
 	for def in GameManager.CHARACTER_DEFS:
@@ -1448,6 +1586,10 @@ func _start_online_game() -> void:
 	# Assign characters from peer choices with conflict resolution, then sync.
 	_assign_online_characters()
 	GameManager.sync_characters_rpc()
+	# Headwear/cloth allow duplicates across players, so no conflict resolution
+	# is needed here -- just carry each peer's raw pick straight through.
+	_assign_online_accessories()
+	GameManager.sync_accessories_rpc()
 	get_tree().change_scene_to_file(GameManager.selected_map_scene)
 	GameManager.call_deferred("_init_game")
 
@@ -1486,6 +1628,19 @@ func _assign_online_characters() -> void:
 						GameManager.player_characters[i] = cid
 						used.append(cid)
 						break
+
+
+func _assign_online_accessories() -> void:
+	## Map peer headwear/cloth choices onto player slots -- no conflict
+	## resolution needed since accessories may duplicate across players (see
+	## CLAUDE.md's uniqueness note, scoped to the base character only).
+	var total: int = GameManager.total_players
+	for i: int in total:
+		var peer_id: int = i + 1
+		if NetworkManager.peer_headwear.has(peer_id):
+			GameManager.player_headwear[i] = str(NetworkManager.peer_headwear[peer_id])
+		if NetworkManager.peer_cloth.has(peer_id):
+			GameManager.player_cloth[i] = str(NetworkManager.peer_cloth[peer_id])
 
 
 func _on_character_chosen(_peer_id: int, _char_id: String) -> void:

@@ -14,6 +14,8 @@ signal game_starting
 signal host_disconnected
 signal rooms_fetched(rooms: Array)           # Array of room Dicts from /rooms
 signal character_chosen(peer_id: int, char_id: String)
+signal headwear_chosen(peer_id: int, headwear_id: String)
+signal cloth_chosen(peer_id: int, cloth_id: String)
 
 const MAX_PLAYERS := 6
 
@@ -23,6 +25,8 @@ var room_code := ""
 var room_settings: Dictionary = {"max_players": 4, "bot_difficulty": 0, "map_id": 0}
 var room_players: Array = []   # [{username, peer_id}]
 var peer_characters: Dictionary = {}   # peer_id (int) → character id (String)
+var peer_headwear: Dictionary = {}     # peer_id (int) → headwear id (String), "" = native
+var peer_cloth: Dictionary = {}        # peer_id (int) → cloth id (String), "" = native
 
 var _signaling_url := "wss://ropedart-arena.onrender.com"
 
@@ -87,6 +91,8 @@ func disconnect_from_room() -> void:
 	room_players.clear()
 	room_settings = {"max_players": 4, "bot_difficulty": 0, "map_id": 0}
 	peer_characters.clear()
+	peer_headwear.clear()
+	peer_cloth.clear()
 	multiplayer.multiplayer_peer = null
 
 
@@ -105,6 +111,20 @@ func send_character_choice(char_id: String) -> void:
 	peer_characters[my_peer_id] = char_id
 	emit_signal("character_chosen", my_peer_id, char_id)
 	_send_signal({"type": "character_choice", "char_id": char_id})
+
+
+func send_headwear_choice(headwear_id: String) -> void:
+	## Same pattern as send_character_choice(), for the headwear slot.
+	peer_headwear[my_peer_id] = headwear_id
+	emit_signal("headwear_chosen", my_peer_id, headwear_id)
+	_send_signal({"type": "headwear_choice", "headwear_id": headwear_id})
+
+
+func send_cloth_choice(cloth_id: String) -> void:
+	## Same pattern as send_character_choice(), for the cloth/cape slot.
+	peer_cloth[my_peer_id] = cloth_id
+	emit_signal("cloth_chosen", my_peer_id, cloth_id)
+	_send_signal({"type": "cloth_choice", "cloth_id": cloth_id})
 
 
 func fetch_rooms() -> void:
@@ -266,6 +286,22 @@ func _handle_signal(msg: Dictionary) -> void:
 			if peer_id > 0 and peer_id != my_peer_id:
 				peer_characters[peer_id] = char_id
 				emit_signal("character_chosen", peer_id, char_id)
+
+		"headwear_choice":
+			# Same relay pattern as "character_choice", for the headwear slot.
+			var peer_id: int = int(msg.get("peer_id", 0))
+			var headwear_id: String = str(msg.get("headwear_id", ""))
+			if peer_id > 0 and peer_id != my_peer_id:
+				peer_headwear[peer_id] = headwear_id
+				emit_signal("headwear_chosen", peer_id, headwear_id)
+
+		"cloth_choice":
+			# Same relay pattern as "character_choice", for the cloth/cape slot.
+			var peer_id: int = int(msg.get("peer_id", 0))
+			var cloth_id: String = str(msg.get("cloth_id", ""))
+			if peer_id > 0 and peer_id != my_peer_id:
+				peer_cloth[peer_id] = cloth_id
+				emit_signal("cloth_chosen", peer_id, cloth_id)
 
 		"error":
 			emit_signal("connection_failed", str(msg.get("message", "Unknown signaling error")))
