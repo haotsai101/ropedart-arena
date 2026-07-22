@@ -78,20 +78,18 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 const DART_STATE_ANCHORED: int = 1
 const DART_ROPE_LENGTH: float = 8.0
 
-## The persistent rope's segment count/sag, and the CylinderMesh dimensions
-## its segments share -- moved here from rope_dart.gd (formerly the dart's
-## own, separately-spawned tether) now that the rope is one object the
-## player always owns; radius matches rope_dart.tscn's old Rope mesh exactly
-## so the extended look is unchanged. See _update_persistent_rope().
-## Segment count is 16, not the old dart-owned rope's 8 -- these segments now
-## also have to draw a tight ROPE_COIL_TURNS-turn spiral when idle (see
-## _render_rope_coiled()), and 8 straight segments across 2 turns would read
-## as an 8-pointed star rather than a coil (~90 deg of arc per segment). A
-## mostly-straight extended line doesn't need the extra segments but isn't
-## hurt by them either.
+## The persistent rope's idle-coil segment count and the CylinderMesh
+## dimensions every rope visual (idle coil AND the physics chain further
+## below) shares -- moved here from rope_dart.gd (formerly the dart's own,
+## separately-spawned tether) now that the rope is one object the player
+## always owns; radius matches rope_dart.tscn's old Rope mesh exactly so the
+## look is unchanged. See _update_persistent_rope(). Only used for the idle
+## coil now -- the thrown/extended look is the real physics chain (see
+## ROPE_PHYSICS_SEGMENTS below), not these same segments reshaped, so this
+## count only has to look good as a ROPE_COIL_TURNS-turn spiral (16 segments
+## across 2 turns; 8 would read as an 8-pointed star rather than a coil, ~90
+## deg of arc per segment).
 const ROPE_SEGMENTS: int = 16
-const ROPE_SAG_FACTOR: float = 0.12
-const ROPE_SAG_MAX: float = 0.35
 const ROPE_RADIUS: float = 0.035
 ## Idle coil shape: a tight spiral centered at _rope_coil_anchor, radius
 ## growing from inner to outer across ROPE_COIL_TURNS full turns. INNER must
@@ -102,6 +100,47 @@ const ROPE_RADIUS: float = 0.035
 const ROPE_COIL_TURNS: float = 2.0
 const ROPE_COIL_RADIUS_INNER: float = 0.16
 const ROPE_COIL_RADIUS_OUTER: float = 0.24
+
+## --- Real physics rope chain (the EXTENDED/thrown look, dart != null) ---
+## Per explicit user direction: three earlier attempts at a scripted
+## hand-computed line (straight, then straight-with-raycast-truncation, then
+## per-segment-raycast-truncation) all read as "the rope goes into the
+## pillar/cactus" in real screenshots despite each one's own positional
+## verification passing -- the user's actual ask is that the rope be a real
+## RigidBody3D chain that Godot's own physics solver simulates and collides
+## against the map's real obstacle geometry, so collision-correctness and
+## draping-over-an-obstacle are emergent from simulation instead of anyone
+## calculating a bend point by hand. See _spawn_physics_rope().
+##
+## The IDLE/coiled look (dart == null, ROPE_SEGMENTS/_render_rope_coiled()
+## above) deliberately stays the old cheap kinematic coil -- there's no
+## obstacle to avoid while the rope is just sitting on the character's own
+## arm, so full simulation there would only add jitter risk for zero visual
+## benefit.
+##
+## Segment count is lower than the idle coil's 16 -- physics joint chains get
+## less stable as they get longer, and 8 is enough to read as a rope at this
+## game's camera distance without excess joint count per simultaneously
+## thrown dart (up to ~6 at once in a full match).
+const ROPE_PHYSICS_SEGMENTS: int = 8
+## Total simulated chain length always equals DART_ROPE_LENGTH (the dart's
+## own fixed max range), regardless of the CURRENT hand-to-dart distance --
+## matches rope_dart.gd's own "fixed rope length, not charge-scaled" design.
+## When the dart is anchored closer than this, the chain carries visible
+## slack/sag between the two ends rather than stretching taut, which is
+## actually the physically correct look for a rope longer than the gap it
+## spans -- not verified visually, see this session's final report for the
+## honest caveat on how a short throw's slack reads on screen.
+const ROPE_PHYSICS_SEGMENT_LENGTH: float = DART_ROPE_LENGTH / float(ROPE_PHYSICS_SEGMENTS)
+const ROPE_SEGMENT_MASS: float = 0.03
+const ROPE_LINEAR_DAMP: float = 1.6
+const ROPE_ANGULAR_DAMP: float = 2.2
+## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
+## comment for why it's duplicated rather than shared, and for the
+## one-directional layer/mask design (chain reacts to obstacles; nothing
+## reacts to the chain) that keeps this simulated rope from ever pushing a
+## player or interfering with the dart's own already-working flight raycast.
+const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
 
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
@@ -136,6 +175,18 @@ var _rope_coil_anchor: Node3D = null
 ## segment meshes for both, so it's one object changing shape rather than a
 ## coil mesh swapped for a separately-spawned tether.
 var _rope_segments: Array[MeshInstance3D] = []
+## Shared material for both the idle-coil segments above and the physics-rope
+## meshes below -- stored here (rather than only as a local in
+## _setup_dagger_in_hand()) so _spawn_physics_rope() can reuse the exact same
+## look without duplicating the material setup.
+var _rope_material: StandardMaterial3D = null
+## The real physics-simulated rope chain (see the ROPE_PHYSICS_* consts'
+## comment) -- only exists while dart != null; built in _spawn_physics_rope(),
+## torn down in _free_physics_rope(), both driven from _update_persistent_rope().
+var _physics_rope_root: Node3D = null
+var _physics_rope_hand_anchor: RigidBody3D = null
+var _physics_rope_tip_anchor: RigidBody3D = null
+var _physics_rope_active: bool = false
 ## Dart head that orbits the hand on a taut rope while charging, depicting
 ## winding up the throw -- see _update_charge_spin().
 var _charge_spin_dart: Node3D = null
@@ -513,6 +564,7 @@ func _setup_dagger_in_hand() -> void:
 	rope_mat.roughness = 0.75
 	rope_mat.emission_enabled = true
 	rope_mat.emission = Color(0.1, 0.07, 0.05)
+	_rope_material = rope_mat
 	var rope_shape := CylinderMesh.new()
 	rope_shape.top_radius = ROPE_RADIUS
 	rope_shape.bottom_radius = ROPE_RADIUS
@@ -758,6 +810,10 @@ func _process(delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	# Drive the physics rope chain's two kinematic endpoints in sync with the
+	# physics tick (not _process()) -- unconditional/no-op-safe regardless of
+	# state below, see _update_physics_rope_anchors()'s own comment.
+	_update_physics_rope_anchors()
 	if is_dead:
 		_is_charging = false
 		return
@@ -1041,18 +1097,25 @@ func get_hand_world_position() -> Vector3:
 
 
 func _update_persistent_rope() -> void:
-	## The rope is one object, always present at the arm -- idle it's drawn
-	## coiled (see _render_rope_coiled()), thrown the exact same segments
-	## redraw as a straight sagging line out to the dart
-	## (_render_rope_extended()). No literal unspooling motion: it reads as
-	## "uncoiling" because the same object's shape grows from a small coil
-	## into a long line as the dart flies out, not because anything spins.
-	if _rope_segments.is_empty():
-		return
+	## Idle (dart == null): the old cheap kinematic coil, drawn via the
+	## ROPE_SEGMENTS MeshInstance3D array (see _render_rope_coiled()).
+	## Thrown (dart != null): a real RigidBody3D chain that Godot's own
+	## physics engine simulates and collides against actual obstacle geometry
+	## (see _spawn_physics_rope()) -- built once per throw, torn down once
+	## the dart returns. The two looks use entirely separate node sets now
+	## (previously the same 16 MeshInstance3D segments were reshaped for
+	## both), so the idle segments are explicitly hidden while the physics
+	## chain is active rather than repurposed for it.
 	if dart == null:
-		_render_rope_coiled()
+		if _physics_rope_active:
+			_free_physics_rope()
+		if not _rope_segments.is_empty():
+			_render_rope_coiled()
 	else:
-		_render_rope_extended()
+		for seg in _rope_segments:
+			seg.visible = false
+		if not _physics_rope_active:
+			_spawn_physics_rope()
 
 
 func _render_rope_coiled() -> void:
@@ -1074,68 +1137,153 @@ func _render_rope_coiled() -> void:
 		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
 
 
-func _render_rope_extended() -> void:
-	## Straight line from the real hand position to the dart's pommel, both
-	## pinned to the dart's own fixed plane_y -- identical math to what used
-	## to live in rope_dart.gd's _update_rope() before the rope moved to
-	## being player-owned; only the source of "the dart" changed (duck-typed
-	## off `dart` here instead of `self`).
-	var plane_y: float = dart.plane_y
-	var hand_pos: Vector3 = get_hand_world_position()
-	var from: Vector3 = Vector3(hand_pos.x, plane_y, hand_pos.z)
-	var to: Vector3 = dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
-	to.y = plane_y
-
-	var total_length: float = from.distance_to(to)
-	if total_length < 0.05:
-		for seg in _rope_segments:
-			seg.visible = false
+func _spawn_physics_rope() -> void:
+	## Builds the real RigidBody3D chain: a kinematic hand anchor, a kinematic
+	## tip anchor (tracked toward the dart every physics tick -- see
+	## _update_physics_rope_anchors(), called from _physics_process()),
+	## ROPE_PHYSICS_SEGMENTS dynamic segments between them, and a PinJoint3D
+	## between every consecutive pair. Godot's own solver is what keeps this
+	## off of pillars/trees/cacti -- see the ROPE_PHYSICS_* consts' comment
+	## for why nothing here computes a bend point or reads any obstacle's
+	## rect/shape data directly.
+	##
+	## Parented under get_parent() (the arena root), not under self -- self is
+	## a moving CharacterBody3D, and physics bodies nested under a moving
+	## Node3D would need top_level=true to avoid their transforms getting
+	## double-applied; simplest to just avoid the nesting entirely (same
+	## parenting rope_dart.gd's own dart instance already uses from _throw()).
+	if _physics_rope_root != null:
 		return
+	var root := Node3D.new()
+	root.name = "PhysicsRopeChain_%d" % player_index
+	get_parent().add_child(root)
+	_physics_rope_root = root
 
-	# Sample points along a shallow hanging curve (parabolic droop, zero at
-	# both ends, peak at the midpoint) before any collision check -- the
-	# curve itself is what needs testing, not just its two endpoints: an
-	# obstacle can intersect only the sagging middle of the rope even when
-	# the straight hand->dart line clears it entirely.
-	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
-	var n: int = _rope_segments.size()
-	var points: Array[Vector3] = []
-	points.resize(n + 1)
-	for i in range(n + 1):
-		var t: float = float(i) / float(n)
-		var p: Vector3 = from.lerp(to, t)
-		p.y -= sag * 4.0 * t * (1.0 - t)
-		points[i] = p
+	var hand_pos: Vector3 = get_hand_world_position()
+	_physics_rope_hand_anchor = _make_rope_anchor_body(root, "RopeHandAnchor", hand_pos)
+	_physics_rope_tip_anchor = _make_rope_anchor_body(root, "RopeTipAnchor", hand_pos)
 
-	# Real physics raycast, one per segment along the actual sampled curve --
-	# most commonly relevant while ANCHORED, when the owner (or a bot walking
-	# to retrieve it) can end up on any side of an obstacle relative to a
-	# dart stuck on its far face, putting part of the rope through solid
-	# geometry. Same technique the dart's own flight uses to stop
-	# (rope_dart.gd's _raycast_obstacle()), just walked along every segment
-	# instead of checked once for the whole span -- real collision data, not
-	# hand-rolled corner/edge geometry. Every player body is excluded (the
-	# rope always passes freely through characters), same as that raycast.
-	# The first blocked segment collapses every point after it to the
-	# obstruction, so the rope visibly stops there instead of drawing
-	# through whatever it hit.
-	var space_state: PhysicsDirectSpaceState3D = get_world_3d().direct_space_state
-	var excluded: Array[RID] = []
-	for p in get_tree().get_nodes_in_group("players"):
-		if p is CollisionObject3D:
-			excluded.append((p as CollisionObject3D).get_rid())
-	for i in range(n):
-		var query := PhysicsRayQueryParameters3D.create(points[i], points[i + 1])
-		query.exclude = excluded
-		var block: Dictionary = space_state.intersect_ray(query)
-		if not block.is_empty():
-			var stop: Vector3 = block.get("position")
-			for j in range(i + 1, n + 1):
-				points[j] = stop
-			break
+	var prev: RigidBody3D = _physics_rope_hand_anchor
+	for i in range(ROPE_PHYSICS_SEGMENTS):
+		# Laid out along a tiny initial droop below the hand rather than all
+		# coincident at one point -- physics solvers converge far more
+		# reliably from a plausible starting pose than from every body
+		# stacked on the same coordinates.
+		var seg_pos: Vector3 = hand_pos + Vector3(0.0, -0.02 * float(i + 1), 0.0)
+		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_pos)
+		_join_rope_bodies(root, prev, seg)
+		prev = seg
+	_join_rope_bodies(root, prev, _physics_rope_tip_anchor)
+	_physics_rope_active = true
 
-	for i in range(n):
-		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
+
+func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> RigidBody3D:
+	## A driven (kinematic-frozen) endpoint with no collision shape and no
+	## mesh of its own -- purely a joint attachment point whose position is
+	## overwritten every physics tick (see _update_physics_rope_anchors()).
+	## collision_layer/mask both 0: it must never be detectable by, or react
+	## to, anything (including the real obstacle layer the segments below
+	## react to) -- it's just a moving pin, not a physical object.
+	var body := RigidBody3D.new()
+	body.name = node_name
+	body.freeze = true
+	body.freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
+	body.collision_layer = 0
+	body.collision_mask = 0
+	# Must add_child() before setting global_position -- global_position's
+	# setter calls get_global_transform() internally, which errors ("Returning
+	# Transform3D()") on a node that isn't inside the tree yet.
+	parent.add_child(body)
+	body.global_position = pos
+	return body
+
+
+func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3) -> RigidBody3D:
+	## One real physics link: a capsule collider (smoother than a cylinder for
+	## sliding along an obstacle's edge/corner, same reasoning games commonly
+	## use capsules for chain links) plus a CylinderMesh child purely for
+	## rendering -- the mesh needs no per-frame code at all since it's a
+	## child of the body Godot's own solver is already moving.
+	## collision_mask = ROPE_OBSTACLE_LAYER_BIT ONLY (not the default layer):
+	## reacts to real obstacle geometry, never to players/ground/the dart
+	## head. collision_layer = 0: nothing else's mask can ever detect this
+	## segment either -- strictly one-directional, so the chain can never
+	## push a player or otherwise leak into gameplay logic.
+	var body := RigidBody3D.new()
+	body.name = node_name
+	body.mass = ROPE_SEGMENT_MASS
+	body.linear_damp = ROPE_LINEAR_DAMP
+	body.angular_damp = ROPE_ANGULAR_DAMP
+	body.continuous_cd = true
+	body.collision_layer = 0
+	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
+
+	var shape := CollisionShape3D.new()
+	var capsule := CapsuleShape3D.new()
+	capsule.radius = ROPE_RADIUS
+	capsule.height = ROPE_PHYSICS_SEGMENT_LENGTH
+	shape.shape = capsule
+	body.add_child(shape)
+
+	var mesh_shape := CylinderMesh.new()
+	mesh_shape.top_radius = ROPE_RADIUS
+	mesh_shape.bottom_radius = ROPE_RADIUS
+	mesh_shape.height = ROPE_PHYSICS_SEGMENT_LENGTH
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh_shape
+	if _rope_material != null:
+		mi.set_surface_override_material(0, _rope_material)
+	body.add_child(mi)
+
+	# Must add_child() before setting global_position -- same is_inside_tree()
+	# requirement as _make_rope_anchor_body() above.
+	parent.add_child(body)
+	body.global_position = pos
+	return body
+
+
+func _join_rope_bodies(parent: Node3D, a: RigidBody3D, b: RigidBody3D) -> void:
+	## Standard Godot rope-chain recipe: a PinJoint3D (ball-socket, holds both
+	## bodies' attachment points coincident -- this is what prevents the
+	## chain from stretching) between every consecutive pair. The joint node
+	## only needs to be positioned correctly once, at setup time; the
+	## constraint is stored relative to each body from that moment and keeps
+	## working as both bodies move afterward, so this needs no per-frame code.
+	var joint := PinJoint3D.new()
+	parent.add_child(joint)
+	joint.global_position = (a.global_position + b.global_position) * 0.5
+	joint.node_a = joint.get_path_to(a)
+	joint.node_b = joint.get_path_to(b)
+
+
+func _update_physics_rope_anchors() -> void:
+	## Drives the two kinematic endpoints every physics tick -- called from
+	## _physics_process() unconditionally (no-ops via _physics_rope_active
+	## when there's no active chain). The hand end always tracks
+	## get_hand_world_position(); the tip end tracks the dart's actual
+	## rendered pommel position (identical point the old scripted renderer
+	## used as its "to"), whatever the dart's current state (FLYING/ANCHORED/
+	## RECALLING) -- so the chain is simulated for the dart's entire time out,
+	## not just while anchored. See this session's final report for the
+	## explicit, known instability risk this carries during FLYING/RECALLING,
+	## when the tip anchor can move at up to travel_speed/recall_speed
+	## (18-36 units/sec) in a single tick.
+	if not _physics_rope_active:
+		return
+	if _physics_rope_hand_anchor != null:
+		_physics_rope_hand_anchor.global_position = get_hand_world_position()
+	if _physics_rope_tip_anchor != null and dart != null and is_instance_valid(dart) and dart.head_mesh != null:
+		var pommel: Vector3 = dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
+		_physics_rope_tip_anchor.global_position = pommel
+
+
+func _free_physics_rope() -> void:
+	if _physics_rope_root != null and is_instance_valid(_physics_rope_root):
+		_physics_rope_root.queue_free()
+	_physics_rope_root = null
+	_physics_rope_hand_anchor = null
+	_physics_rope_tip_anchor = null
+	_physics_rope_active = false
 
 
 func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
