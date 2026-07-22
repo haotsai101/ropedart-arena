@@ -49,6 +49,20 @@ const BASE_SPEED: float = 18.0
 ## _ready() comment on the 0.85 mesh scale) -- 4x that.
 const ROPE_LENGTH: float = 8.0
 
+## Obstacle collision boxes (pillars in main.tscn, trees/cacti added by
+## nature_scatter.gd's _add_obstacle_collision) all uniformly span world Y
+## [0.0, 2.0]. get_hand_world_position() tracks the owner's actual animated
+## hand bone, which sweeps through a wide arc during the charge/throw
+## animations -- sampled raw at the exact instant launch() fires, this
+## occasionally landed near/below ground (rope render fell under the floor)
+## or above the obstacle band (the raycast's fixed-height line passed clean
+## over a pillar it visually looked like it should hit, since a physics ray
+## only detects geometry actually intersecting that one exact height).
+## Clamping the one-time sample into a safe band well inside the shared
+## obstacle range fixes both without needing to fight the animation's timing.
+const MIN_PLANE_Y: float = 0.5
+const MAX_PLANE_Y: float = 1.6
+
 ## A player's hitbox is a capsule (base at their ground position, extending
 ## toward CAPSULE_DIR by capsule_height) instead of a single circle, so it
 ## covers head-to-toe rather than just the body's ground footprint. This
@@ -129,8 +143,9 @@ func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) 
 	charge_ratio = ratio
 	# Scale speed only -- rope length is fixed (ROPE_LENGTH), not charge-scaled.
 	travel_speed = BASE_SPEED * lerp(1.0, 2.0, ratio)
-	plane_y = player.get_hand_world_position().y if player.has_method("get_hand_world_position") \
+	var raw_hand_y: float = player.get_hand_world_position().y if player.has_method("get_hand_world_position") \
 		else player.global_position.y + 1.0
+	plane_y = clampf(raw_hand_y, MIN_PLANE_Y, MAX_PLANE_Y)
 	# Larger dart mesh at higher charge gives instant visual feedback on launch
 	head_mesh.scale = Vector3.ONE * lerp(1.0, 1.5, ratio)
 
