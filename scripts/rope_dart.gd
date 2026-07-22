@@ -76,6 +76,14 @@ const ROPE_SEGMENTS: int = 8
 const ROPE_SAG_FACTOR: float = 0.12
 const ROPE_SAG_MAX: float = 0.35
 
+## dart_head.glb's own local geometry, measured directly off its exported
+## glTF vertex data (NOT by re-importing into Blender, which silently
+## converts back from glTF's Y-up to Blender's Z-up and hides the real
+## axes): blade tip at local Z=-0.55, pommel at local Z=+0.315 -- so "blade
+## forward" is local -Z, and the rope should attach at the pommel end
+## (DAGGER_POMMEL_OFFSET), not the model's origin.
+const DAGGER_POMMEL_OFFSET: float = 0.315
+
 var state: int = State.FLYING
 var owner_player: Node3D = null
 var head_2d: Vector2 = Vector2.ZERO
@@ -319,13 +327,36 @@ func _render() -> void:
 	var height: float = visual_height if state == State.FLYING else visual_height * 0.25
 	var mid_y: float = owner_player.global_position.y + height
 	head_mesh.global_position = Vector3(head_2d.x, mid_y, head_2d.y)
+
+	# Blade points away from wherever the rope currently comes from (the
+	# owner) -- covers FLYING (roughly dir_2d, but stays correct even if the
+	# owner moves mid-flight), ANCHORED (re-orients if the owner walks around
+	# it), and RECALLING (blade trails, pommel leads back toward the owner)
+	# with one rule instead of three special cases. Falls back to dir_2d
+	# only in the degenerate case of head_2d and the owner coinciding.
+	var owner_pos_2d: Vector2 = owner_player.get_pos_2d()
+	var blade_dir_2d: Vector2 = head_2d - owner_pos_2d
+	if blade_dir_2d.length() < 0.01:
+		blade_dir_2d = dir_2d
+	if blade_dir_2d.length() > 0.001:
+		var blade_forward: Vector3 = Vector3(blade_dir_2d.x, 0.0, blade_dir_2d.y).normalized()
+		var z_axis: Vector3 = -blade_forward
+		var basis_seed: Vector3 = Vector3.RIGHT if absf(z_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+		var x_axis: Vector3 = basis_seed.cross(z_axis).normalized()
+		var y_axis: Vector3 = z_axis.cross(x_axis).normalized()
+		head_mesh.global_transform.basis = Basis(x_axis, y_axis, z_axis)
+
 	_update_rope()
 
 
 func _update_rope() -> void:
 	var owner_pos_2d: Vector2 = owner_player.get_pos_2d()
 	var from: Vector3 = Vector3(owner_pos_2d.x, owner_player.global_position.y + rope_hand_height, owner_pos_2d.y)
-	var to: Vector3 = head_mesh.global_position
+	# Attach at the dagger's pommel (DAGGER_POMMEL_OFFSET along its own local
+	# +Z), not its origin -- transforming by head_mesh's full global
+	# transform (not just its position) so this follows the blade's current
+	# orientation too.
+	var to: Vector3 = head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
 	var total_length: float = from.distance_to(to)
 	if total_length < 0.05:
 		for seg in _rope_segments:

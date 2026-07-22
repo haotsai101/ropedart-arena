@@ -39,6 +39,16 @@ const MELEE_CONE_DEG: float = 50.0
 const CHARGE_SPIN_RADIUS: float = 0.35
 const CHARGE_SPIN_SPEED_MIN: float = TAU * 3.0  # ~3 rev/sec at the start of a charge
 const CHARGE_SPIN_SPEED_MAX: float = TAU * 7.0  # ~7 rev/sec at a full charge
+## dart_head.glb's own local geometry, measured directly off its exported
+## glTF vertex data (NOT by re-importing into Blender, which silently
+## converts back from glTF's Y-up to Blender's Z-up and hides the real
+## axes): blade tip at local Z=-0.55, pommel at local Z=+0.315 -- so "blade
+## forward" is local -Z, and a rope should attach at the pommel end
+## (DAGGER_POMMEL_OFFSET), not the model's origin. Duplicated from
+## rope_dart.gd's own copy of this same constant/comment rather than shared
+## across the two scripts -- see HITBOX_DEBUG_RADIUS for this codebase's
+## existing precedent on tolerating small hand-synced duplication like this.
+const DAGGER_POMMEL_OFFSET: float = 0.315
 ## Once a charge hits MAX_CHARGE_TIME, "Sword_Idle" is already holding its
 ## final frame (it's a one-shot clip, not looped -- see LOOPING_CLIPS'
 ## comment) -- a small fast tremble on top of that held pose reads as
@@ -482,19 +492,40 @@ func _update_charge_spin(delta: float) -> void:
 	var offset: Vector3 = forward_3d * (cos(_charge_spin_angle) * CHARGE_SPIN_RADIUS) \
 		+ Vector3.UP * (sin(_charge_spin_angle) * CHARGE_SPIN_RADIUS)
 	var pivot: Vector3 = _dagger_in_hand.global_position
+	var dart_world: Vector3 = pivot + offset
 	_charge_spin_dart.visible = true
-	_charge_spin_dart.global_position = pivot + offset
+	_charge_spin_dart.global_position = dart_world
 
 	var length: float = offset.length()
 	if length < 0.001:
 		_charge_spin_rope.visible = false
 		return
+	var out_dir: Vector3 = offset / length
+	# Blade points radially outward (away from the pivot, the same direction
+	# the dart is currently orbiting toward) -- local -Z, per
+	# DAGGER_POMMEL_OFFSET's comment on the model's own axes.
+	var z_axis: Vector3 = -out_dir
+	var basis_seed: Vector3 = Vector3.RIGHT if absf(z_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+	var x_axis: Vector3 = basis_seed.cross(z_axis).normalized()
+	var y_axis: Vector3 = z_axis.cross(x_axis).normalized()
+	_charge_spin_dart.global_transform.basis = Basis(x_axis, y_axis, z_axis)
+
+	# Rope attaches at the pommel (opposite end from the outward-pointing
+	# blade), not the dart's origin -- pommel sits DAGGER_POMMEL_OFFSET back
+	# toward the pivot along the same radial line.
+	var pommel_world: Vector3 = dart_world - out_dir * DAGGER_POMMEL_OFFSET
+	var rope_length: float = pivot.distance_to(pommel_world)
+	if rope_length < 0.001:
+		_charge_spin_rope.visible = false
+		return
 	_charge_spin_rope.visible = true
-	var y_axis: Vector3 = offset / length
-	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
-	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
-	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
-	_charge_spin_rope.global_transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), pivot + offset * 0.5)
+	var rope_y_axis: Vector3 = (pommel_world - pivot) / rope_length
+	var rope_seed: Vector3 = Vector3.RIGHT if absf(rope_y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+	var rope_x_axis: Vector3 = rope_seed.cross(rope_y_axis).normalized()
+	var rope_z_axis: Vector3 = rope_x_axis.cross(rope_y_axis).normalized()
+	_charge_spin_rope.global_transform = Transform3D(
+		Basis(rope_x_axis, rope_y_axis * rope_length, rope_z_axis), pivot + (pommel_world - pivot) * 0.5
+	)
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:
@@ -621,6 +652,23 @@ func _process(delta: float) -> void:
 		var dir3 := Vector3(facing_target.x, 0.0, facing_target.y).normalized()
 		var desired_quat: Quaternion = Basis.looking_at(-dir3, Vector3.UP).get_rotation_quaternion()
 		player_mesh.quaternion = player_mesh.quaternion.slerp(desired_quat, clampf(12.0 * delta, 0.0, 1.0))
+
+	# The held dagger's blade points outward along the character's current
+	# facing, computed fresh in world space every frame rather than as a
+	# fixed rotation on the handslot.r attachment -- the hand bone's own
+	# world orientation constantly changes as Idle_A/Walking_A/Sword_Idle
+	# each pose the arm differently, so any single baked-in local rotation
+	# would only look right in whichever pose it was tuned against. See
+	# DAGGER_POMMEL_OFFSET's comment for the model's own local -Z = "blade
+	# forward" axis.
+	if _static_dagger_mesh != null:
+		var dagger_forward: Vector3 = Vector3(_facing_dir.x, 0.0, _facing_dir.y)
+		if dagger_forward.length() > 0.001:
+			var dz_axis: Vector3 = -dagger_forward.normalized()
+			var d_seed: Vector3 = Vector3.RIGHT if absf(dz_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+			var dx_axis: Vector3 = d_seed.cross(dz_axis).normalized()
+			var dy_axis: Vector3 = dz_axis.cross(dx_axis).normalized()
+			_static_dagger_mesh.global_transform.basis = Basis(dx_axis, dy_axis, dz_axis)
 
 	# Subtle procedural bob for extra juice — real leg/arm swing is now
 	# animation-driven, so this only needs to be a light vertical accent.
