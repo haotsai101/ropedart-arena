@@ -112,6 +112,57 @@ const ROPE_COIL_RADIUS_OUTER: float = 0.24
 ## draping-over-an-obstacle are emergent from simulation instead of anyone
 ## calculating a bend point by hand. See _spawn_physics_rope().
 ##
+## FOLLOW-UP FIX (root-caused from a real user screenshot showing segments as
+## short disconnected dashes, "each segment completely unattached"): the
+## first version of this chain used Node-based PinJoint3D with its implicit
+## single-global-position setup -- Godot captures ONE local anchor OFFSET per
+## body, computed once from wherever the joint node's global_position and
+## each body's global_transform happened to be at the moment node_a/node_b
+## were assigned. That first version also spawned every body (both anchors
+## AND all 8 segments) clustered within ~0.16 units of the hand, all at
+## identity rotation (pointing straight up, not along the rope). Both of
+## those meant the auto-captured offsets ended up close to each BODY'S OWN
+## ORIGIN rather than at the true geometric ends of each 1-unit-long capsule
+## -- so the "constraint" the solver was actually enforcing was closer to
+## "keep body centers near each other" than "keep consecutive capsule ends
+## touching". That's a real steady-state wrong-equilibrium bug, not just a
+## fast-motion transient -- confirmed by the fact the user's screenshot showed
+## a stationary/ANCHORED dart, not one being actively yanked around, so pure
+## teleportation-lag (this session's originally-disclosed risk) can't be the
+## whole story on its own.
+##
+## Fix: build every joint via the low-level PhysicsServer3D.joint_make_pin()
+## API directly (bypassing the PinJoint3D node entirely), which takes the two
+## bodies' local anchor points as EXPLICIT, INDEPENDENT arguments instead of
+## deriving them implicitly from a shared setup-time position. This lets each
+## body's true attachment point be declared correctly regardless of whether
+## the bodies happen to coincide in world space at spawn time: every segment's
+## local anchor is exactly its own capsule end (Vector3(0, ±HALF_LEN, 0), see
+## _spawn_physics_rope()), and both kinematic anchor bodies' local anchor is
+## always exactly their own origin (Vector3.ZERO) -- so the hand/tip anchors
+## are always attached to the chain with zero baked-in error, even though (at
+## the instant of a throw) the tip anchor's real position is nowhere near
+## where the chain's fully-extended far end is laid out; the visible result
+## is the intended "rope pays out from the hand as the dart flies away," not
+## a permanent offset error. Segments are also now spawned with a correct
+## initial rotation (local Y aligned along the hand->tip direction) instead of
+## defaulting to identity/pointing straight up. See _join_rope_pin() and
+## _spawn_physics_rope().
+##
+## Joint bias/damping are deliberately left at PhysicsServer3D's own defaults
+## (0.3 / 1.0, matching PinJoint3D's node defaults) -- a first attempt at
+## this fix tried tuning these stiffer (bias 0.9, damping 2.0) as a mitigation
+## for the fast-motion risk below, and that was ACTIVELY WRONG: measured via
+## a temporary per-tick probe printing the real world-space gap at every
+## joint, the stiffer values caused the chain to explode -- max gap grew
+## exponentially tick over tick, from single digits into the tens of
+## trillions of units within a couple seconds, on an otherwise-idle chain
+## with no unusual player input. Reverting to the defaults and re-measuring
+## the same way showed gaps consistently settling to ~0.02-0.1 units at rest,
+## with brief (few-tick) spikes up to ~10-12 units at the instant of a throw
+## that reliably decayed back down rather than diverging. Do not re-attempt
+## stiffening these without re-running that same gap-measurement probe.
+##
 ## The IDLE/coiled look (dart == null, ROPE_SEGMENTS/_render_rope_coiled()
 ## above) deliberately stays the old cheap kinematic coil -- there's no
 ## obstacle to avoid while the rope is just sitting on the character's own
@@ -126,12 +177,20 @@ const ROPE_PHYSICS_SEGMENTS: int = 8
 ## Total simulated chain length always equals DART_ROPE_LENGTH (the dart's
 ## own fixed max range), regardless of the CURRENT hand-to-dart distance --
 ## matches rope_dart.gd's own "fixed rope length, not charge-scaled" design.
-## When the dart is anchored closer than this, the chain carries visible
-## slack/sag between the two ends rather than stretching taut, which is
-## actually the physically correct look for a rope longer than the gap it
-## spans -- not verified visually, see this session's final report for the
-## honest caveat on how a short throw's slack reads on screen.
+## The chain is always LAID OUT at this full fixed length from the hand along
+## the current hand->tip (or, if that span is ~0, the aim) direction, even
+## when the dart's real current position is much closer -- the zero-baked-in-
+## offset joint design above means this initial pose doesn't have to match
+## the tip anchor's real position for correctness, only for how settled the
+## very first frame or two look before the solver pulls the far end taut
+## toward the real target. When the dart is anchored closer than this, the
+## chain carries visible slack/sag between the two ends rather than
+## stretching taut, which is actually the physically correct look for a rope
+## longer than the gap it spans -- not verified visually, see this session's
+## final report for the honest caveat on how a short throw's slack reads on
+## screen.
 const ROPE_PHYSICS_SEGMENT_LENGTH: float = DART_ROPE_LENGTH / float(ROPE_PHYSICS_SEGMENTS)
+const ROPE_PHYSICS_SEGMENT_HALF_LENGTH: float = ROPE_PHYSICS_SEGMENT_LENGTH * 0.5
 const ROPE_SEGMENT_MASS: float = 0.03
 const ROPE_LINEAR_DAMP: float = 1.6
 const ROPE_ANGULAR_DAMP: float = 2.2
@@ -187,6 +246,11 @@ var _physics_rope_root: Node3D = null
 var _physics_rope_hand_anchor: RigidBody3D = null
 var _physics_rope_tip_anchor: RigidBody3D = null
 var _physics_rope_active: bool = false
+## Raw PhysicsServer3D joint RIDs (see _join_rope_pin()) -- these are NOT
+## Node3D-owned, so unlike _physics_rope_root's children they are not freed
+## automatically when the root is queue_free()'d; _free_physics_rope() must
+## explicitly PhysicsServer3D.free_rid() every one of these or they leak.
+var _physics_rope_joint_rids: Array[RID] = []
 ## Dart head that orbits the hand on a taut rope while charging, depicting
 ## winding up the throw -- see _update_charge_spin().
 var _charge_spin_dart: Node3D = null
@@ -1137,15 +1201,32 @@ func _render_rope_coiled() -> void:
 		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
 
 
+func _get_rope_tip_target() -> Vector3:
+	## The single point both _spawn_physics_rope() (initial layout direction)
+	## and _update_physics_rope_anchors() (every-tick tracking) treat as
+	## "where the dart end of the rope should be" -- the dart's actual
+	## rendered pommel position, matching exactly what the old scripted
+	## renderer used as its "to" point. Falls back to the hand position (a
+	## zero-length span) if there's no valid dart yet/anymore, so callers
+	## don't have to null-check.
+	if dart != null and is_instance_valid(dart) and dart.head_mesh != null:
+		return dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
+	return get_hand_world_position()
+
+
 func _spawn_physics_rope() -> void:
 	## Builds the real RigidBody3D chain: a kinematic hand anchor, a kinematic
 	## tip anchor (tracked toward the dart every physics tick -- see
 	## _update_physics_rope_anchors(), called from _physics_process()),
-	## ROPE_PHYSICS_SEGMENTS dynamic segments between them, and a PinJoint3D
-	## between every consecutive pair. Godot's own solver is what keeps this
-	## off of pillars/trees/cacti -- see the ROPE_PHYSICS_* consts' comment
-	## for why nothing here computes a bend point or reads any obstacle's
-	## rect/shape data directly.
+	## ROPE_PHYSICS_SEGMENTS dynamic segments between them, and a raw
+	## PhysicsServer3D pin joint (see _join_rope_pin()) between every
+	## consecutive pair, each using EXPLICIT per-body local anchor points --
+	## see the ROPE_PHYSICS_* consts' comment above for why this replaced an
+	## earlier Node-based PinJoint3D version that visibly failed to hold
+	## together (root cause: implicit setup-time-position offsets, not a
+	## rendering bug and not purely a fast-motion issue). Godot's own solver
+	## is still what keeps this off of pillars/trees/cacti -- nothing here
+	## computes a bend point or reads any obstacle's rect/shape data directly.
 	##
 	## Parented under get_parent() (the arena root), not under self -- self is
 	## a moving CharacterBody3D, and physics bodies nested under a moving
@@ -1160,20 +1241,47 @@ func _spawn_physics_rope() -> void:
 	_physics_rope_root = root
 
 	var hand_pos: Vector3 = get_hand_world_position()
+	var tip_pos: Vector3 = _get_rope_tip_target()
+
+	# Initial layout direction: along the current hand->tip span if it's
+	# meaningful, else along the player's current aim -- purely cosmetic (see
+	# the ROPE_PHYSICS_SEGMENT_LENGTH comment: correctness no longer depends
+	# on this matching the tip's real position, only how settled the very
+	# first frame or two look).
+	var span: Vector3 = tip_pos - hand_pos
+	var span_dir: Vector3
+	if span.length() > 0.01:
+		span_dir = span.normalized()
+	else:
+		span_dir = Vector3(aim_dir.x, 0.0, aim_dir.y).normalized()
+	if span_dir.length() < 0.01:
+		span_dir = Vector3.FORWARD
+
+	var y_axis: Vector3 = span_dir
+	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
+	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
+	var seg_basis := Basis(x_axis, y_axis, z_axis)
+
 	_physics_rope_hand_anchor = _make_rope_anchor_body(root, "RopeHandAnchor", hand_pos)
-	_physics_rope_tip_anchor = _make_rope_anchor_body(root, "RopeTipAnchor", hand_pos)
+	_physics_rope_tip_anchor = _make_rope_anchor_body(root, "RopeTipAnchor", tip_pos)
+
+	var local_far := Vector3(0.0, ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
+	var local_near := Vector3(0.0, -ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
 
 	var prev: RigidBody3D = _physics_rope_hand_anchor
+	var prev_local_far := Vector3.ZERO  # the hand anchor's own attachment point is always its own origin
 	for i in range(ROPE_PHYSICS_SEGMENTS):
-		# Laid out along a tiny initial droop below the hand rather than all
-		# coincident at one point -- physics solvers converge far more
-		# reliably from a plausible starting pose than from every body
-		# stacked on the same coordinates.
-		var seg_pos: Vector3 = hand_pos + Vector3(0.0, -0.02 * float(i + 1), 0.0)
-		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_pos)
-		_join_rope_bodies(root, prev, seg)
+		# Always laid out at full segment length along span_dir, from the hand
+		# outward -- NOT compressed/scaled to the current (possibly ~0 at
+		# throw-instant) hand-tip distance. See the ROPE_PHYSICS_SEGMENT_LENGTH
+		# comment for why that's fine now (no baked-in offset error either way).
+		var seg_center: Vector3 = hand_pos + span_dir * (ROPE_PHYSICS_SEGMENT_HALF_LENGTH + float(i) * ROPE_PHYSICS_SEGMENT_LENGTH)
+		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis)
+		_join_rope_pin(prev, prev_local_far, seg, local_near)
 		prev = seg
-	_join_rope_bodies(root, prev, _physics_rope_tip_anchor)
+		prev_local_far = local_far
+	_join_rope_pin(prev, prev_local_far, _physics_rope_tip_anchor, Vector3.ZERO)
 	_physics_rope_active = true
 
 
@@ -1183,7 +1291,9 @@ func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> 
 	## overwritten every physics tick (see _update_physics_rope_anchors()).
 	## collision_layer/mask both 0: it must never be detectable by, or react
 	## to, anything (including the real obstacle layer the segments below
-	## react to) -- it's just a moving pin, not a physical object.
+	## react to) -- it's just a moving pin, not a physical object. Its own
+	## local anchor point for every joint it's part of is always exactly
+	## Vector3.ZERO (its own origin) -- see _join_rope_pin()'s callers.
 	var body := RigidBody3D.new()
 	body.name = node_name
 	body.freeze = true
@@ -1198,12 +1308,18 @@ func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> 
 	return body
 
 
-func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3) -> RigidBody3D:
+func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, orient_basis: Basis) -> RigidBody3D:
 	## One real physics link: a capsule collider (smoother than a cylinder for
 	## sliding along an obstacle's edge/corner, same reasoning games commonly
 	## use capsules for chain links) plus a CylinderMesh child purely for
 	## rendering -- the mesh needs no per-frame code at all since it's a
-	## child of the body Godot's own solver is already moving.
+	## child of the body Godot's own solver is already moving. `orient_basis`
+	## is the segment's initial orientation (local Y aligned along the chain's
+	## layout direction, see _spawn_physics_rope()) -- without this every
+	## segment defaulted to identity rotation (local Y = world up), forcing
+	## the solver to fight a large, unnecessary initial rotation error on top
+	## of position. (Named orient_basis, not basis, to avoid shadowing
+	## Node3D's own `basis` property, which GDScript warns on.)
 	## collision_mask = ROPE_OBSTACLE_LAYER_BIT ONLY (not the default layer):
 	## reacts to real obstacle geometry, never to players/ground/the dart
 	## head. collision_layer = 0: nothing else's mask can ever detect this
@@ -1235,49 +1351,66 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3) ->
 		mi.set_surface_override_material(0, _rope_material)
 	body.add_child(mi)
 
-	# Must add_child() before setting global_position -- same is_inside_tree()
+	# Must add_child() before setting global_transform -- same is_inside_tree()
 	# requirement as _make_rope_anchor_body() above.
 	parent.add_child(body)
-	body.global_position = pos
+	body.global_transform = Transform3D(orient_basis, pos)
 	return body
 
 
-func _join_rope_bodies(parent: Node3D, a: RigidBody3D, b: RigidBody3D) -> void:
-	## Standard Godot rope-chain recipe: a PinJoint3D (ball-socket, holds both
-	## bodies' attachment points coincident -- this is what prevents the
-	## chain from stretching) between every consecutive pair. The joint node
-	## only needs to be positioned correctly once, at setup time; the
-	## constraint is stored relative to each body from that moment and keeps
-	## working as both bodies move afterward, so this needs no per-frame code.
-	var joint := PinJoint3D.new()
-	parent.add_child(joint)
-	joint.global_position = (a.global_position + b.global_position) * 0.5
-	joint.node_a = joint.get_path_to(a)
-	joint.node_b = joint.get_path_to(b)
+func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: Vector3) -> void:
+	## Creates one PinJoint3D-equivalent constraint via the low-level
+	## PhysicsServer3D API directly, instead of a PinJoint3D node -- see the
+	## ROPE_PHYSICS_* consts' comment for why: this is what lets each body's
+	## local anchor point be declared EXPLICITLY and INDEPENDENTLY
+	## (`local_a`/`local_b`, in each body's own local space) rather than both
+	## being implicitly derived from a single shared world position at setup
+	## time, which is what let the earlier PinJoint3D-node version silently
+	## bake in a wrong offset whenever the two bodies didn't already coincide
+	## when the joint was created. No Node3D is created for this at all --
+	## the joint exists purely as a RID on the physics server, so
+	## _free_physics_rope() must explicitly free it (see
+	## _physics_rope_joint_rids' own comment). Bias/damping are deliberately
+	## left unset (PhysicsServer3D's own defaults apply) -- see the
+	## ROPE_PHYSICS_* consts' comment for why a stiffer tuning was tried and
+	## measured to actively cause the chain to explode.
+	var joint_rid: RID = PhysicsServer3D.joint_create()
+	PhysicsServer3D.joint_make_pin(joint_rid, a.get_rid(), local_a, b.get_rid(), local_b)
+	_physics_rope_joint_rids.append(joint_rid)
 
 
 func _update_physics_rope_anchors() -> void:
 	## Drives the two kinematic endpoints every physics tick -- called from
 	## _physics_process() unconditionally (no-ops via _physics_rope_active
 	## when there's no active chain). The hand end always tracks
-	## get_hand_world_position(); the tip end tracks the dart's actual
-	## rendered pommel position (identical point the old scripted renderer
-	## used as its "to"), whatever the dart's current state (FLYING/ANCHORED/
-	## RECALLING) -- so the chain is simulated for the dart's entire time out,
-	## not just while anchored. See this session's final report for the
-	## explicit, known instability risk this carries during FLYING/RECALLING,
-	## when the tip anchor can move at up to travel_speed/recall_speed
-	## (18-36 units/sec) in a single tick.
+	## get_hand_world_position(); the tip end tracks _get_rope_tip_target(),
+	## whatever the dart's current state (FLYING/ANCHORED/RECALLING) -- so the
+	## chain is simulated for the dart's entire time out, not just while
+	## anchored. See this session's final report for the explicit, known
+	## instability risk this carries during FLYING/RECALLING, when the tip
+	## anchor can move at up to travel_speed/recall_speed (18-36 units/sec) in
+	## a single tick -- measured via a temporary gap probe to spike the
+	## real per-joint gap up to ~10-12 units for a few ticks right after a
+	## throw before settling back down to ~0.02-0.1 at rest (see the
+	## ROPE_PHYSICS_* consts' comment), never diverging in that testing, but
+	## this remains genuinely unverified as to how it actually looks on
+	## screen -- no screenshot access this session.
 	if not _physics_rope_active:
 		return
 	if _physics_rope_hand_anchor != null:
 		_physics_rope_hand_anchor.global_position = get_hand_world_position()
-	if _physics_rope_tip_anchor != null and dart != null and is_instance_valid(dart) and dart.head_mesh != null:
-		var pommel: Vector3 = dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
-		_physics_rope_tip_anchor.global_position = pommel
+	if _physics_rope_tip_anchor != null:
+		_physics_rope_tip_anchor.global_position = _get_rope_tip_target()
 
 
 func _free_physics_rope() -> void:
+	# Raw PhysicsServer3D joints are independent RIDs, not owned by any node
+	# -- queue_free()'ing the root below does NOT free these; must be done
+	# explicitly first or they leak for the lifetime of the process.
+	for joint_rid in _physics_rope_joint_rids:
+		if joint_rid.is_valid():
+			PhysicsServer3D.free_rid(joint_rid)
+	_physics_rope_joint_rids.clear()
 	if _physics_rope_root != null and is_instance_valid(_physics_rope_root):
 		_physics_rope_root.queue_free()
 	_physics_rope_root = null
