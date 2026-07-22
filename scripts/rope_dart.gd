@@ -76,13 +76,21 @@ const MAX_PLANE_Y: float = 1.6
 const CAPSULE_DIR: Vector2 = Vector2(0, -1)
 @export var capsule_height: float = 1.4
 
-## How far past the raycast hit point the dart's origin is pushed, along its
-## travel direction, when it anchors on a real obstacle -- reads as the blade
-## buried roughly halfway into the pillar/tree with the grip/pommel (and the
-## rope's attach point, DAGGER_POMMEL_OFFSET further back) still outside the
-## surface, rather than just touching it. Not applied for player hits or the
-## arena boundary -- there's no solid geometry to visibly sink into there.
-const ANCHOR_EMBED_DEPTH: float = 0.3
+## How far the dart's ORIGIN sits past the raycast hit point, along the
+## travel direction, when it anchors on a real obstacle -- NEGATIVE, i.e.
+## pulled back outside the surface. dart_head.glb's blade tip is at local
+## Z=-0.55, pommel at local Z=+0.315 (see DAGGER_POMMEL_OFFSET's comment in
+## player.gd), so the dagger's own true midpoint sits at local Z=-0.1175 --
+## noticeably closer to the origin than the tip is. For that midpoint (not
+## the origin itself) to land on the surface -- i.e. the dagger actually
+## reading as half embedded -- the origin needs to sit (-0.55 + 0.315) / 2
+## = -0.1175 outside the surface, not past it. An earlier version pushed
+## the origin 0.3 further IN, which buried nearly the whole dagger (pommel
+## included) with nothing left visible -- reading as the rope just
+## vanishing into solid rock rather than a stuck blade. Not applied for
+## player hits or the arena boundary -- there's no solid geometry to
+## visibly sink into there.
+const ANCHOR_EMBED_DEPTH: float = -0.1175
 
 var state: int = State.FLYING
 var owner_player: Node3D = null
