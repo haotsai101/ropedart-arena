@@ -163,11 +163,77 @@ const ROPE_COIL_RADIUS_OUTER: float = 0.24
 ## that reliably decayed back down rather than diverging. Do not re-attempt
 ## stiffening these without re-running that same gap-measurement probe.
 ##
+## FOLLOW-UP FIX #2 (root-caused from a real user SCREEN RECORDING -- not
+## just a screenshot -- so this is video-frame-confirmed, not just measured
+## in the debug console): three bugs, all traced to the same underlying
+## cause. (1) The rope collapsed to a tiny ~0.3-0.5 unit hanging stub right
+## next to the dagger the instant the dart anchored, and stayed exactly like
+## that for the rest of the clip even with the character standing 2-3 grid
+## cells away -- the dominant, most severe symptom. (2) The leftover stub
+## visibly drooped downward under what was clearly gravity. (3) During
+## FLYING, the rope still showed the ORIGINAL "disconnected floating dash
+## segments" look, i.e. FOLLOW-UP FIX #1 above (raw PhysicsServer3D pin
+## joints with correct local anchors) did NOT fully fix the earlier
+## complaint either.
+##
+## Root cause of all three: every segment RigidBody3D had normal gravity
+## (default gravity_scale = 1.0, never overridden) pulling it down every
+## physics step, opposed only by PIN_JOINT_BIAS/DAMPING's soft, gradual
+## positional correction (deliberately left at PhysicsServer3D's own
+## un-stiffened defaults -- see the note a few paragraphs up about why a
+## stiffer tuning was already tried once and found to make the chain
+## explode). Against a constant, continuous downward force, that soft
+## correction can't keep light (ROPE_SEGMENT_MASS = 0.03) segments taut
+## across a real multi-unit span -- the chain sags under its own portrayed
+## weight and settles toward some other equilibrium instead, which is
+## exactly "collapses toward one point" (Bug 1) combined with "visibly
+## drooping" (Bug 2). This also explains why FOLLOW-UP FIX #1's own
+## verification (a temporary gap probe) never caught this: that probe only
+## ran for a few seconds right after a throw and only measured LOCAL gaps
+## between adjacent segment ends, which stay small even while the whole
+## chain is gradually sagging as a unit -- it never checked whether the
+## chain's TOTAL span still matched the real hand-to-dart distance over a
+## sustained multi-second anchored hold, which is what the user's recording
+## actually showed failing. Bug 3 (still-disconnected during FLYING) is the
+## same mechanism at a shorter timescale: gravity has less time to act
+## before the dart anchors, so it reads as segments trailing behind/below
+## where they should be rather than a full collapse yet.
+##
+## Per the user's own explicit, verbatim requirement -- "I want the rope to
+## disregard gravity and live on a plane" -- this is the actual spec, not
+## just a bugfix detail: every segment now (a) has gravity_scale = 0.0 (see
+## _make_rope_segment_body()), the literal "disregard gravity," and (b) is
+## hard-locked to the dart's own fixed plane_y height every physics step via
+## a dedicated rope_segment_body.gd script's _integrate_forces() override
+## (Godot's own documented, solver-safe way to override a RigidBody3D's
+## transform each step -- see that script's own doc comment for why this is
+## used instead of just relying on gravity_scale=0 alone, or poking
+## global_position from outside physics processing the way the kinematic
+## anchors are driven). The plane_y value itself is read from the owning
+## rope_dart.gd instance (duck-typed off `dart.plane_y`) and passed down to
+## every segment and both kinematic anchors at spawn time -- see
+## _spawn_physics_rope(). This keeps real physics-driven XZ collision
+## against pillars/trees/cacti (the whole reason for using RigidBody3D at
+## all) while eliminating vertical sag entirely, consistent with this game's
+## core 2D-XZ-plane-gameplay invariant (see CLAUDE.md) -- the rope's physics
+## simulation now lives in exactly the same 2-degrees-of-freedom plane the
+## rest of the rope+dart system already does.
+##
 ## The IDLE/coiled look (dart == null, ROPE_SEGMENTS/_render_rope_coiled()
 ## above) deliberately stays the old cheap kinematic coil -- there's no
 ## obstacle to avoid while the rope is just sitting on the character's own
 ## arm, so full simulation there would only add jitter risk for zero visual
 ## benefit.
+##
+## VISUAL: per an explicit follow-up user request ("Can the rope be rope
+## instead of segments of bars?"), the THROWN look is no longer rendered as
+## ROPE_PHYSICS_SEGMENTS separate CylinderMesh/capsule pieces with visible
+## seams at every joint -- see _update_rope_tube_mesh() for the single
+## continuous tube mesh (SurfaceTool, Catmull-Rom-interpolated through the
+## segment centers) that now renders in their place. The discrete
+## RigidBody3D segments described above are UNCHANGED and still exist for
+## collision purposes -- this is a pure decoupling of the rendered mesh from
+## the physics representation, not a change to the simulation itself.
 ##
 ## Segment count is lower than the idle coil's 16 -- physics joint chains get
 ## less stable as they get longer, and 8 is enough to read as a rope at this
@@ -200,6 +266,24 @@ const ROPE_ANGULAR_DAMP: float = 2.2
 ## reacts to the chain) that keeps this simulated rope from ever pushing a
 ## player or interfering with the dart's own already-working flight raycast.
 const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
+
+## Preloaded once at class scope (not instantiated per-dart) -- every rope
+## segment body shares this same script; see rope_segment_body.gd's own doc
+## comment for the plane-lock/no-gravity mechanism it implements.
+const RopeSegmentBodyScript: Script = preload("res://scripts/rope_segment_body.gd")
+
+## --- Continuous tube-mesh rendering for the thrown/physics rope (visual
+## only -- see this const block's parent doc comment above) ---
+## Sample count along the Catmull-Rom curve through the chain's control
+## points -- deliberately much higher than ROPE_PHYSICS_SEGMENTS (8) itself,
+## since this is purely a rendering smoothness knob with no physics cost
+## (the curve is evaluated in plain Vector3 math, not simulated).
+const ROPE_TUBE_CURVE_SAMPLES: int = 48
+## Radial cross-section resolution of the extruded tube -- 8-sided reads as
+## round at this game's camera distance without excessive triangle count
+## (ROPE_TUBE_CURVE_SAMPLES * ROPE_TUBE_RADIAL_SEGMENTS quads per dart, up to
+## ~6 simultaneous darts in a full match).
+const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
 
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
@@ -246,11 +330,23 @@ var _physics_rope_root: Node3D = null
 var _physics_rope_hand_anchor: RigidBody3D = null
 var _physics_rope_tip_anchor: RigidBody3D = null
 var _physics_rope_active: bool = false
+## Every dynamic segment body, in hand->tip order -- kept as a flat array
+## (rather than re-walking _physics_rope_root's children each frame) so
+## _update_rope_tube_mesh() can cheaply build its curve control-point list
+## every _process() frame.
+var _physics_rope_segments: Array[RigidBody3D] = []
 ## Raw PhysicsServer3D joint RIDs (see _join_rope_pin()) -- these are NOT
 ## Node3D-owned, so unlike _physics_rope_root's children they are not freed
 ## automatically when the root is queue_free()'d; _free_physics_rope() must
 ## explicitly PhysicsServer3D.free_rid() every one of these or they leak.
 var _physics_rope_joint_rids: Array[RID] = []
+## The single continuous tube MeshInstance3D that visually replaces the
+## per-segment CylinderMesh/capsule rendering -- see this file's
+## ROPE_TUBE_CURVE_SAMPLES doc comment and _update_rope_tube_mesh(). Rebuilt
+## (not just repositioned) every _process() frame the physics chain is
+## active, since the curve it traces changes shape continuously as the
+## simulated segments move.
+var _physics_rope_tube_mesh: MeshInstance3D = null
 ## Dart head that orbits the hand on a taut rope while charging, depicting
 ## winding up the throw -- see _update_charge_spin().
 var _charge_spin_dart: Node3D = null
@@ -1180,6 +1276,7 @@ func _update_persistent_rope() -> void:
 			seg.visible = false
 		if not _physics_rope_active:
 			_spawn_physics_rope()
+		_update_rope_tube_mesh()
 
 
 func _render_rope_coiled() -> void:
@@ -1214,6 +1311,40 @@ func _get_rope_tip_target() -> Vector3:
 	return get_hand_world_position()
 
 
+func _get_rope_plane_y() -> float:
+	## The one fixed horizontal-plane height every physics-rope segment for
+	## the CURRENT dart is locked to (see rope_segment_body.gd's locked_y) --
+	## read directly from the owning rope_dart.gd instance's own plane_y
+	## (duck-typed, matching how this file already reads dart.head_mesh
+	## elsewhere), NOT recomputed from get_hand_world_position(), since the
+	## hand's real animated height moves throughout a throw/charge/idle cycle
+	## while rope_dart.gd's whole class doc comment is explicit that plane_y
+	## itself must stay fixed for a given dart's entire lifetime. Falls back
+	## to the current hand height only in the no-dart-yet edge case (there is
+	## no dart.plane_y to read before launch() has set it), which in practice
+	## never matters since this is only ever called while dart != null.
+	if dart != null and is_instance_valid(dart):
+		return dart.plane_y
+	return get_hand_world_position().y
+
+
+func _get_rope_hand_anchor_pos() -> Vector3:
+	## The hand end of the rope, X/Z from the real (animated, bobbing) hand
+	## bone but Y hard-clamped to _get_rope_plane_y() -- matching exactly
+	## what the OLD scripted renderer already did (`Vector3(hand_pos.x,
+	## plane_y, hand_pos.z)`), before this rope became a physics simulation.
+	## This matters beyond just "the hand end should visually sit on the
+	## plane too": the kinematic hand anchor is JOINTED to the first dynamic
+	## segment, whose Y is hard-locked to plane_y every physics step (see
+	## rope_segment_body.gd) -- if the hand anchor's own Y were left free to
+	## follow the real hand bone's bob/animation instead, the joint would be
+	## fighting a small constant Y mismatch between the two ends every single
+	## step, which is exactly the kind of persistent unresolved joint stress
+	## this whole fix is meant to eliminate.
+	var hand_pos: Vector3 = get_hand_world_position()
+	return Vector3(hand_pos.x, _get_rope_plane_y(), hand_pos.z)
+
+
 func _spawn_physics_rope() -> void:
 	## Builds the real RigidBody3D chain: a kinematic hand anchor, a kinematic
 	## tip anchor (tracked toward the dart every physics tick -- see
@@ -1240,14 +1371,25 @@ func _spawn_physics_rope() -> void:
 	get_parent().add_child(root)
 	_physics_rope_root = root
 
-	var hand_pos: Vector3 = get_hand_world_position()
+	var plane_y: float = _get_rope_plane_y()
+	# Hand end is plane-locked here too (X/Z from the real hand, Y forced to
+	# plane_y) -- see _get_rope_hand_anchor_pos()'s own comment for why this
+	# matters beyond just visual consistency: it keeps the joint to the first
+	# dynamic segment (itself plane-locked) from fighting a constant Y
+	# mismatch every physics step. tip_pos is already at plane_y on its own
+	# (rope_dart.gd's _render() always sets head_mesh's Y to plane_y), so no
+	# separate correction is needed there.
+	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
 	var tip_pos: Vector3 = _get_rope_tip_target()
 
 	# Initial layout direction: along the current hand->tip span if it's
 	# meaningful, else along the player's current aim -- purely cosmetic (see
 	# the ROPE_PHYSICS_SEGMENT_LENGTH comment: correctness no longer depends
 	# on this matching the tip's real position, only how settled the very
-	# first frame or two look).
+	# first frame or two look). Both endpoints already share the same Y
+	# (plane_y), so this direction is naturally flat (zero Y component)
+	# whenever it's derived from the real span -- the aim-direction fallback
+	# is explicitly constructed flat for the same reason.
 	var span: Vector3 = tip_pos - hand_pos
 	var span_dir: Vector3
 	if span.length() > 0.01:
@@ -1269,6 +1411,7 @@ func _spawn_physics_rope() -> void:
 	var local_far := Vector3(0.0, ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
 	var local_near := Vector3(0.0, -ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
 
+	_physics_rope_segments.clear()
 	var prev: RigidBody3D = _physics_rope_hand_anchor
 	var prev_local_far := Vector3.ZERO  # the hand anchor's own attachment point is always its own origin
 	for i in range(ROPE_PHYSICS_SEGMENTS):
@@ -1277,7 +1420,8 @@ func _spawn_physics_rope() -> void:
 		# throw-instant) hand-tip distance. See the ROPE_PHYSICS_SEGMENT_LENGTH
 		# comment for why that's fine now (no baked-in offset error either way).
 		var seg_center: Vector3 = hand_pos + span_dir * (ROPE_PHYSICS_SEGMENT_HALF_LENGTH + float(i) * ROPE_PHYSICS_SEGMENT_LENGTH)
-		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis)
+		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis, plane_y)
+		_physics_rope_segments.append(seg)
 		_join_rope_pin(prev, prev_local_far, seg, local_near)
 		prev = seg
 		prev_local_far = local_far
@@ -1308,18 +1452,27 @@ func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> 
 	return body
 
 
-func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, orient_basis: Basis) -> RigidBody3D:
+func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, orient_basis: Basis, plane_y: float) -> RigidBody3D:
 	## One real physics link: a capsule collider (smoother than a cylinder for
 	## sliding along an obstacle's edge/corner, same reasoning games commonly
-	## use capsules for chain links) plus a CylinderMesh child purely for
-	## rendering -- the mesh needs no per-frame code at all since it's a
-	## child of the body Godot's own solver is already moving. `orient_basis`
-	## is the segment's initial orientation (local Y aligned along the chain's
-	## layout direction, see _spawn_physics_rope()) -- without this every
-	## segment defaulted to identity rotation (local Y = world up), forcing
-	## the solver to fight a large, unnecessary initial rotation error on top
-	## of position. (Named orient_basis, not basis, to avoid shadowing
-	## Node3D's own `basis` property, which GDScript warns on.)
+	## use capsules for chain links) -- NO mesh/visual of its own anymore (see
+	## this file's ROPE_TUBE_CURVE_SAMPLES doc comment: the thrown rope's
+	## visual is one continuous tube mesh built separately in
+	## _update_rope_tube_mesh(), decoupled from these discrete collision
+	## bodies). `orient_basis` is the segment's initial orientation (local Y
+	## aligned along the chain's layout direction, see _spawn_physics_rope())
+	## -- without this every segment defaulted to identity rotation (local Y
+	## = world up), forcing the solver to fight a large, unnecessary initial
+	## rotation error on top of position. (Named orient_basis, not basis, to
+	## avoid shadowing Node3D's own `basis` property, which GDScript warns on.)
+	##
+	## gravity_scale = 0.0 and the attached rope_segment_body.gd script
+	## (locked_y = plane_y) are this fix's actual mechanism for the user's
+	## explicit "disregard gravity and live on a plane" requirement -- see
+	## that script's own doc comment and this file's ROPE_PHYSICS_SEGMENTS
+	## doc comment above for the full root-cause writeup on why gravity was
+	## the actual cause of the anchored-rope-collapses-to-a-stub bug.
+	##
 	## collision_mask = ROPE_OBSTACLE_LAYER_BIT ONLY (not the default layer):
 	## reacts to real obstacle geometry, never to players/ground/the dart
 	## head. collision_layer = 0: nothing else's mask can ever detect this
@@ -1327,7 +1480,10 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	## push a player or otherwise leak into gameplay logic.
 	var body := RigidBody3D.new()
 	body.name = node_name
+	body.set_script(RopeSegmentBodyScript)
+	body.locked_y = plane_y
 	body.mass = ROPE_SEGMENT_MASS
+	body.gravity_scale = 0.0
 	body.linear_damp = ROPE_LINEAR_DAMP
 	body.angular_damp = ROPE_ANGULAR_DAMP
 	body.continuous_cd = true
@@ -1340,16 +1496,6 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	capsule.height = ROPE_PHYSICS_SEGMENT_LENGTH
 	shape.shape = capsule
 	body.add_child(shape)
-
-	var mesh_shape := CylinderMesh.new()
-	mesh_shape.top_radius = ROPE_RADIUS
-	mesh_shape.bottom_radius = ROPE_RADIUS
-	mesh_shape.height = ROPE_PHYSICS_SEGMENT_LENGTH
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh_shape
-	if _rope_material != null:
-		mi.set_surface_override_material(0, _rope_material)
-	body.add_child(mi)
 
 	# Must add_child() before setting global_transform -- same is_inside_tree()
 	# requirement as _make_rope_anchor_body() above.
@@ -1382,23 +1528,25 @@ func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: V
 func _update_physics_rope_anchors() -> void:
 	## Drives the two kinematic endpoints every physics tick -- called from
 	## _physics_process() unconditionally (no-ops via _physics_rope_active
-	## when there's no active chain). The hand end always tracks
-	## get_hand_world_position(); the tip end tracks _get_rope_tip_target(),
-	## whatever the dart's current state (FLYING/ANCHORED/RECALLING) -- so the
-	## chain is simulated for the dart's entire time out, not just while
-	## anchored. See this session's final report for the explicit, known
-	## instability risk this carries during FLYING/RECALLING, when the tip
-	## anchor can move at up to travel_speed/recall_speed (18-36 units/sec) in
-	## a single tick -- measured via a temporary gap probe to spike the
-	## real per-joint gap up to ~10-12 units for a few ticks right after a
-	## throw before settling back down to ~0.02-0.1 at rest (see the
-	## ROPE_PHYSICS_* consts' comment), never diverging in that testing, but
-	## this remains genuinely unverified as to how it actually looks on
-	## screen -- no screenshot access this session.
+	## when there's no active chain). The hand end tracks
+	## _get_rope_hand_anchor_pos() (X/Z from the real hand, Y locked to
+	## plane_y -- see that function's own comment for why the Y-lock matters
+	## here specifically, not just at spawn time); the tip end tracks
+	## _get_rope_tip_target(), whatever the dart's current state (FLYING/
+	## ANCHORED/RECALLING) -- so the chain is simulated for the dart's entire
+	## time out, not just while anchored. See this session's final report for
+	## the explicit, known instability risk this carries during FLYING/
+	## RECALLING, when the tip anchor can move at up to travel_speed/
+	## recall_speed (18-36 units/sec) in a single tick -- measured via a
+	## temporary gap probe to spike the real per-joint gap up to ~10-12 units
+	## for a few ticks right after a throw before settling back down to
+	## ~0.02-0.1 at rest (see the ROPE_PHYSICS_* consts' comment), never
+	## diverging in that testing, but this remains genuinely unverified as to
+	## how it actually looks on screen -- no screenshot access this session.
 	if not _physics_rope_active:
 		return
 	if _physics_rope_hand_anchor != null:
-		_physics_rope_hand_anchor.global_position = get_hand_world_position()
+		_physics_rope_hand_anchor.global_position = _get_rope_hand_anchor_pos()
 	if _physics_rope_tip_anchor != null:
 		_physics_rope_tip_anchor.global_position = _get_rope_tip_target()
 
@@ -1416,7 +1564,140 @@ func _free_physics_rope() -> void:
 	_physics_rope_root = null
 	_physics_rope_hand_anchor = null
 	_physics_rope_tip_anchor = null
+	_physics_rope_segments.clear()
 	_physics_rope_active = false
+	if _physics_rope_tube_mesh != null:
+		_physics_rope_tube_mesh.visible = false
+
+
+func _update_rope_tube_mesh() -> void:
+	## Per an explicit follow-up user request ("Can the rope be rope instead
+	## of segments of bars?"), the thrown rope's VISUAL is decoupled from the
+	## discrete RigidBody3D collision segments entirely: this rebuilds one
+	## continuous ArrayMesh every _process() frame the physics chain is
+	## active, tracing a smooth Catmull-Rom curve through the control points
+	## [hand anchor, every dynamic segment's center, tip anchor] (in that
+	## order -- matches the actual joint chain order from
+	## _spawn_physics_rope()) and extruding a round tube of ROPE_RADIUS along
+	## it. The underlying RigidBody3D segments and their capsule collision
+	## shapes are completely unchanged by this -- they still exist, still
+	## collide with real obstacle geometry, and still drive this curve's
+	## shape; only what gets DRAWN from their positions changed.
+	if _physics_rope_root == null or _physics_rope_hand_anchor == null or _physics_rope_tip_anchor == null:
+		return
+	if _physics_rope_segments.size() != ROPE_PHYSICS_SEGMENTS:
+		return
+
+	if _physics_rope_tube_mesh == null:
+		var mi := MeshInstance3D.new()
+		mi.name = "RopeTubeMesh"
+		# Material is applied AFTER _build_tube_mesh() gives this mesh its
+		# first real surface (below) -- set_surface_override_material(0, ...)
+		# errors ("Index p_surface = 0 is out of bounds") on a MeshInstance3D
+		# whose mesh has zero surfaces yet, which is exactly this freshly
+		# created node's state until the first _build_tube_mesh() call commits
+		# an ArrayMesh onto it.
+		add_child(mi)
+		_physics_rope_tube_mesh = mi
+
+	var control_points: Array[Vector3] = [_physics_rope_hand_anchor.global_position]
+	for seg in _physics_rope_segments:
+		control_points.append((seg as RigidBody3D).global_position)
+	control_points.append(_physics_rope_tip_anchor.global_position)
+	var n: int = control_points.size()
+
+	# Sample a Catmull-Rom curve through control_points at ROPE_TUBE_CURVE_SAMPLES
+	# steps -- Vector3.cubic_interpolate(b, pre_a, post_b, weight) needs a
+	# "before the start" and "after the end" handle for every interpolated
+	# span; clamping the index at both ends (rather than requiring 4 real
+	# neighbors) is what lets this work even at the very first/last span,
+	# and lets the whole curve work correctly with as few as 2 control points
+	# (a degenerate straight line -- possible right at throw-instant, when
+	# the tip anchor and every not-yet-separated segment can start nearly
+	# coincident).
+	var curve_points: Array[Vector3] = []
+	curve_points.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
+	for i in range(ROPE_TUBE_CURVE_SAMPLES + 1):
+		var t: float = float(i) / float(ROPE_TUBE_CURVE_SAMPLES)
+		var f: float = t * float(n - 1)
+		var seg_i: int = clampi(int(f), 0, n - 2)
+		var local_t: float = f - float(seg_i)
+		var p0: Vector3 = control_points[clampi(seg_i - 1, 0, n - 1)]
+		var p1: Vector3 = control_points[seg_i]
+		var p2: Vector3 = control_points[clampi(seg_i + 1, 0, n - 1)]
+		var p3: Vector3 = control_points[clampi(seg_i + 2, 0, n - 1)]
+		curve_points[i] = p1.cubic_interpolate(p2, p0, p3, local_t)
+
+	_build_tube_mesh(_physics_rope_tube_mesh, curve_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
+	_physics_rope_tube_mesh.visible = true
+
+
+func _build_tube_mesh(mi: MeshInstance3D, curve_points: Array[Vector3], radius: float, radial_segments: int) -> void:
+	## Extrudes a round tube of constant `radius` along `curve_points` (a
+	## polyline, already densely sampled by the caller -- see
+	## _update_rope_tube_mesh()) via SurfaceTool, and assigns the result as
+	## `mi`'s mesh. Each ring's orientation is built from the local tangent
+	## (direction to the next point) with a stable perpendicular basis
+	## (same RIGHT/UP basis-seed trick used elsewhere in this file for
+	## building a basis from a single direction vector), so the tube doesn't
+	## twist unpredictably along its length.
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+
+	var point_count: int = curve_points.size()
+	if point_count < 2:
+		mi.mesh = null
+		return
+
+	var rings: Array[PackedVector3Array] = []
+	rings.resize(point_count)
+	for i in range(point_count):
+		var tangent: Vector3
+		if i == 0:
+			tangent = (curve_points[1] - curve_points[0])
+		elif i == point_count - 1:
+			tangent = (curve_points[i] - curve_points[i - 1])
+		else:
+			tangent = (curve_points[i + 1] - curve_points[i - 1])
+		if tangent.length() < 0.0001:
+			tangent = Vector3.FORWARD
+		tangent = tangent.normalized()
+		var basis_seed: Vector3 = Vector3.RIGHT if absf(tangent.dot(Vector3.UP)) > 0.99 else Vector3.UP
+		var right: Vector3 = basis_seed.cross(tangent).normalized()
+		var up: Vector3 = tangent.cross(right).normalized()
+		var ring := PackedVector3Array()
+		ring.resize(radial_segments)
+		for j in range(radial_segments):
+			var angle: float = TAU * float(j) / float(radial_segments)
+			ring[j] = curve_points[i] + (right * cos(angle) + up * sin(angle)) * radius
+		rings[i] = ring
+
+	for i in range(point_count - 1):
+		var ring_a: PackedVector3Array = rings[i]
+		var ring_b: PackedVector3Array = rings[i + 1]
+		for j in range(radial_segments):
+			var j_next: int = (j + 1) % radial_segments
+			var a0: Vector3 = ring_a[j]
+			var a1: Vector3 = ring_a[j_next]
+			var b0: Vector3 = ring_b[j]
+			var b1: Vector3 = ring_b[j_next]
+			# Two triangles per quad, wound so the outward-facing normal
+			# points away from the tube's own centerline (consistent with
+			# SurfaceTool.generate_normals()'s face-winding expectations).
+			st.add_vertex(a0)
+			st.add_vertex(b0)
+			st.add_vertex(a1)
+			st.add_vertex(a1)
+			st.add_vertex(b0)
+			st.add_vertex(b1)
+
+	st.generate_normals()
+	mi.mesh = st.commit()
+	# Must be applied AFTER mi.mesh is assigned -- set_surface_override_material
+	# errors on a MeshInstance3D whose mesh has no surfaces yet, which every
+	# call before this line's mi.mesh assignment would still be.
+	if _rope_material != null:
+		mi.set_surface_override_material(0, _rope_material)
 
 
 func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
