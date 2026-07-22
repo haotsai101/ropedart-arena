@@ -39,6 +39,12 @@ const MELEE_CONE_DEG: float = 50.0
 const CHARGE_SPIN_RADIUS: float = 0.35
 const CHARGE_SPIN_SPEED_MIN: float = TAU * 3.0  # ~3 rev/sec at the start of a charge
 const CHARGE_SPIN_SPEED_MAX: float = TAU * 7.0  # ~7 rev/sec at a full charge
+## Once a charge hits MAX_CHARGE_TIME, "Sword_Idle" is already holding its
+## final frame (it's a one-shot clip, not looped -- see LOOPING_CLIPS'
+## comment) -- a small fast tremble on top of that held pose reads as
+## "straining at max power" and gives a clear release-now cue.
+const CHARGE_SHAKE_AMPLITUDE: float = 0.025
+const CHARGE_SHAKE_FREQUENCY: float = TAU * 18.0
 const WALK_ANIM_SPEED: float = 2.0
 ## Half-extent of the platform on the XZ plane — must match the ground
 ## PlaneMesh/BoxShape3D size (30x30) in scenes/main.tscn. Stepping past this
@@ -88,6 +94,9 @@ var _rope_coil_in_hand: Node3D = null
 var _charge_spin_dart: Node3D = null
 var _charge_spin_rope: MeshInstance3D = null
 var _charge_spin_angle: float = 0.0
+## Elapsed time at max charge -- drives the tremble in the bob/shake block of
+## _process(); see CHARGE_SHAKE_AMPLITUDE's comment.
+var _charge_shake_time: float = 0.0
 
 var player_color: Color
 var character_color: Color = Color(0.85, 0.08, 0.04, 1.0)   # set in _ready from CHARACTER_DEFS
@@ -301,7 +310,7 @@ const ANIM_SOURCES: Array[String] = [
 ## the last frame instead of cycling. One-shot clips (Death/Hit/Throw/
 ## Jump_*/etc.) are deliberately NOT in this list — those should play once.
 const LOOPING_CLIPS: Array[String] = [
-	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B", "Sword_Idle",
+	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B",
 ]
 
 ## One-shot action clips triggered from gameplay code (throw/slash/kick) --
@@ -568,14 +577,19 @@ func _process(delta: float) -> void:
 	# (dash-excluded) is_moving state used for Walk/Idle and the procedural bob.
 	# A one-shot action clip (throw/slash/kick) gets to finish playing first --
 	# otherwise this per-frame selection would stomp it within a single frame
-	# of it starting, since nothing here else calls _play_anim(). Recall and
-	# charging are separate overrides since "Push"/"Sword_Idle" are looping
-	# clips -- is_playing() never goes false on its own, so each needs its
-	# own explicit flag as an end condition instead: _is_recalling (cleared
-	# in _on_dart_returned()) and _is_charging (cleared on throw_just_released
+	# of it starting, since nothing here else calls _play_anim(). Recall is a
+	# separate override since "Push" is a looping clip -- is_playing() never
+	# goes false on its own, so it needs the explicit _is_recalling flag
+	# (cleared in _on_dart_returned()) as its end condition instead. Charging
+	# also needs its own override even though "Sword_Idle" is NOT looping
+	# (plays once and holds its last frame, deliberately -- see
+	# _update_charge_shake() for the tremble once that held pose means "max
+	# charge"): without this branch, once is_playing() goes false on its own
+	# at the end, the elif chain below would fall through to Idle_A/Walking_A
+	# and stomp the held pose. _is_charging is cleared on throw_just_released
 	# in the throw/charge block below, right as _throw() fires and plays the
-	# one-shot "Spell_Simple_Shoot" -- so charging's "Sword_Idle" hand-wind-up
-	# hands off to the throw clip in the same frame the button is released).
+	# one-shot "Spell_Simple_Shoot" -- so charging's held "Sword_Idle" pose
+	# hands off to the throw clip in the same frame the button is released.
 	var action_playing: bool = _anim_player != null and _current_anim in ONE_SHOT_ACTION_CLIPS and _anim_player.is_playing()
 	if _is_recalling:
 		_play_anim("Push")
@@ -618,6 +632,18 @@ func _process(delta: float) -> void:
 		player_mesh.position.y = lerp(player_mesh.position.y, _mesh_ground_offset, 8.0 * delta)
 		if _move_speed_smooth <= 0.1:
 			_run_bob_time = lerp(_run_bob_time, 0.0, 5.0 * delta)
+
+	# Max-charge tremble on top of "Sword_Idle"'s held final pose -- see
+	# CHARGE_SHAKE_AMPLITUDE's comment. X/Z only; bob/ground-offset above
+	# already owns Y, so this can't fight with it.
+	if _is_charging and _charge_time >= MAX_CHARGE_TIME:
+		_charge_shake_time += delta
+		player_mesh.position.x = sin(_charge_shake_time * CHARGE_SHAKE_FREQUENCY) * CHARGE_SHAKE_AMPLITUDE
+		player_mesh.position.z = cos(_charge_shake_time * CHARGE_SHAKE_FREQUENCY * 1.3) * CHARGE_SHAKE_AMPLITUDE
+	else:
+		_charge_shake_time = 0.0
+		player_mesh.position.x = 0.0
+		player_mesh.position.z = 0.0
 
 
 func _physics_process(delta: float) -> void:
@@ -1035,6 +1061,7 @@ func reset_for_round(new_lives: int, start_pos: Vector3) -> void:
 	_prev_throw = false
 	_is_charging = false
 	_charge_time = 0.0
+	_charge_shake_time = 0.0
 	_is_recalling = false
 	_trip_timer = 0.0
 	_slow_timer = 0.0
