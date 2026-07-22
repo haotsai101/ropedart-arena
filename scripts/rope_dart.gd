@@ -1,34 +1,36 @@
 extends Node3D
-## Thrown rope dart: FLYING → ANCHORED → (optionally) RECALLING. All positions
-## are 2D (XZ plane); 3D mesh rebuilt each frame for lighting. Kill/hit
-## detection uses 2D math — no physics collision shapes needed for that;
-## obstacles use a simple 2D swept-rect test against their footprint (see
-## _get_swept_hit_obstacle) — this obstacle/boundary-stop logic is carried
-## over unchanged from the previous straight-thrown-dagger weapon, which is
-## current codebase, not the old (discarded) rope dart design.
+## Thrown rope dart: FLYING → ANCHORED → (optionally) RECALLING.
 ##
-## Unlike that dagger, this weapon stays tethered: a multi-segment sagging
-## rope (see ROPE_SEGMENTS) is drawn from the owner's hand to the head every
-## frame in every state, and the owner can actively recall it (see recall())
-## from anywhere -- flying or anchored -- instead of only retrieving it by
-## walking over it (still also supported; walking within pickup_radius
-## always retrieves it too).
+## The rope+dart system lives entirely within ONE fixed horizontal plane at
+## the owner's hand height (see plane_y, computed once in launch() from
+## get_hand_world_position() and held constant for the dart's whole
+## lifetime) -- this is what makes "real" physics collision for this weapon
+## compatible with the rest of the game's flat XZ-plane gameplay math (see
+## CLAUDE.md's core invariant): rather than a free-hanging 3D rope, it's a
+## rope+dart constrained to 2 degrees of freedom, with real physics used
+## only for detecting what's solid at that one height.
 ##
-## Hit resolution distinguishes head vs. body: a head hit (tight radius right
-## at the top of the target's capsule) is an instant kill, same as the old
-## dagger's economy. A body hit is a non-lethal "clothesline" -- trip()'s
-## existing freeze-then-slow stagger. Either kind of hit anchors the dart at
-## the point of contact, same as hitting an obstacle or the arena boundary.
+## FLYING uses a real physics raycast each tick (see _raycast_obstacle())
+## against the map's actual CollisionShape3D geometry (the same one players
+## already collide with) to detect pillars/trees/cacti -- explicitly
+## excluding every player body, so the rope/dart always passes through
+## characters. A hit ANCHORS the dart there, stuck until the owner recalls
+## it or walks over it (pickup_radius) -- same as before.
+##
+## The rope has a fixed length (ROPE_LENGTH, 4x a character's height) rather
+## than growing with charge power -- charge now scales travel_speed only.
+## Reaching full extension without hitting anything doesn't anchor it in
+## place; it immediately yanks back into RECALLING instead, like snapping
+## taut on a real tether.
+##
+## Player hit detection (_check_hits()) is unchanged: still pure 2D capsule
+## math, head vs. body, kill vs. trip()'s "clothesline" stagger -- that's a
+## separate concern from the map-collision system above and was never the
+## part reported as broken.
 
 enum State { FLYING, ANCHORED, RECALLING }
 
 @export var travel_speed: float = 18.0
-@export var max_range: float = 7.0
-## Extra offset added to owner_player.global_position.y (the player's FEET —
-## KayKit character meshes are authored feet-at-local-origin and added to
-## the CharacterBody3D with no position offset) to get the dart's render
-## height. 1.1 lands it roughly at hand/chest height while flying.
-@export var visual_height: float = 1.1
 @export var hit_radius: float = 0.6  # matches the character's outstretched arm/leg reach (~0.79 at max swing), not just body radius (~0.48)
 ## Tight radius around the capsule's top point only -- a hit inside this is a
 ## head hit (kill); anywhere else within hit_radius along the capsule is a
@@ -41,14 +43,11 @@ enum State { FLYING, ANCHORED, RECALLING }
 ## in should feel snappier than the outbound throw, especially since charged
 ## throws can nearly double travel_speed on the way out.
 @export var recall_speed: float = 24.0
-## Height above the owner's feet the rope's near end is drawn from --
-## approximates hand height without needing to reach into the owner's actual
-## hand-bone attachment (see player.gd's _setup_dagger_in_hand()).
-@export var rope_hand_height: float = 1.0
 
-## Baseline values used to compute charged-throw speed and range.
 const BASE_SPEED: float = 18.0
-const BASE_MAX_RANGE: float = 7.0
+## A KayKit character reads at ~2.0 units tall on screen (see player.gd's
+## _ready() comment on the 0.85 mesh scale) -- 4x that.
+const ROPE_LENGTH: float = 8.0
 
 ## A player's hitbox is a capsule (base at their ground position, extending
 ## toward CAPSULE_DIR by capsule_height) instead of a single circle, so it
@@ -96,6 +95,12 @@ var head_2d: Vector2 = Vector2.ZERO
 var origin_2d: Vector2 = Vector2.ZERO
 var dir_2d: Vector2 = Vector2.ZERO
 var charge_ratio: float = 0.0
+## The one world-space height the whole rope+dart lives at for this dart's
+## entire lifetime -- set once in launch() from the owner's hand bone and
+## never touched again, even as the owner moves or crouches or the dart
+## changes state. This is what keeps the "real physics" raycast below
+## meaningful: a single ray at a fixed height, not a moving target.
+var plane_y: float = 1.0
 var _rope_segments: Array[MeshInstance3D] = []
 
 @onready var head_mesh: Node3D = $Head
@@ -122,9 +127,10 @@ func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) 
 	head_2d = from_2d
 	dir_2d = aim.normalized()
 	charge_ratio = ratio
-	# Scale speed and range linearly: min charge = baseline, max charge = 2×
+	# Scale speed only -- rope length is fixed (ROPE_LENGTH), not charge-scaled.
 	travel_speed = BASE_SPEED * lerp(1.0, 2.0, ratio)
-	max_range = BASE_MAX_RANGE * lerp(1.0, 2.0, ratio)
+	plane_y = player.get_hand_world_position().y if player.has_method("get_hand_world_position") \
+		else player.global_position.y + 1.0
 	# Larger dart mesh at higher charge gives instant visual feedback on launch
 	head_mesh.scale = Vector3.ONE * lerp(1.0, 1.5, ratio)
 
@@ -184,19 +190,21 @@ func _physics_process(delta: float) -> void:
 				head_2d.y = clampf(head_2d.y, -arena_half, arena_half)
 				_anchor()
 			else:
-				# Swept segment-vs-rect test (prev_head_2d -> head_2d) instead of
-				# point-sampling the new position — a fast dart can move ~0.5+
-				# units per tick, which is thin enough to tunnel through a pillar
-				# footprint if only the endpoint is tested.
-				var obs_hit: Variant = _get_swept_hit_obstacle(prev_head_2d, head_2d)
-				if obs_hit != null:
-					var hit_dict: Dictionary = obs_hit
-					var hit_obs: Node = hit_dict.get("obstacle")
-					var hit_point: Vector2 = hit_dict.get("point")
-					head_2d = _snap_to_rect_edge(hit_point, hit_obs.get_rect_2d())
+				# Real physics raycast (prev_head_2d -> head_2d, at plane_y) against
+				# the map's actual CollisionShape3D geometry instead of a hand-rolled
+				# 2D rect test -- this is what actually stops the dart on pillars,
+				# trees, and cacti using the same collision the player already
+				# bumps into, with player bodies explicitly excluded so the dart
+				# never anchors on a character it merely grazed.
+				var hit_point_2d: Variant = _raycast_obstacle(prev_head_2d, head_2d)
+				if hit_point_2d != null:
+					head_2d = hit_point_2d
 					_anchor()
-				elif head_2d.distance_to(origin_2d) >= max_range:
-					_anchor()
+				elif head_2d.distance_to(origin_2d) >= ROPE_LENGTH:
+					# Fixed-length rope snapping taut: rather than anchoring at empty
+					# air, it yanks straight back toward the owner.
+					head_2d = origin_2d + dir_2d * ROPE_LENGTH
+					recall()
 
 		State.ANCHORED:
 			if owner_player.get_pos_2d().distance_to(head_2d) < pickup_radius:
@@ -239,6 +247,32 @@ func _check_hits() -> bool:
 				body.trip()
 			hit = true
 	return hit
+
+
+func _raycast_obstacle(prev: Vector2, cur: Vector2) -> Variant:
+	## Real physics raycast against the map's actual collision geometry, at
+	## the dart's fixed plane_y, from prev to cur (this frame's swept motion,
+	## not just the new point -- a fast dart can move a good fraction of a
+	## unit per tick and tunnel through a pillar's footprint if only the
+	## endpoint were tested). Excludes every player body via RID so darts
+	## never stop on the character throwing or standing near them; anything
+	## else solid (pillars, trees, cacti -- all still on the default physics
+	## layer, same as players, per project-wide grep) counts as a hit.
+	## Returns the 2D hit point, or null if the ray reaches cur unobstructed.
+	var space_state: PhysicsDirectSpaceState3D = get_world_3d().direct_space_state
+	var from: Vector3 = Vector3(prev.x, plane_y, prev.y)
+	var to: Vector3 = Vector3(cur.x, plane_y, cur.y)
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	var excluded: Array[RID] = []
+	for p in get_tree().get_nodes_in_group("players"):
+		if p is CollisionObject3D:
+			excluded.append((p as CollisionObject3D).get_rid())
+	query.exclude = excluded
+	var result: Dictionary = space_state.intersect_ray(query)
+	if result.is_empty():
+		return null
+	var pos: Vector3 = result.get("position")
+	return Vector2(pos.x, pos.z)
 
 
 func _get_swept_hit_obstacle(prev: Vector2, cur: Vector2) -> Variant:
@@ -328,11 +362,10 @@ func _capsule_top(base: Vector2) -> Vector2:
 func _render() -> void:
 	if not is_instance_valid(owner_player):
 		return
-	# Sits a little lower once anchored, to read as planted/stuck rather than
-	# floating at the same height it flew at.
-	var height: float = visual_height if state == State.FLYING else visual_height * 0.25
-	var mid_y: float = owner_player.global_position.y + height
-	head_mesh.global_position = Vector3(head_2d.x, mid_y, head_2d.y)
+	# Always at the dart's own fixed plane_y -- see the class doc comment for
+	# why this stays constant rather than varying by state or the owner's
+	# current height.
+	head_mesh.global_position = Vector3(head_2d.x, plane_y, head_2d.y)
 
 	# Blade points away from wherever the rope currently comes from (the
 	# owner) -- covers FLYING (roughly dir_2d, but stays correct even if the
@@ -356,13 +389,21 @@ func _render() -> void:
 
 
 func _update_rope() -> void:
-	var from: Vector3 = owner_player.get_hand_world_position() if owner_player.has_method("get_hand_world_position") \
-		else Vector3(owner_player.get_pos_2d().x, owner_player.global_position.y + rope_hand_height, owner_player.get_pos_2d().y)
+	# XZ tracks the hand bone's real current position (so the rope's near end
+	# visibly follows the owner's arm), but Y is pinned to the dart's fixed
+	# plane_y rather than the bone's current animated height -- the rope
+	# lives in a single flat plane for its whole life, per the class doc
+	# comment, not a free-hanging 3D line.
+	var hand_pos: Vector3 = owner_player.get_hand_world_position() if owner_player.has_method("get_hand_world_position") \
+		else Vector3(owner_player.get_pos_2d().x, plane_y, owner_player.get_pos_2d().y)
+	var from: Vector3 = Vector3(hand_pos.x, plane_y, hand_pos.z)
 	# Attach at the dagger's pommel (DAGGER_POMMEL_OFFSET along its own local
 	# +Z), not its origin -- transforming by head_mesh's full global
 	# transform (not just its position) so this follows the blade's current
-	# orientation too.
+	# orientation too. head_mesh.global_position.y is already plane_y (see
+	# _render()), so this stays in-plane automatically.
 	var to: Vector3 = head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
+	to.y = plane_y
 
 	# Route around map geometry -- a pillar directly between the hand and the
 	# dart (e.g. after the owner walks around one post-anchor) would
@@ -372,21 +413,11 @@ func _update_rope() -> void:
 	# "players" -- the rope always passes freely through other characters
 	# regardless of where they're standing.
 	var path: Array[Vector3] = [from]
-	var bend_hit: Variant = _get_swept_hit_obstacle(Vector2(from.x, from.z), Vector2(to.x, to.z))
-	var bent: bool = bend_hit != null
+	var bend_2d: Variant = _get_rope_bend_point(Vector2(from.x, from.z), Vector2(to.x, to.z))
+	var bent: bool = bend_2d != null
 	if bent:
-		var hit_dict: Dictionary = bend_hit
-		var hit_obs: Node = hit_dict.get("obstacle")
-		var hit_point: Vector2 = hit_dict.get("point")
-		var obs_rect: Rect2 = hit_obs.get_rect_2d()
-		var bend_2d: Vector2 = _snap_to_rect_edge(hit_point, obs_rect)
-		# Push outward from the rect's center so the rope clears the surface
-		# with visible daylight instead of sitting flush against it -- see
-		# ROPE_BEND_CLEARANCE's comment.
-		var outward: Vector2 = bend_2d - obs_rect.get_center()
-		if outward.length() > 0.001:
-			bend_2d += outward.normalized() * ROPE_BEND_CLEARANCE
-		path.append(Vector3(bend_2d.x, (from.y + to.y) * 0.5, bend_2d.y))
+		var b: Vector2 = bend_2d
+		path.append(Vector3(b.x, (from.y + to.y) * 0.5, b.y))
 	path.append(to)
 
 	var total_length: float = 0.0
@@ -414,6 +445,65 @@ func _update_rope() -> void:
 
 	for i in range(n):
 		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
+
+
+func _get_rope_bend_point(from_2d: Vector2, to_2d: Vector2) -> Variant:
+	## Returns a single Vector2 bend point that routes the direct line around
+	## whichever obstacle blocks it, or null if unobstructed.
+	##
+	## An earlier version routed through _snap_to_rect_edge()'s point (where
+	## the direct line first ENTERS the rect) -- wrong: for a line passing
+	## near the rect's center, the second leg (bend -> to) can cut straight
+	## back through the rest of the box on its way out, since the entry
+	## point is just the edge crossing, not a point that clears the whole
+	## shape. A rect's CORNER is the only kind of point where routing through
+	## it is geometrically guaranteed to clear a convex shape on both sides.
+	## Tries all 4 corners (pushed outward for clearance -- see
+	## ROPE_BEND_CLEARANCE), keeps only the ones where BOTH from->corner and
+	## corner->to independently miss the same rect, and picks whichever adds
+	## the least extra distance over the direct line.
+	##
+	## Checks ONLY the "obstacles" group (via _get_swept_hit_obstacle(), the
+	## same one the dart's own flight already uses), never "players" -- the
+	## rope always passes freely through other characters regardless of
+	## where they're standing.
+	var hit: Variant = _get_swept_hit_obstacle(from_2d, to_2d)
+	if hit == null:
+		return null
+	var hit_dict: Dictionary = hit
+	var hit_obs: Node = hit_dict.get("obstacle")
+	var rect: Rect2 = hit_obs.get_rect_2d()
+	var center: Vector2 = rect.get_center()
+	var corners: Array[Vector2] = [
+		rect.position, Vector2(rect.end.x, rect.position.y), rect.end, Vector2(rect.position.x, rect.end.y)
+	]
+
+	var direct_length: float = from_2d.distance_to(to_2d)
+	var best_point: Vector2 = Vector2.ZERO
+	var best_extra: float = INF
+	for corner in corners:
+		var outward: Vector2 = corner - center
+		var pushed: Vector2 = corner + (outward.normalized() * ROPE_BEND_CLEARANCE if outward.length() > 0.001 else Vector2.ZERO)
+		if _segment_rect_intersect(from_2d, pushed, rect) != null:
+			continue
+		if _segment_rect_intersect(pushed, to_2d, rect) != null:
+			continue
+		var extra: float = from_2d.distance_to(pushed) + pushed.distance_to(to_2d) - direct_length
+		if extra < best_extra:
+			best_extra = extra
+			best_point = pushed
+
+	if best_extra < INF:
+		return best_point
+	# Fallback for the (shouldn't normally happen, single convex rect) case
+	# where no single corner clears both legs -- the old edge-snap point,
+	# still pushed outward for clearance.
+	var hit_point: Vector2 = hit_dict.get("point")
+	var edge_point: Vector2 = _snap_to_rect_edge(hit_point, rect)
+	var edge_outward: Vector2 = edge_point - center
+	if edge_outward.length() > 0.001:
+		edge_point += edge_outward.normalized() * ROPE_BEND_CLEARANCE
+	return edge_point
 
 
 func _sample_path(path: Array[Vector3], t: float) -> Vector3:
