@@ -1086,6 +1086,26 @@ func _render_rope_extended() -> void:
 	var to: Vector3 = dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
 	to.y = plane_y
 
+	# Real physics raycast, hand -> dart -- most commonly relevant while
+	# ANCHORED, when the owner (or a bot walking to retrieve it) can end up
+	# on any side of an obstacle relative to a dart stuck on its far face,
+	# putting the straight line through solid geometry. Same technique the
+	# dart's own flight uses to stop (rope_dart.gd's _raycast_obstacle()),
+	# applied here to truncate the rope's rendered line at the obstruction
+	# instead of drawing straight through it -- real collision data, not
+	# hand-rolled corner/edge geometry. Every player body is excluded (the
+	# rope always passes freely through characters), same as that raycast.
+	var space_state: PhysicsDirectSpaceState3D = get_world_3d().direct_space_state
+	var query := PhysicsRayQueryParameters3D.create(from, to)
+	var excluded: Array[RID] = []
+	for p in get_tree().get_nodes_in_group("players"):
+		if p is CollisionObject3D:
+			excluded.append((p as CollisionObject3D).get_rid())
+	query.exclude = excluded
+	var block: Dictionary = space_state.intersect_ray(query)
+	if not block.is_empty():
+		to = block.get("position")
+
 	var total_length: float = from.distance_to(to)
 	if total_length < 0.05:
 		for seg in _rope_segments:
