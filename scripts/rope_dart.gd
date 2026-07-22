@@ -75,6 +75,12 @@ const ROPE_SEGMENTS: int = 8
 ## mostly reeled back in during RECALLING).
 const ROPE_SAG_FACTOR: float = 0.12
 const ROPE_SAG_MAX: float = 0.35
+## _snap_to_rect_edge() (reused from the dart's own obstacle-stop logic)
+## returns a point exactly ON the obstacle's boundary -- with zero
+## clearance, a rope bending there sits flush against the surface, which
+## can read as "still touching" the obstacle rather than visibly clearing
+## it. Pushed outward from the rect center by this much instead.
+const ROPE_BEND_CLEARANCE: float = 0.15
 
 ## dart_head.glb's own local geometry, measured directly off its exported
 ## glTF vertex data (NOT by re-importing into Blender, which silently
@@ -372,7 +378,14 @@ func _update_rope() -> void:
 		var hit_dict: Dictionary = bend_hit
 		var hit_obs: Node = hit_dict.get("obstacle")
 		var hit_point: Vector2 = hit_dict.get("point")
-		var bend_2d: Vector2 = _snap_to_rect_edge(hit_point, hit_obs.get_rect_2d())
+		var obs_rect: Rect2 = hit_obs.get_rect_2d()
+		var bend_2d: Vector2 = _snap_to_rect_edge(hit_point, obs_rect)
+		# Push outward from the rect's center so the rope clears the surface
+		# with visible daylight instead of sitting flush against it -- see
+		# ROPE_BEND_CLEARANCE's comment.
+		var outward: Vector2 = bend_2d - obs_rect.get_center()
+		if outward.length() > 0.001:
+			bend_2d += outward.normalized() * ROPE_BEND_CLEARANCE
 		path.append(Vector3(bend_2d.x, (from.y + to.y) * 0.5, bend_2d.y))
 	path.append(to)
 
