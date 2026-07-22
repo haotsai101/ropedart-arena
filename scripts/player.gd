@@ -281,7 +281,7 @@ const ANIM_SOURCES: Array[String] = [
 ## the last frame instead of cycling. One-shot clips (Death/Hit/Throw/
 ## Jump_*/etc.) are deliberately NOT in this list — those should play once.
 const LOOPING_CLIPS: Array[String] = [
-	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B",
+	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B", "Sword_Idle",
 ]
 
 ## One-shot action clips triggered from gameplay code (throw/slash/kick) --
@@ -466,13 +466,19 @@ func _process(delta: float) -> void:
 	# (dash-excluded) is_moving state used for Walk/Idle and the procedural bob.
 	# A one-shot action clip (throw/slash/kick) gets to finish playing first --
 	# otherwise this per-frame selection would stomp it within a single frame
-	# of it starting, since nothing here else calls _play_anim(). Recall is a
-	# separate override since "Push" is a looping clip -- is_playing() never
-	# goes false on its own, so it needs the explicit _is_recalling flag
-	# (cleared in _on_dart_returned()) as its end condition instead.
+	# of it starting, since nothing here else calls _play_anim(). Recall and
+	# charging are separate overrides since "Push"/"Sword_Idle" are looping
+	# clips -- is_playing() never goes false on its own, so each needs its
+	# own explicit flag as an end condition instead: _is_recalling (cleared
+	# in _on_dart_returned()) and _is_charging (cleared on throw_just_released
+	# in the throw/charge block below, right as _throw() fires and plays the
+	# one-shot "Spell_Simple_Shoot" -- so charging's "Sword_Idle" hand-wind-up
+	# hands off to the throw clip in the same frame the button is released).
 	var action_playing: bool = _anim_player != null and _current_anim in ONE_SHOT_ACTION_CLIPS and _anim_player.is_playing()
 	if _is_recalling:
 		_play_anim("Push")
+	elif _is_charging:
+		_play_anim("Sword_Idle")
 	elif action_playing:
 		pass
 	elif _is_dashing:
