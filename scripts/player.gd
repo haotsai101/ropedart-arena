@@ -32,10 +32,13 @@ const SLASH_COOLDOWN: float = 0.25
 const MELEE_RANGE: float = 1.4
 const MELEE_CONE_DEG: float = 50.0
 ## Winding up a throw: the dart head orbits the hand on a short taut rope --
-## see _update_charge_spin(). Radius is in the handslot.r attachment's local
-## space (small, hand-relative), speed is angular (rad/s).
+## see _update_charge_spin(). Speed ramps from MIN at the start of a charge
+## up to MAX at a full charge (matching the same charge_ratio that scales
+## the eventual throw's speed/range in _throw()), so a harder-charged throw
+## visibly winds up faster.
 const CHARGE_SPIN_RADIUS: float = 0.35
-const CHARGE_SPIN_SPEED: float = TAU * 2.2  # ~2.2 revolutions/sec
+const CHARGE_SPIN_SPEED_MIN: float = TAU * 3.0  # ~3 rev/sec at the start of a charge
+const CHARGE_SPIN_SPEED_MAX: float = TAU * 7.0  # ~7 rev/sec at a full charge
 const WALK_ANIM_SPEED: float = 2.0
 ## Half-extent of the platform on the XZ plane — must match the ground
 ## PlaneMesh/BoxShape3D size (30x30) in scenes/main.tscn. Stepping past this
@@ -442,9 +445,16 @@ func _setup_dagger_in_hand() -> void:
 
 func _update_charge_spin(delta: float) -> void:
 	## Winding up: the dart orbits the hand on a short taut rope while
-	## charging, in the handslot.r attachment's own local space -- both the
-	## dart's offset and the rope endpoint are local positions within that
-	## same space, so this needs no bone-pose queries or cross-space math.
+	## charging. The spin's plane is parallel to the character -- built from
+	## world UP and the character's own facing direction (_facing_dir) in
+	## world space, rather than the hand bone's local axes, so the circle
+	## stays aligned with the character's body/facing regardless of whatever
+	## arm angle the "Sword_Idle" charge pose happens to hold (which isn't
+	## necessarily facing-aligned itself). This needs global positions/
+	## transforms rather than the attachment's local space, unlike most of
+	## this codebase's other per-bone visual code. Speed ramps up with
+	## charge progress so a fuller charge visibly winds up faster, matching
+	## the harder throw it produces (see _throw()'s own charge_ratio use).
 	## Depicts "spinning the rope" during the windup, distinct from the
 	## Wrap/Grapple-Bind design note in CLAUDE.md (that's about the thrown
 	## dart's arc, not this pre-throw animation).
@@ -454,10 +464,17 @@ func _update_charge_spin(delta: float) -> void:
 		_charge_spin_dart.visible = false
 		_charge_spin_rope.visible = false
 		return
-	_charge_spin_angle = fmod(_charge_spin_angle + CHARGE_SPIN_SPEED * delta, TAU)
-	var offset := Vector3(cos(_charge_spin_angle), 0.0, sin(_charge_spin_angle)) * CHARGE_SPIN_RADIUS
+
+	var charge_ratio: float = clampf(_charge_time / MAX_CHARGE_TIME, 0.0, 1.0)
+	var spin_speed: float = lerp(CHARGE_SPIN_SPEED_MIN, CHARGE_SPIN_SPEED_MAX, charge_ratio)
+	_charge_spin_angle = fmod(_charge_spin_angle + spin_speed * delta, TAU)
+
+	var forward_3d: Vector3 = Vector3(_facing_dir.x, 0.0, _facing_dir.y)
+	var offset: Vector3 = forward_3d * (cos(_charge_spin_angle) * CHARGE_SPIN_RADIUS) \
+		+ Vector3.UP * (sin(_charge_spin_angle) * CHARGE_SPIN_RADIUS)
+	var pivot: Vector3 = _dagger_in_hand.global_position
 	_charge_spin_dart.visible = true
-	_charge_spin_dart.position = offset
+	_charge_spin_dart.global_position = pivot + offset
 
 	var length: float = offset.length()
 	if length < 0.001:
@@ -468,9 +485,7 @@ func _update_charge_spin(delta: float) -> void:
 	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
 	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
 	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
-	# Local (not global) transform -- both endpoints (origin = the hand, and
-	# offset) are already expressed in the attachment's own local space.
-	_charge_spin_rope.transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), offset * 0.5)
+	_charge_spin_rope.global_transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), pivot + offset * 0.5)
 
 
 func _find_skeleton(node: Node) -> Skeleton3D:
