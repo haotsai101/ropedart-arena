@@ -76,6 +76,14 @@ const MAX_PLANE_Y: float = 1.6
 const CAPSULE_DIR: Vector2 = Vector2(0, -1)
 @export var capsule_height: float = 1.4
 
+## How far past the raycast hit point the dart's origin is pushed, along its
+## travel direction, when it anchors on a real obstacle -- reads as the blade
+## buried roughly halfway into the pillar/tree with the grip/pommel (and the
+## rope's attach point, DAGGER_POMMEL_OFFSET further back) still outside the
+## surface, rather than just touching it. Not applied for player hits or the
+## arena boundary -- there's no solid geometry to visibly sink into there.
+const ANCHOR_EMBED_DEPTH: float = 0.3
+
 var state: int = State.FLYING
 var owner_player: Node3D = null
 var head_2d: Vector2 = Vector2.ZERO
@@ -88,6 +96,11 @@ var charge_ratio: float = 0.0
 ## changes state. This is what keeps the "real physics" raycast below
 ## meaningful: a single ray at a fixed height, not a moving target.
 var plane_y: float = 1.0
+## The travel direction frozen at the moment of anchoring (a copy of dir_2d
+## at that instant) -- see _anchor()/_render(). Keeps the embedded dart's
+## orientation fixed once stuck, instead of continuously re-aiming at
+## wherever the owner currently stands.
+var _anchor_dir_2d: Vector2 = Vector2.ZERO
 
 @onready var head_mesh: Node3D = $Head
 
@@ -132,6 +145,11 @@ func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) 
 
 	state = State.FLYING
 	add_to_group("darts")
+	# Without this, head_mesh sits at its scene-default transform (world
+	# origin -- the map's center) for the one render frame between
+	# add_child() and this dart's first _physics_process() tick, flashing
+	# there before snapping to the real thrown position.
+	_render()
 
 
 ## Called by the owner (pressing throw again while the dart is out) to pull
@@ -169,7 +187,10 @@ func _physics_process(delta: float) -> void:
 				# never anchors on a character it merely grazed.
 				var hit_point_2d: Variant = _raycast_obstacle(prev_head_2d, head_2d)
 				if hit_point_2d != null:
-					head_2d = hit_point_2d
+					# Push past the surface along the travel direction so the
+					# blade reads as embedded rather than just touching it --
+					# see ANCHOR_EMBED_DEPTH's comment.
+					head_2d = (hit_point_2d as Vector2) + dir_2d * ANCHOR_EMBED_DEPTH
 					_anchor()
 				elif head_2d.distance_to(origin_2d) >= ROPE_LENGTH:
 					# Fixed-length rope snapping taut: rather than anchoring at empty
@@ -194,6 +215,9 @@ func _physics_process(delta: float) -> void:
 
 func _anchor() -> void:
 	state = State.ANCHORED
+	# Freeze the embedded orientation now, from the direction it was actually
+	# traveling -- see _anchor_dir_2d's comment and _render()'s use of it.
+	_anchor_dir_2d = dir_2d
 
 
 func _pick_up() -> void:
@@ -267,16 +291,21 @@ func _render() -> void:
 	# current height.
 	head_mesh.global_position = Vector3(head_2d.x, plane_y, head_2d.y)
 
-	# Blade points away from wherever the rope currently comes from (the
-	# owner) -- covers FLYING (roughly dir_2d, but stays correct even if the
-	# owner moves mid-flight), ANCHORED (re-orients if the owner walks around
-	# it), and RECALLING (blade trails, pommel leads back toward the owner)
-	# with one rule instead of three special cases. Falls back to dir_2d
-	# only in the degenerate case of head_2d and the owner coinciding.
-	var owner_pos_2d: Vector2 = owner_player.get_pos_2d()
-	var blade_dir_2d: Vector2 = head_2d - owner_pos_2d
-	if blade_dir_2d.length() < 0.01:
-		blade_dir_2d = dir_2d
+	# ANCHORED: frozen at the moment it stuck (see _anchor()) -- an embedded
+	# blade doesn't swivel just because the owner walks to a different angle.
+	# FLYING/RECALLING: blade points away from wherever the rope currently
+	# comes from (the owner) -- roughly dir_2d while flying, and trails with
+	# the pommel leading back toward the owner while recalling, covered by
+	# the same rule. Falls back to dir_2d only in the degenerate case of
+	# head_2d and the owner coinciding.
+	var blade_dir_2d: Vector2
+	if state == State.ANCHORED:
+		blade_dir_2d = _anchor_dir_2d
+	else:
+		var owner_pos_2d: Vector2 = owner_player.get_pos_2d()
+		blade_dir_2d = head_2d - owner_pos_2d
+		if blade_dir_2d.length() < 0.01:
+			blade_dir_2d = dir_2d
 	if blade_dir_2d.length() > 0.001:
 		var blade_forward: Vector3 = Vector3(blade_dir_2d.x, 0.0, blade_dir_2d.y).normalized()
 		var z_axis: Vector3 = -blade_forward
