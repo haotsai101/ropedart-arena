@@ -488,15 +488,21 @@ func _process(delta: float) -> void:
 	else:
 		_play_anim("Idle_A")
 
-	# Facing: smoothly turn the mesh to face the movement direction. KayKit's
-	# modeled forward is actually +Z after import (same as the old fruit
-	# models needed, confirmed visually — the glTF/Godot -Z-forward
-	# assumption in a prior version of this comment was wrong), opposite of
-	# Basis.looking_at()'s -Z convention, so look toward the reverse vector.
+	# Facing: smoothly turn the mesh to face the movement direction -- or,
+	# while charging a throw, the aim direction instead. Charging zeroes
+	# velocity (movement_blocked), so the vel2d-based facing below would
+	# otherwise just freeze on whatever direction was last faced before the
+	# charge started; aiming should still visibly reorient you toward your
+	# throw target even though you can't move. KayKit's modeled forward is
+	# actually +Z after import (same as the old fruit models needed,
+	# confirmed visually — the glTF/Godot -Z-forward assumption in a prior
+	# version of this comment was wrong), opposite of Basis.looking_at()'s
+	# -Z convention, so look toward the reverse vector.
 	var vel2d := Vector2(velocity.x, velocity.z)
-	if vel2d.length() > 0.5:
-		_facing_dir = vel2d.normalized()
-		var dir3 := Vector3(vel2d.x, 0.0, vel2d.y).normalized()
+	var facing_target: Vector2 = aim_dir if _is_charging else vel2d
+	if facing_target.length() > 0.5:
+		_facing_dir = facing_target.normalized()
+		var dir3 := Vector3(facing_target.x, 0.0, facing_target.y).normalized()
 		var desired_quat: Quaternion = Basis.looking_at(-dir3, Vector3.UP).get_rotation_quaternion()
 		player_mesh.quaternion = player_mesh.quaternion.slerp(desired_quat, clampf(12.0 * delta, 0.0, 1.0))
 
