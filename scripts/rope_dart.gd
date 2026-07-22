@@ -76,27 +76,6 @@ const MAX_PLANE_Y: float = 1.6
 const CAPSULE_DIR: Vector2 = Vector2(0, -1)
 @export var capsule_height: float = 1.4
 
-## Number of straight segments the rope is drawn as between hand and head --
-## a single stretched segment (the old approach) reads as a rigid rod
-## recalculated every frame rather than an actual rope, since it's always
-## the exact straight-line distance between the two points. Sampling
-## several points along a sagging curve and drawing a short segment between
-## each pair gives it a real hanging-rope silhouette instead.
-const ROPE_SEGMENTS: int = 8
-## World-space vertical droop applied at the rope's midpoint, scaled by its
-## current length (a fully-extended throw sags more than a rope that's
-## mostly reeled back in during RECALLING).
-const ROPE_SAG_FACTOR: float = 0.12
-const ROPE_SAG_MAX: float = 0.35
-
-## dart_head.glb's own local geometry, measured directly off its exported
-## glTF vertex data (NOT by re-importing into Blender, which silently
-## converts back from glTF's Y-up to Blender's Z-up and hides the real
-## axes): blade tip at local Z=-0.55, pommel at local Z=+0.315 -- so "blade
-## forward" is local -Z, and the rope should attach at the pommel end
-## (DAGGER_POMMEL_OFFSET), not the model's origin.
-const DAGGER_POMMEL_OFFSET: float = 0.315
-
 var state: int = State.FLYING
 var owner_player: Node3D = null
 var head_2d: Vector2 = Vector2.ZERO
@@ -109,24 +88,8 @@ var charge_ratio: float = 0.0
 ## changes state. This is what keeps the "real physics" raycast below
 ## meaningful: a single ray at a fixed height, not a moving target.
 var plane_y: float = 1.0
-var _rope_segments: Array[MeshInstance3D] = []
 
 @onready var head_mesh: Node3D = $Head
-@onready var rope_mesh: MeshInstance3D = $Rope
-
-
-func _ready() -> void:
-	# $Rope (authored in rope_dart.tscn, with the actual rope material) is
-	# segment 0; build the rest by sharing its mesh + material rather than
-	# duplicating the scene-authored resources.
-	_rope_segments.append(rope_mesh)
-	var shared_mat: Material = rope_mesh.get_surface_override_material(0)
-	for i in range(ROPE_SEGMENTS - 1):
-		var seg := MeshInstance3D.new()
-		seg.mesh = rope_mesh.mesh
-		seg.set_surface_override_material(0, shared_mat)
-		add_child(seg)
-		_rope_segments.append(seg)
 
 
 func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) -> void:
@@ -164,9 +127,8 @@ func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) 
 			tinted.emission_enabled = true
 			tinted.emission = owner_player.player_color * 0.4
 			head_mi.set_surface_override_material(0, tinted)
-	# Rope keeps its own authored material (natural rope color, see
-	# rope_dart.tscn) rather than being player-tinted like the blade --
-	# the head is what identifies whose dart it is.
+	# The rope itself is player.gd's own persistent object now (see
+	# _update_persistent_rope()), not something this dart draws.
 
 	state = State.FLYING
 	add_to_group("darts")
@@ -322,74 +284,6 @@ func _render() -> void:
 		var x_axis: Vector3 = basis_seed.cross(z_axis).normalized()
 		var y_axis: Vector3 = z_axis.cross(x_axis).normalized()
 		head_mesh.global_transform.basis = Basis(x_axis, y_axis, z_axis)
-
-	_update_rope()
-
-
-func _update_rope() -> void:
-	# XZ tracks the hand bone's real current position (so the rope's near end
-	# visibly follows the owner's arm), but Y is pinned to the dart's fixed
-	# plane_y rather than the bone's current animated height -- the rope
-	# lives in a single flat plane for its whole life, per the class doc
-	# comment, not a free-hanging 3D line.
-	var hand_pos: Vector3 = owner_player.get_hand_world_position() if owner_player.has_method("get_hand_world_position") \
-		else Vector3(owner_player.get_pos_2d().x, plane_y, owner_player.get_pos_2d().y)
-	var from: Vector3 = Vector3(hand_pos.x, plane_y, hand_pos.z)
-	# Attach at the dagger's pommel (DAGGER_POMMEL_OFFSET along its own local
-	# +Z), not its origin -- transforming by head_mesh's full global
-	# transform (not just its position) so this follows the blade's current
-	# orientation too. head_mesh.global_position.y is already plane_y (see
-	# _render()), so this stays in-plane automatically.
-	var to: Vector3 = head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
-	to.y = plane_y
-
-	# A straight line, no obstacle-routing geometry -- gameplay-relevant
-	# collision is handled entirely by the dart's own real physics raycast
-	# (see _raycast_obstacle()), which already stops the DART at an
-	# obstacle's surface; this draws the rope purely as what's left between
-	# the hand and wherever the dart actually ended up. It can visually clip
-	# through geometry in the rare case the owner walks directly behind an
-	# obstacle after anchoring, but there's no hand-rolled corner/edge math
-	# to keep re-deriving and re-breaking for that cosmetic case.
-	var total_length: float = from.distance_to(to)
-	if total_length < 0.05:
-		for seg in _rope_segments:
-			seg.visible = false
-		return
-
-	# Sample points along a shallow hanging curve (parabolic droop, zero at
-	# both ends, peak at the midpoint) instead of a single straight line --
-	# see ROPE_SEGMENTS' comment for why.
-	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
-	var n: int = _rope_segments.size()
-	var points: Array[Vector3] = []
-	points.resize(n + 1)
-	for i in range(n + 1):
-		var t: float = float(i) / float(n)
-		var p: Vector3 = from.lerp(to, t)
-		p.y -= sag * 4.0 * t * (1.0 - t)
-		points[i] = p
-
-	for i in range(n):
-		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
-
-
-func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
-	var diff: Vector3 = to_pt - from_pt
-	var length: float = diff.length()
-	if length < 0.001:
-		seg.visible = false
-		return
-	seg.visible = true
-	var y_axis: Vector3 = diff / length
-	# Any vector not parallel to y_axis works as a basis seed for building an
-	# orthonormal frame around it; UP fails only when a segment points
-	# (near-)vertically, which never happens here since both endpoints share
-	# roughly the same height band, but guard it anyway.
-	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
-	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
-	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
-	# CylinderMesh's unit height runs along local Y -- encode the stretch
-	# directly into that basis column rather than touching .scale separately,
-	# so this single assignment can't fight with any other transform write.
-	seg.global_transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), (from_pt + to_pt) * 0.5)
+	# The rope itself is drawn by player.gd's _update_persistent_rope() every
+	# frame, reading this dart's head_mesh/plane_y by duck typing -- this
+	# script no longer renders any rope of its own.

@@ -78,6 +78,31 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 const DART_STATE_ANCHORED: int = 1
 const DART_ROPE_LENGTH: float = 8.0
 
+## The persistent rope's segment count/sag, and the CylinderMesh dimensions
+## its segments share -- moved here from rope_dart.gd (formerly the dart's
+## own, separately-spawned tether) now that the rope is one object the
+## player always owns; radius matches rope_dart.tscn's old Rope mesh exactly
+## so the extended look is unchanged. See _update_persistent_rope().
+## Segment count is 16, not the old dart-owned rope's 8 -- these segments now
+## also have to draw a tight ROPE_COIL_TURNS-turn spiral when idle (see
+## _render_rope_coiled()), and 8 straight segments across 2 turns would read
+## as an 8-pointed star rather than a coil (~90 deg of arc per segment). A
+## mostly-straight extended line doesn't need the extra segments but isn't
+## hurt by them either.
+const ROPE_SEGMENTS: int = 16
+const ROPE_SAG_FACTOR: float = 0.12
+const ROPE_SAG_MAX: float = 0.35
+const ROPE_RADIUS: float = 0.035
+## Idle coil shape: a tight spiral centered at _rope_coil_anchor, radius
+## growing from inner to outer across ROPE_COIL_TURNS full turns. INNER must
+## clear the actual forearm radius there (~0.09-0.15, sampled directly from
+## Barbarian.glb's skinned vertices -- see _setup_dagger_in_hand()'s comment)
+## or the coil clips into the arm; matches the old rope_coil.glb mesh's own
+## calibrated inner/outer radii so the idle silhouette is unchanged.
+const ROPE_COIL_TURNS: float = 2.0
+const ROPE_COIL_RADIUS_INNER: float = 0.16
+const ROPE_COIL_RADIUS_OUTER: float = 0.24
+
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
 ## global_position.y sits at the physics capsule's CENTER (spawn markers add
@@ -101,12 +126,16 @@ var _dagger_in_hand: Node3D = null
 ## since the charge-spin visuals take over depicting the weapon while
 ## winding up a throw.
 var _static_dagger_mesh: Node3D = null
-## Coiled rope worn around the forearm until thrown -- separate attachment
-## point from _dagger_in_hand (lowerarm.r, not handslot.r) so it doesn't
-## overlap the dagger's own geometry; visibility mirrors (dart == null)
-## alongside it (stays visible through a charge, unlike the dagger itself --
-## the rope is still feeding from the arm while the weight spins).
-var _rope_coil_in_hand: Node3D = null
+## Reference point (lowerarm.r, not handslot.r -- same clipping-avoidance
+## reasoning as the old coil mesh this replaced) for where the persistent
+## rope's coiled idle shape centers -- see _render_rope_coiled().
+var _rope_coil_anchor: Node3D = null
+## The single rope object worn on the forearm, always present -- see
+## _update_persistent_rope(). Coiled while (dart == null), it redraws as a
+## straight sagging line out to the dart once thrown, using the exact same
+## segment meshes for both, so it's one object changing shape rather than a
+## coil mesh swapped for a separately-spawned tether.
+var _rope_segments: Array[MeshInstance3D] = []
 ## Dart head that orbits the hand on a taut rope while charging, depicting
 ## winding up the throw -- see _update_charge_spin().
 var _charge_spin_dart: Node3D = null
@@ -387,22 +416,22 @@ func _setup_dagger_in_hand() -> void:
 	## dart head (reuses rope_dart.gd's own dart_head.glb so the in-hand and
 	## in-flight weapon look identical).
 	##
-	## The coiled rope is a SEPARATE attachment on "lowerarm.r" instead --
-	## sharing handslot.r with the dagger put both props in the same small
-	## span of space, and the coil (built with a small inner radius) ended up
-	## overlapping/clipping inside the dagger's grip geometry. lowerarm.r
-	## measures 0.26 units head-to-tail along its own local -Y (bone length
-	## axis), and the actual character mesh's forearm radius there measures
-	## ~0.09-0.15 (sampled directly from Barbarian.glb's skinned vertices) --
-	## rope_coil.glb's inner radius (0.16) was sized to clear that. Rotating
-	## 90 deg around local X maps the coil's flat spiral normal (local +Z)
-	## onto the bone's length axis (local -Y), so it encircles the forearm
-	## like a wrapped coil instead of lying flat against it. Positioned at
-	## the bone's local half-length (-0.13) to sit at the forearm's midpoint.
+	## The rope's coiled-idle anchor is a SEPARATE attachment on "lowerarm.r"
+	## instead -- sharing handslot.r with the dagger put both props in the
+	## same small span of space, and a coil there would overlap/clip inside
+	## the dagger's grip geometry. lowerarm.r measures 0.26 units head-to-tail
+	## along its own local -Y (bone length axis), and the actual character
+	## mesh's forearm radius there measures ~0.09-0.15 (sampled directly from
+	## Barbarian.glb's skinned vertices) -- ROPE_COIL_RADIUS_OUTER (0.16) is
+	## sized to clear that. Positioned at the bone's local half-length (-0.13)
+	## to sit at the forearm's midpoint.
 	##
-	## Both props are kept in sync with (dart == null) in _process() rather
-	## than at each of _throw()/_on_dart_returned()/kill()/reset_for_round(),
-	## so there's a single source of truth for it.
+	## The held dagger's visibility is kept in sync with (dart == null) in
+	## _process() rather than at each of _throw()/_on_dart_returned()/kill()/
+	## reset_for_round(), so there's a single source of truth for it. The
+	## rope (see below) reads the same (dart == null) each frame in
+	## _update_persistent_rope() to pick coiled vs. extended, rather than
+	## toggling visibility on a second mesh.
 	##
 	## Also builds the charge-spin visuals (a second dart-head instance plus
 	## a short rope) as extra children of the same handslot.r attachment --
@@ -460,14 +489,41 @@ func _setup_dagger_in_hand() -> void:
 	coil_attachment.name = "RopeCoilAttachment"
 	coil_attachment.bone_name = "lowerarm.r"
 	skeleton.add_child(coil_attachment)
-	var coil_scene: PackedScene = load("res://assets/characters/rope_coil.glb")
-	if coil_scene != null:
-		var coil_instance: Node3D = coil_scene.instantiate()
-		coil_instance.name = "RopeCoilInHand"
-		coil_instance.position = Vector3(0.0, -0.13, 0.0)
-		coil_instance.rotation_degrees = Vector3(90.0, 0.0, 0.0)
-		coil_attachment.add_child(coil_instance)
-	_rope_coil_in_hand = coil_attachment
+	# A plain child, not a property on the attachment itself -- BoneAttachment3D
+	# overwrites its own transform to track the bone every frame, so the local
+	# offset/rotation that actually centers the coil on the forearm (same
+	# values the old rope_coil.glb instance used) has to live one level down.
+	var coil_anchor := Node3D.new()
+	coil_anchor.name = "RopeCoilAnchor"
+	coil_anchor.position = Vector3(0.0, -0.13, 0.0)
+	coil_anchor.rotation_degrees = Vector3(90.0, 0.0, 0.0)
+	coil_attachment.add_child(coil_anchor)
+	_rope_coil_anchor = coil_anchor
+
+	# The persistent rope itself -- ROPE_SEGMENTS short cylinders, reused for
+	# both the coiled-idle shape and the thrown-extended shape (see
+	# _update_persistent_rope()). Parented directly under the player rather
+	# than any bone attachment, since every segment gets its global_transform
+	# set explicitly each frame regardless (same technique the old
+	# dart-owned rope segments used) -- only needs to be somewhere in the
+	# tree to render.
+	var rope_mat := StandardMaterial3D.new()
+	rope_mat.albedo_color = Color(0.22, 0.16, 0.12)
+	rope_mat.metallic = 0.1
+	rope_mat.roughness = 0.75
+	rope_mat.emission_enabled = true
+	rope_mat.emission = Color(0.1, 0.07, 0.05)
+	var rope_shape := CylinderMesh.new()
+	rope_shape.top_radius = ROPE_RADIUS
+	rope_shape.bottom_radius = ROPE_RADIUS
+	rope_shape.height = 1.0
+	for i in range(ROPE_SEGMENTS):
+		var seg := MeshInstance3D.new()
+		seg.name = "RopeSegment%d" % i
+		seg.mesh = rope_shape
+		seg.set_surface_override_material(0, rope_mat)
+		add_child(seg)
+		_rope_segments.append(seg)
 
 
 func _update_charge_spin(delta: float) -> void:
@@ -600,8 +656,7 @@ func _process(delta: float) -> void:
 		return
 	if _static_dagger_mesh != null:
 		_static_dagger_mesh.visible = (dart == null and not _is_charging)
-	if _rope_coil_in_hand != null:
-		_rope_coil_in_hand.visible = (dart == null)
+	_update_persistent_rope()
 	_update_charge_spin(delta)
 	if is_dead or is_falling:
 		return
@@ -983,6 +1038,86 @@ func get_hand_world_position() -> Vector3:
 	if _dagger_in_hand != null:
 		return _dagger_in_hand.global_position
 	return global_position + Vector3.UP * 1.0
+
+
+func _update_persistent_rope() -> void:
+	## The rope is one object, always present at the arm -- idle it's drawn
+	## coiled (see _render_rope_coiled()), thrown the exact same segments
+	## redraw as a straight sagging line out to the dart
+	## (_render_rope_extended()). No literal unspooling motion: it reads as
+	## "uncoiling" because the same object's shape grows from a small coil
+	## into a long line as the dart flies out, not because anything spins.
+	if _rope_segments.is_empty():
+		return
+	if dart == null:
+		_render_rope_coiled()
+	else:
+		_render_rope_extended()
+
+
+func _render_rope_coiled() -> void:
+	if _rope_coil_anchor == null:
+		for seg in _rope_segments:
+			seg.visible = false
+		return
+	var center: Vector3 = _rope_coil_anchor.global_position
+	var coil_basis: Basis = _rope_coil_anchor.global_transform.basis
+	var n: int = _rope_segments.size()
+	var points: Array[Vector3] = []
+	points.resize(n + 1)
+	for i in range(n + 1):
+		var t: float = float(i) / float(n)
+		var angle: float = t * ROPE_COIL_TURNS * TAU
+		var radius: float = lerp(ROPE_COIL_RADIUS_INNER, ROPE_COIL_RADIUS_OUTER, t)
+		points[i] = center + coil_basis.x * (cos(angle) * radius) + coil_basis.y * (sin(angle) * radius)
+	for i in range(n):
+		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
+
+
+func _render_rope_extended() -> void:
+	## Straight line from the real hand position to the dart's pommel, both
+	## pinned to the dart's own fixed plane_y -- identical math to what used
+	## to live in rope_dart.gd's _update_rope() before the rope moved to
+	## being player-owned; only the source of "the dart" changed (duck-typed
+	## off `dart` here instead of `self`).
+	var plane_y: float = dart.plane_y
+	var hand_pos: Vector3 = get_hand_world_position()
+	var from: Vector3 = Vector3(hand_pos.x, plane_y, hand_pos.z)
+	var to: Vector3 = dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
+	to.y = plane_y
+
+	var total_length: float = from.distance_to(to)
+	if total_length < 0.05:
+		for seg in _rope_segments:
+			seg.visible = false
+		return
+
+	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
+	var n: int = _rope_segments.size()
+	var points: Array[Vector3] = []
+	points.resize(n + 1)
+	for i in range(n + 1):
+		var t: float = float(i) / float(n)
+		var p: Vector3 = from.lerp(to, t)
+		p.y -= sag * 4.0 * t * (1.0 - t)
+		points[i] = p
+
+	for i in range(n):
+		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
+
+
+func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
+	var diff: Vector3 = to_pt - from_pt
+	var length: float = diff.length()
+	if length < 0.001:
+		seg.visible = false
+		return
+	seg.visible = true
+	var y_axis: Vector3 = diff / length
+	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
+	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
+	seg.global_transform = Transform3D(Basis(x_axis, y_axis * length, z_axis), (from_pt + to_pt) * 0.5)
 
 
 func _perform_slash() -> void:
