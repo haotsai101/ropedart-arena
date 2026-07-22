@@ -88,6 +88,14 @@ var player_peer_id: int = 1          # which multiplayer peer owns this player
 var is_network_controlled: bool = false  # true when a remote peer drives this player
 
 var _prev_throw: bool = false
+## True for the duration of an active rope dart recall -- see the throw-again
+## branch in _physics_process() and _on_dart_returned(). Drives the "Push"
+## animation override in _process() (a looping clip -- note the imported name
+## has its "_Loop" suffix stripped by Godot's glTF importer, same as it does
+## for KayKit's own clips, see ANIM_SOURCES' comment -- so unlike the one-shot
+## action clips it needs an explicit end condition rather than relying on
+## AnimationPlayer.is_playing() going false on its own).
+var _is_recalling: bool = false
 var _respawn_timer: SceneTreeTimer = null
 ## One duplicated material per mesh part of the character (arms/body/head/
 ## legs/accessories) — KayKit characters are fully textured, so player-color
@@ -421,11 +429,16 @@ func _process(delta: float) -> void:
 	# Dash takes priority over the is_moving check — while dashing we're moving
 	# far faster than a walk, so cut straight to the run clip regardless of the
 	# (dash-excluded) is_moving state used for Walk/Idle and the procedural bob.
-	# A one-shot action clip (kicking / getting kicked) gets to finish playing
-	# first -- otherwise this per-frame selection would stomp it within a
-	# single frame of it starting, since nothing here else calls _play_anim().
+	# A one-shot action clip (throw/slash/kick) gets to finish playing first --
+	# otherwise this per-frame selection would stomp it within a single frame
+	# of it starting, since nothing here else calls _play_anim(). Recall is a
+	# separate override since "Push" is a looping clip -- is_playing() never
+	# goes false on its own, so it needs the explicit _is_recalling flag
+	# (cleared in _on_dart_returned()) as its end condition instead.
 	var action_playing: bool = _anim_player != null and _current_anim in ONE_SHOT_ACTION_CLIPS and _anim_player.is_playing()
-	if action_playing:
+	if _is_recalling:
+		_play_anim("Push")
+	elif action_playing:
 		pass
 	elif _is_dashing:
 		_play_anim("Running_A")
@@ -595,26 +608,32 @@ func _physics_process(delta: float) -> void:
 		aim_dir = move_input.normalized()
 	aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
 
-	# --- Throw / charge logic ---
-	# No rope to recall anymore: a dagger is either still in flight or lying
-	# on the ground wherever it landed, and getting it back means walking
-	# over to it (see dagger.gd's LANDED state) — pressing throw again while
-	# dart != null just does nothing, whether it's flying or already landed.
+	# --- Throw / charge / recall logic ---
+	# The rope dart stays tethered: pressing throw again while it's still out
+	# (flying or anchored) recalls it instead of doing nothing, on top of the
+	# existing walk-over-to-pick-up (see rope_dart.gd's recall()/pickup_radius).
 	if is_bot and bot_controller != null:
-		# Bots use a one-shot flag; throw immediately at difficulty-based ratio
+		# Bots use a one-shot flag; throw immediately at difficulty-based ratio.
+		# Bots don't actively recall -- they retrieve by walking over it, same
+		# as before, keeping their AI simple.
 		if bot_controller.get_desired_throw() and dart == null:
 			var diff: int = clamp(bot_controller.difficulty, 0, BOT_CHARGE_RATIOS.size() - 1)
 			var bot_ratio: float = float(BOT_CHARGE_RATIOS[diff])
 			_throw(bot_ratio)
 	else:
-		# Human players: hold to charge, release to fire
+		# Human players: hold to charge, release to fire; a tap while the dart
+		# is already out recalls it instead.
 		var throw_just_pressed: bool = throw_held and not _prev_throw
 		var throw_just_released: bool = not throw_held and _prev_throw
 		_prev_throw = throw_held
 
-		if throw_just_pressed and dart == null:
-			_is_charging = true
-			_charge_time = 0.0
+		if throw_just_pressed:
+			if dart == null:
+				_is_charging = true
+				_charge_time = 0.0
+			elif dart.has_method("recall"):
+				dart.recall()
+				_is_recalling = true
 
 		if _is_charging:
 			if throw_held:
@@ -867,6 +886,7 @@ func reset_for_round(new_lives: int, start_pos: Vector3) -> void:
 	_prev_throw = false
 	_is_charging = false
 	_charge_time = 0.0
+	_is_recalling = false
 	_trip_timer = 0.0
 	_slow_timer = 0.0
 	_is_tripped = false
@@ -893,3 +913,4 @@ func _start_spawn_invincibility() -> void:
 
 func _on_dart_returned() -> void:
 	dart = null
+	_is_recalling = false
