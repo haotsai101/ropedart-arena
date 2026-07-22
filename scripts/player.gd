@@ -60,7 +60,7 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 var player_mesh: Node3D = null
 var character_id: String = "char_barbarian"
 var _mesh_base_scale: Vector3 = Vector3.ONE
-## Dagger model held in the character's hand until thrown -- see
+## Dart head + coiled rope held in the character's hand until thrown -- see
 ## _setup_dagger_in_hand(); visibility mirrors (dart == null) every frame.
 var _dagger_in_hand: Node3D = null
 
@@ -331,26 +331,38 @@ func _setup_dagger_in_hand() -> void:
 	## Every character rig has a "handslot.r" bone -- a KayKit-authored
 	## attachment point parented right under hand.r, positioned at the palm
 	## with its local -Y axis as the grip direction (confirmed by inspecting
-	## its rest transform) -- exactly what BoneAttachment3D needs. Reuses
-	## dagger.gd's own dart_head.glb model so the in-hand and in-flight dagger
-	## look identical. Visibility is kept in sync with (dart == null) in
-	## _process() rather than at each of _throw()/_on_dart_returned()/kill()/
-	## reset_for_round(), so there's a single source of truth for it.
+	## its rest transform) -- exactly what BoneAttachment3D needs. Holds two
+	## permanent props: the dart head (reuses rope_dart.gd's own dart_head.glb
+	## so the in-hand and in-flight weapon look identical) and a coiled rope
+	## (rope_coil.glb, matching rope_dart.tscn's rope material so the coiled
+	## and extended-while-thrown rope read as the same physical object)
+	## offset slightly so it doesn't clip through the dart head. Both are
+	## kept in sync with (dart == null) in _process() rather than at each of
+	## _throw()/_on_dart_returned()/kill()/reset_for_round(), so there's a
+	## single source of truth for it.
 	if player_mesh == null:
 		return
 	var skeleton: Skeleton3D = _find_skeleton(player_mesh)
 	if skeleton == null:
 		return
-	var dagger_scene: PackedScene = load("res://assets/characters/dart_head.glb")
-	if dagger_scene == null:
-		return
 	var attachment := BoneAttachment3D.new()
 	attachment.name = "DaggerAttachment"
 	attachment.bone_name = "handslot.r"
 	skeleton.add_child(attachment)
-	var dagger_instance: Node3D = dagger_scene.instantiate()
-	dagger_instance.name = "DaggerInHand"
-	attachment.add_child(dagger_instance)
+
+	var dagger_scene: PackedScene = load("res://assets/characters/dart_head.glb")
+	if dagger_scene != null:
+		var dagger_instance: Node3D = dagger_scene.instantiate()
+		dagger_instance.name = "DaggerInHand"
+		attachment.add_child(dagger_instance)
+
+	var coil_scene: PackedScene = load("res://assets/characters/rope_coil.glb")
+	if coil_scene != null:
+		var coil_instance: Node3D = coil_scene.instantiate()
+		coil_instance.name = "RopeCoilInHand"
+		coil_instance.position = Vector3(0.0, -0.05, 0.05)
+		attachment.add_child(coil_instance)
+
 	_dagger_in_hand = attachment
 
 
