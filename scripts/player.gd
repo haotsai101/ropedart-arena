@@ -70,6 +70,14 @@ const SPAWN_INVINCIBLE_DURATION: float = 0.75
 @export var show_hitbox_debug: bool = true
 const HITBOX_DEBUG_RADIUS: float = 0.6
 
+## Mirrors rope_dart.gd's State.ANCHORED ordinal and ROPE_LENGTH — no shared
+## constant between the two scripts (see HITBOX_DEBUG_RADIUS's comment
+## above), so keep these in sync by hand if either changes. Used by
+## _clamp_to_rope_leash() to keep the owner from wandering past the tether's
+## reach once the dart is anchored.
+const DART_STATE_ANCHORED: int = 1
+const DART_ROPE_LENGTH: float = 8.0
+
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
 ## global_position.y sits at the physics capsule's CENTER (spawn markers add
@@ -820,6 +828,7 @@ func _physics_process(delta: float) -> void:
 			move_input = move_input.normalized()
 		velocity = Vector3(move_input.x, 0.0, move_input.y) * effective_speed
 	move_and_slide()
+	_clamp_to_rope_leash()
 	_check_boundary_fall()
 	if is_falling:
 		return
@@ -998,6 +1007,25 @@ func _perform_slash() -> void:
 			p.kill()
 		else:
 			p.trip()
+
+
+func _clamp_to_rope_leash() -> void:
+	## Once the rope dart is anchored, its rope is a fixed-length physical
+	## tether (see rope_dart.gd's class doc comment) -- the owner shouldn't be
+	## able to walk further from the anchor point than the rope allows.
+	## Pulls the player back onto the circle of radius DART_ROPE_LENGTH around
+	## the anchor instead of blocking movement outright, so running at an
+	## angle slides along the tether's edge rather than just stopping dead.
+	if dart == null or dart.state != DART_STATE_ANCHORED:
+		return
+	var anchor: Vector2 = dart.head_2d
+	var pos: Vector2 = get_pos_2d()
+	var offset: Vector2 = pos - anchor
+	if offset.length() <= DART_ROPE_LENGTH:
+		return
+	var clamped: Vector2 = anchor + offset.normalized() * DART_ROPE_LENGTH
+	global_position.x = clamped.x
+	global_position.z = clamped.y
 
 
 func _check_boundary_fall() -> void:

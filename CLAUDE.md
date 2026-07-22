@@ -42,6 +42,7 @@ There is no CLI build or test runner. All iteration happens in the Godot editor.
 **`player.gd`** — `CharacterBody3D`, one instance per player
 - Input: `player_index == 0` → keyboard (WASD/arrows/Space); `player_index >= 1` → gamepad `player_index - 1`. When `is_bot == true`, input is delegated to `bot_controller` via `get_desired_move()` / `get_desired_aim()` / `get_desired_throw()`.
 - Movement is blocked (velocity zeroed) when `GameManager.current_state != PLAYING`.
+- `_clamp_to_rope_leash()`, called right after `move_and_slide()` every physics tick: once the owner's rope dart is `ANCHORED`, clamps the player onto the circle of radius `DART_ROPE_LENGTH` around the dart's anchor point rather than letting them walk further away — a real tether limit, not just a visual one. `DART_STATE_ANCHORED` / `DART_ROPE_LENGTH` mirror rope_dart.gd's `State.ANCHORED` ordinal and `ROPE_LENGTH` by hand (no shared constant between the two scripts, same as `HITBOX_DEBUG_RADIUS`).
 - Signals: `player_killed(player)`, `player_eliminated(player)`. Both HUD and GameManager connect to these.
 - `reset_for_round(lives, pos)` is the only way to restore a player between rounds.
 
