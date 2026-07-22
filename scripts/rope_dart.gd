@@ -88,12 +88,6 @@ const ROPE_SEGMENTS: int = 8
 ## mostly reeled back in during RECALLING).
 const ROPE_SAG_FACTOR: float = 0.12
 const ROPE_SAG_MAX: float = 0.35
-## _snap_to_rect_edge() (reused from the dart's own obstacle-stop logic)
-## returns a point exactly ON the obstacle's boundary -- with zero
-## clearance, a rope bending there sits flush against the surface, which
-## can read as "still touching" the obstacle rather than visibly clearing
-## it. Pushed outward from the rect center by this much instead.
-const ROPE_BEND_CLEARANCE: float = 0.15
 
 ## dart_head.glb's own local geometry, measured directly off its exported
 ## glTF vertex data (NOT by re-importing into Blender, which silently
@@ -290,77 +284,6 @@ func _raycast_obstacle(prev: Vector2, cur: Vector2) -> Variant:
 	return Vector2(pos.x, pos.z)
 
 
-func _get_swept_hit_obstacle(prev: Vector2, cur: Vector2) -> Variant:
-	## Swept segment-vs-rect test across every obstacle for the dart's
-	## motion this frame (prev -> cur). Returns {"obstacle": Node, "point":
-	## Vector2} for the obstacle hit closest to prev (smallest t), or null.
-	var best_obs: Node = null
-	var best_t: float = INF
-	var best_point: Vector2 = cur
-	for obs in get_tree().get_nodes_in_group("obstacles"):
-		var hit: Variant = _segment_rect_intersect(prev, cur, obs.get_rect_2d())
-		if hit != null:
-			var hit_dict: Dictionary = hit
-			var t: float = hit_dict.get("t")
-			if t < best_t:
-				best_t = t
-				best_obs = obs
-				best_point = hit_dict.get("point")
-	if best_obs != null:
-		return {"obstacle": best_obs, "point": best_point}
-	return null
-
-
-func _segment_rect_intersect(p0: Vector2, p1: Vector2, r: Rect2) -> Variant:
-	## Standard slab-method segment-vs-AABB intersection. Returns
-	## {"t": float, "point": Vector2} for the first point (smallest t in
-	## [0, 1]) where the segment enters the rect, or null if it never does.
-	## If p0 already starts inside the rect, t = 0 and point = p0.
-	var d: Vector2 = p1 - p0
-	var tmin: float = 0.0
-	var tmax: float = 1.0
-	var mn: Vector2 = r.position
-	var mx: Vector2 = r.end
-	for axis: int in range(2):
-		var p0a: float = p0[axis]
-		var da: float = d[axis]
-		var mna: float = mn[axis]
-		var mxa: float = mx[axis]
-		if absf(da) < 0.000001:
-			if p0a < mna or p0a > mxa:
-				return null
-		else:
-			var t1: float = (mna - p0a) / da
-			var t2: float = (mxa - p0a) / da
-			if t1 > t2:
-				var tmp: float = t1
-				t1 = t2
-				t2 = tmp
-			tmin = maxf(tmin, t1)
-			tmax = minf(tmax, t2)
-			if tmin > tmax:
-				return null
-	return {"t": tmin, "point": p0 + d * tmin}
-
-
-func _snap_to_rect_edge(p: Vector2, r: Rect2) -> Vector2:
-	# Find the nearest point on the perimeter of the rectangle.
-	var best: Vector2 = p
-	var best_d: float = INF
-	var candidates: Array[Vector2] = [
-		Vector2(r.position.x, clampf(p.y, r.position.y, r.end.y)),   # left edge
-		Vector2(r.end.x,      clampf(p.y, r.position.y, r.end.y)),   # right edge
-		Vector2(clampf(p.x, r.position.x, r.end.x), r.position.y),  # top edge
-		Vector2(clampf(p.x, r.position.x, r.end.x), r.end.y),       # bottom edge
-	]
-	for c in candidates:
-		var d: float = p.distance_to(c)
-		if d < best_d:
-			best_d = d
-			best = c
-	return best
-
-
 func _seg_dist(p: Vector2, a: Vector2, b: Vector2) -> float:
 	var ab := b - a
 	var len_sq := ab.length_squared()
@@ -420,24 +343,15 @@ func _update_rope() -> void:
 	var to: Vector3 = head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
 	to.y = plane_y
 
-	# Route around map geometry -- a pillar directly between the hand and the
-	# dart (e.g. after the owner walks around one post-anchor) would
-	# otherwise just clip straight through it. Deliberately checks only the
-	# "obstacles" group via the same _get_swept_hit_obstacle()/
-	# _snap_to_rect_edge() the dart's own flight already uses, never
-	# "players" -- the rope always passes freely through other characters
-	# regardless of where they're standing.
-	var path: Array[Vector3] = [from]
-	var bend_2d: Variant = _get_rope_bend_point(Vector2(from.x, from.z), Vector2(to.x, to.z))
-	var bent: bool = bend_2d != null
-	if bent:
-		var b: Vector2 = bend_2d
-		path.append(Vector3(b.x, (from.y + to.y) * 0.5, b.y))
-	path.append(to)
-
-	var total_length: float = 0.0
-	for i in range(path.size() - 1):
-		total_length += path[i].distance_to(path[i + 1])
+	# A straight line, no obstacle-routing geometry -- gameplay-relevant
+	# collision is handled entirely by the dart's own real physics raycast
+	# (see _raycast_obstacle()), which already stops the DART at an
+	# obstacle's surface; this draws the rope purely as what's left between
+	# the hand and wherever the dart actually ended up. It can visually clip
+	# through geometry in the rare case the owner walks directly behind an
+	# obstacle after anchoring, but there's no hand-rolled corner/edge math
+	# to keep re-deriving and re-breaking for that cosmetic case.
+	var total_length: float = from.distance_to(to)
 	if total_length < 0.05:
 		for seg in _rope_segments:
 			seg.visible = false
@@ -445,104 +359,19 @@ func _update_rope() -> void:
 
 	# Sample points along a shallow hanging curve (parabolic droop, zero at
 	# both ends, peak at the midpoint) instead of a single straight line --
-	# see ROPE_SEGMENTS' comment for why. Skipped across a bend (a rope
-	# caught on a corner reads as taut there, and a smooth parabola doesn't
-	# make sense across a kinked path anyway).
-	var sag: float = 0.0 if bent else minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
+	# see ROPE_SEGMENTS' comment for why.
+	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
 	var n: int = _rope_segments.size()
 	var points: Array[Vector3] = []
 	points.resize(n + 1)
 	for i in range(n + 1):
 		var t: float = float(i) / float(n)
-		var p: Vector3 = _sample_path(path, t)
+		var p: Vector3 = from.lerp(to, t)
 		p.y -= sag * 4.0 * t * (1.0 - t)
 		points[i] = p
 
 	for i in range(n):
 		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
-
-
-func _get_rope_bend_point(from_2d: Vector2, to_2d: Vector2) -> Variant:
-	## Returns a single Vector2 bend point that routes the direct line around
-	## whichever obstacle blocks it, or null if unobstructed.
-	##
-	## An earlier version routed through _snap_to_rect_edge()'s point (where
-	## the direct line first ENTERS the rect) -- wrong: for a line passing
-	## near the rect's center, the second leg (bend -> to) can cut straight
-	## back through the rest of the box on its way out, since the entry
-	## point is just the edge crossing, not a point that clears the whole
-	## shape. A rect's CORNER is the only kind of point where routing through
-	## it is geometrically guaranteed to clear a convex shape on both sides.
-	## Tries all 4 corners (pushed outward for clearance -- see
-	## ROPE_BEND_CLEARANCE), keeps only the ones where BOTH from->corner and
-	## corner->to independently miss the same rect, and picks whichever adds
-	## the least extra distance over the direct line.
-	##
-	## Checks ONLY the "obstacles" group (via _get_swept_hit_obstacle(), the
-	## same one the dart's own flight already uses), never "players" -- the
-	## rope always passes freely through other characters regardless of
-	## where they're standing.
-	var hit: Variant = _get_swept_hit_obstacle(from_2d, to_2d)
-	if hit == null:
-		return null
-	var hit_dict: Dictionary = hit
-	var hit_obs: Node = hit_dict.get("obstacle")
-	var rect: Rect2 = hit_obs.get_rect_2d()
-	var center: Vector2 = rect.get_center()
-	var corners: Array[Vector2] = [
-		rect.position, Vector2(rect.end.x, rect.position.y), rect.end, Vector2(rect.position.x, rect.end.y)
-	]
-
-	var direct_length: float = from_2d.distance_to(to_2d)
-	var best_point: Vector2 = Vector2.ZERO
-	var best_extra: float = INF
-	for corner in corners:
-		var outward: Vector2 = corner - center
-		var pushed: Vector2 = corner + (outward.normalized() * ROPE_BEND_CLEARANCE if outward.length() > 0.001 else Vector2.ZERO)
-		if _segment_rect_intersect(from_2d, pushed, rect) != null:
-			continue
-		if _segment_rect_intersect(pushed, to_2d, rect) != null:
-			continue
-		var extra: float = from_2d.distance_to(pushed) + pushed.distance_to(to_2d) - direct_length
-		if extra < best_extra:
-			best_extra = extra
-			best_point = pushed
-
-	if best_extra < INF:
-		return best_point
-	# Fallback for the (shouldn't normally happen, single convex rect) case
-	# where no single corner clears both legs -- the old edge-snap point,
-	# still pushed outward for clearance.
-	var hit_point: Vector2 = hit_dict.get("point")
-	var edge_point: Vector2 = _snap_to_rect_edge(hit_point, rect)
-	var edge_outward: Vector2 = edge_point - center
-	if edge_outward.length() > 0.001:
-		edge_point += edge_outward.normalized() * ROPE_BEND_CLEARANCE
-	return edge_point
-
-
-func _sample_path(path: Array[Vector3], t: float) -> Vector3:
-	## Sample a point at fraction t (0..1) along a piecewise-linear path,
-	## proportionally to each leg's actual length (not evenly split by
-	## point count), so a short bend leg doesn't get over-represented.
-	if path.size() == 2:
-		return path[0].lerp(path[1], t)
-	var lengths: Array[float] = []
-	var total: float = 0.0
-	for i in range(path.size() - 1):
-		var seg_len: float = path[i].distance_to(path[i + 1])
-		lengths.append(seg_len)
-		total += seg_len
-	if total < 0.001:
-		return path[0]
-	var target: float = t * total
-	var accum: float = 0.0
-	for i in range(lengths.size()):
-		if target <= accum + lengths[i] or i == lengths.size() - 1:
-			var local_t: float = 0.0 if lengths[i] < 0.001 else clampf((target - accum) / lengths[i], 0.0, 1.0)
-			return path[i].lerp(path[i + 1], local_t)
-		accum += lengths[i]
-	return path[path.size() - 1]
 
 
 func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
