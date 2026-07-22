@@ -963,6 +963,19 @@ func get_pos_2d() -> Vector2:
 	return Vector2(global_position.x, global_position.z)
 
 
+func get_hand_world_position() -> Vector3:
+	## The actual tracked handslot.r attachment position (see
+	## _setup_dagger_in_hand()) -- used by rope_dart.gd to draw the rope's
+	## near end from the real hand instead of a guessed height offset above
+	## the capsule center, which was never actually calibrated against the
+	## real hand height and was drawing it up near head/shoulder height.
+	## Falls back to a rough approximation if the attachment isn't set up
+	## (e.g. player_mesh failed to load) rather than erroring.
+	if _dagger_in_hand != null:
+		return _dagger_in_hand.global_position
+	return global_position + Vector3.UP * 1.0
+
+
 func _perform_slash() -> void:
 	## Lethal if the attacker still has their dagger in hand (dart == null) --
 	## same one-hit-kill economy as a dagger throw, with Sword_Attack as the

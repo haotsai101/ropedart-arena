@@ -350,14 +350,35 @@ func _render() -> void:
 
 
 func _update_rope() -> void:
-	var owner_pos_2d: Vector2 = owner_player.get_pos_2d()
-	var from: Vector3 = Vector3(owner_pos_2d.x, owner_player.global_position.y + rope_hand_height, owner_pos_2d.y)
+	var from: Vector3 = owner_player.get_hand_world_position() if owner_player.has_method("get_hand_world_position") \
+		else Vector3(owner_player.get_pos_2d().x, owner_player.global_position.y + rope_hand_height, owner_player.get_pos_2d().y)
 	# Attach at the dagger's pommel (DAGGER_POMMEL_OFFSET along its own local
 	# +Z), not its origin -- transforming by head_mesh's full global
 	# transform (not just its position) so this follows the blade's current
 	# orientation too.
 	var to: Vector3 = head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
-	var total_length: float = from.distance_to(to)
+
+	# Route around map geometry -- a pillar directly between the hand and the
+	# dart (e.g. after the owner walks around one post-anchor) would
+	# otherwise just clip straight through it. Deliberately checks only the
+	# "obstacles" group via the same _get_swept_hit_obstacle()/
+	# _snap_to_rect_edge() the dart's own flight already uses, never
+	# "players" -- the rope always passes freely through other characters
+	# regardless of where they're standing.
+	var path: Array[Vector3] = [from]
+	var bend_hit: Variant = _get_swept_hit_obstacle(Vector2(from.x, from.z), Vector2(to.x, to.z))
+	var bent: bool = bend_hit != null
+	if bent:
+		var hit_dict: Dictionary = bend_hit
+		var hit_obs: Node = hit_dict.get("obstacle")
+		var hit_point: Vector2 = hit_dict.get("point")
+		var bend_2d: Vector2 = _snap_to_rect_edge(hit_point, hit_obs.get_rect_2d())
+		path.append(Vector3(bend_2d.x, (from.y + to.y) * 0.5, bend_2d.y))
+	path.append(to)
+
+	var total_length: float = 0.0
+	for i in range(path.size() - 1):
+		total_length += path[i].distance_to(path[i + 1])
 	if total_length < 0.05:
 		for seg in _rope_segments:
 			seg.visible = false
@@ -365,19 +386,45 @@ func _update_rope() -> void:
 
 	# Sample points along a shallow hanging curve (parabolic droop, zero at
 	# both ends, peak at the midpoint) instead of a single straight line --
-	# see ROPE_SEGMENTS' comment for why.
-	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
+	# see ROPE_SEGMENTS' comment for why. Skipped across a bend (a rope
+	# caught on a corner reads as taut there, and a smooth parabola doesn't
+	# make sense across a kinked path anyway).
+	var sag: float = 0.0 if bent else minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
 	var n: int = _rope_segments.size()
 	var points: Array[Vector3] = []
 	points.resize(n + 1)
 	for i in range(n + 1):
 		var t: float = float(i) / float(n)
-		var p: Vector3 = from.lerp(to, t)
+		var p: Vector3 = _sample_path(path, t)
 		p.y -= sag * 4.0 * t * (1.0 - t)
 		points[i] = p
 
 	for i in range(n):
 		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
+
+
+func _sample_path(path: Array[Vector3], t: float) -> Vector3:
+	## Sample a point at fraction t (0..1) along a piecewise-linear path,
+	## proportionally to each leg's actual length (not evenly split by
+	## point count), so a short bend leg doesn't get over-represented.
+	if path.size() == 2:
+		return path[0].lerp(path[1], t)
+	var lengths: Array[float] = []
+	var total: float = 0.0
+	for i in range(path.size() - 1):
+		var seg_len: float = path[i].distance_to(path[i + 1])
+		lengths.append(seg_len)
+		total += seg_len
+	if total < 0.001:
+		return path[0]
+	var target: float = t * total
+	var accum: float = 0.0
+	for i in range(lengths.size()):
+		if target <= accum + lengths[i] or i == lengths.size() - 1:
+			var local_t: float = 0.0 if lengths[i] < 0.001 else clampf((target - accum) / lengths[i], 0.0, 1.0)
+			return path[i].lerp(path[i + 1], local_t)
+		accum += lengths[i]
+	return path[path.size() - 1]
 
 
 func _render_rope_segment(seg: MeshInstance3D, from_pt: Vector3, to_pt: Vector3) -> void:
