@@ -1086,32 +1086,17 @@ func _render_rope_extended() -> void:
 	var to: Vector3 = dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
 	to.y = plane_y
 
-	# Real physics raycast, hand -> dart -- most commonly relevant while
-	# ANCHORED, when the owner (or a bot walking to retrieve it) can end up
-	# on any side of an obstacle relative to a dart stuck on its far face,
-	# putting the straight line through solid geometry. Same technique the
-	# dart's own flight uses to stop (rope_dart.gd's _raycast_obstacle()),
-	# applied here to truncate the rope's rendered line at the obstruction
-	# instead of drawing straight through it -- real collision data, not
-	# hand-rolled corner/edge geometry. Every player body is excluded (the
-	# rope always passes freely through characters), same as that raycast.
-	var space_state: PhysicsDirectSpaceState3D = get_world_3d().direct_space_state
-	var query := PhysicsRayQueryParameters3D.create(from, to)
-	var excluded: Array[RID] = []
-	for p in get_tree().get_nodes_in_group("players"):
-		if p is CollisionObject3D:
-			excluded.append((p as CollisionObject3D).get_rid())
-	query.exclude = excluded
-	var block: Dictionary = space_state.intersect_ray(query)
-	if not block.is_empty():
-		to = block.get("position")
-
 	var total_length: float = from.distance_to(to)
 	if total_length < 0.05:
 		for seg in _rope_segments:
 			seg.visible = false
 		return
 
+	# Sample points along a shallow hanging curve (parabolic droop, zero at
+	# both ends, peak at the midpoint) before any collision check -- the
+	# curve itself is what needs testing, not just its two endpoints: an
+	# obstacle can intersect only the sagging middle of the rope even when
+	# the straight hand->dart line clears it entirely.
 	var sag: float = minf(total_length * ROPE_SAG_FACTOR, ROPE_SAG_MAX)
 	var n: int = _rope_segments.size()
 	var points: Array[Vector3] = []
@@ -1121,6 +1106,33 @@ func _render_rope_extended() -> void:
 		var p: Vector3 = from.lerp(to, t)
 		p.y -= sag * 4.0 * t * (1.0 - t)
 		points[i] = p
+
+	# Real physics raycast, one per segment along the actual sampled curve --
+	# most commonly relevant while ANCHORED, when the owner (or a bot walking
+	# to retrieve it) can end up on any side of an obstacle relative to a
+	# dart stuck on its far face, putting part of the rope through solid
+	# geometry. Same technique the dart's own flight uses to stop
+	# (rope_dart.gd's _raycast_obstacle()), just walked along every segment
+	# instead of checked once for the whole span -- real collision data, not
+	# hand-rolled corner/edge geometry. Every player body is excluded (the
+	# rope always passes freely through characters), same as that raycast.
+	# The first blocked segment collapses every point after it to the
+	# obstruction, so the rope visibly stops there instead of drawing
+	# through whatever it hit.
+	var space_state: PhysicsDirectSpaceState3D = get_world_3d().direct_space_state
+	var excluded: Array[RID] = []
+	for p in get_tree().get_nodes_in_group("players"):
+		if p is CollisionObject3D:
+			excluded.append((p as CollisionObject3D).get_rid())
+	for i in range(n):
+		var query := PhysicsRayQueryParameters3D.create(points[i], points[i + 1])
+		query.exclude = excluded
+		var block: Dictionary = space_state.intersect_ray(query)
+		if not block.is_empty():
+			var stop: Vector3 = block.get("position")
+			for j in range(i + 1, n + 1):
+				points[j] = stop
+			break
 
 	for i in range(n):
 		_render_rope_segment(_rope_segments[i], points[i], points[i + 1])
