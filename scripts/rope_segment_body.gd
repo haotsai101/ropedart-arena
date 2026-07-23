@@ -54,6 +54,15 @@ extends RigidBody3D
 ## per-frame, per that script's own class doc comment).
 var locked_y: float = 0.0
 
+## Hard cap on this segment's own XZ speed, enforced every physics step below
+## -- see the "UNSPOOL WHIPLASH" note above _integrate_forces() for why this
+## exists. A bit above rope_dart.gd's fastest possible speed (recall_speed
+## 24.0, or travel_speed up to BASE_SPEED*2.0 = 36.0 at a full charge) so a
+## segment can still keep pace with a legitimately fast-moving dart, but any
+## solver-driven spike well beyond that (measured, see below) gets bounded
+## instead of compounding.
+const MAX_SEGMENT_SPEED: float = 45.0
+
 
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	var t: Transform3D = state.transform
@@ -61,4 +70,40 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	state.transform = t
 	var v: Vector3 = state.linear_velocity
 	v.y = 0.0
+	# UNSPOOL WHIPLASH FIX: when player.gd started spawning every segment of
+	# the chain BUNCHED near the hand instead of laid out to the chain's full
+	# length (see player.gd's ROPE_PHYSICS_SEGMENTS doc comment on the
+	# "reeling out" feature this enables), EVERY joint along the chain starts
+	# with a real, simultaneous positional violation (each capsule's own
+	# local anchor points sit ~ROPE_PHYSICS_SEGMENT_HALF_LENGTH from its
+	# near-coincident neighbor's). Measured directly via a temporary per-tick
+	# probe (printing real hand-to-dart distance vs. the chain's actual max
+	# reach from the hand every physics tick after a throw): with NO clamp,
+	# this reliably produced a genuine solver "crack the whip" resonance, not
+	# a bounded transient like the already-validated single-joint tip-anchor
+	# spike -- chain_max_reach shot up to 4x the total rope length (~30+
+	# units against a real hand-to-dart distance of ~4) within about 10
+	# ticks, one single tick alone moving a segment ~7 units (~420 units/sec)
+	# -- then took another ~20-30 ticks to decay back down toward the real
+	# distance. Root cause: many simultaneously-violated joints along a
+	# chain of very light (ROPE_SEGMENT_MASS = 0.03) bodies, each computing
+	# its own corrective impulse against an already-moving neighbor, so the
+	# correction compounds link-to-link instead of damping -- the same class
+	# of instability as the already-documented "stiffer bias/damping
+	# explodes the chain" finding, just triggered by many simultaneous small
+	# violations instead of one large one. This clamp bounds the RESULT
+	# (actual per-tick speed) directly, regardless of which joint/how many
+	# simultaneous corrections caused it, rather than trying to tune the
+	# solver's own bias/damping/impulse further -- deterministic and cheap,
+	# and verified (see this session's own final report) to bring
+	# chain_max_reach back to closely tracking the real hand-to-dart
+	# distance instead of overshooting it by multiples.
+	var xz_speed: float = Vector2(v.x, v.z).length()
+	if xz_speed > MAX_SEGMENT_SPEED:
+		# Named clamp_ratio, not scale -- Node3D already has a `scale`
+		# property, and a local var of the same name in a RigidBody3D
+		# subclass shadows it (GDScript warning, though harmless here).
+		var clamp_ratio: float = MAX_SEGMENT_SPEED / xz_speed
+		v.x *= clamp_ratio
+		v.z *= clamp_ratio
 	state.linear_velocity = v

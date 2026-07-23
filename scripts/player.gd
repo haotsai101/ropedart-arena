@@ -243,23 +243,77 @@ const ROPE_PHYSICS_SEGMENTS: int = 8
 ## Total simulated chain length always equals DART_ROPE_LENGTH (the dart's
 ## own fixed max range), regardless of the CURRENT hand-to-dart distance --
 ## matches rope_dart.gd's own "fixed rope length, not charge-scaled" design.
-## The chain is always LAID OUT at this full fixed length from the hand along
-## the current hand->tip (or, if that span is ~0, the aim) direction, even
-## when the dart's real current position is much closer -- the zero-baked-in-
-## offset joint design above means this initial pose doesn't have to match
-## the tip anchor's real position for correctness, only for how settled the
-## very first frame or two look before the solver pulls the far end taut
-## toward the real target. When the dart is anchored closer than this, the
-## chain carries visible slack/sag between the two ends rather than
-## stretching taut, which is actually the physically correct look for a rope
-## longer than the gap it spans -- not verified visually, see this session's
-## final report for the honest caveat on how a short throw's slack reads on
-## screen.
+##
+## UNSPOOLING FIX (per explicit user direction, from a real screen recording
+## reviewed frame-by-frame): an earlier version of this chain LAID OUT every
+## segment at its full fixed length from the hand along the current
+## hand->tip (or, if that span is ~0, the aim) direction the INSTANT a throw
+## fired -- correctness never depended on this (the zero-baked-in-offset
+## joint design means each joint's local anchors are declared independently
+## of the bodies' actual world positions at spawn), but the visual result was
+## that the whole 8-unit rope appeared at once, already long, with only the
+## UNUSED length showing as slack/droop -- never visibly growing out of the
+## hand as the dart traveled further. The user's own diagnosis, verbatim:
+## "Imagine there is a roller and the rope uncoil from it... Right now the
+## rope is appearing at full length out of nowhere."
+##
+## Fix: segments are now spawned BUNCHED near the hand (see
+## ROPE_BUNCH_SPACING and _spawn_physics_rope()) instead of laid out toward
+## wherever the dart already is. This intentionally leaves every joint with a
+## real (not baked-in-zero) positional violation at spawn -- roughly one
+## ROPE_PHYSICS_SEGMENT_LENGTH per internal joint, since two capsules
+## centered near the same point still have their own local anchor points
+## (each capsule's true end) offset from that shared center by
+## ROPE_PHYSICS_SEGMENT_HALF_LENGTH in opposite directions. With the
+## deliberately un-stiffened joint bias/damping (0.3/1.0 defaults -- see the
+## note a few paragraphs up on why stiffening these was already tried once
+## and found to make the chain explode), the solver only closes a fraction of
+## that violation each tick, so the chain visibly drags itself out from the
+## bunch over multiple ticks as the kinematic tip anchor is pulled toward the
+## live dart position -- i.e. it reads as paying out from a spool, not
+## snapping instantly taut. This distributes the "real, decaying constraint
+## violation" pattern this codebase already validated (a single ~10-12 unit
+## spike at the tip joint during a fast throw, always measured to decay, not
+## diverge) across all 9 joints simultaneously at spawn instead of
+## concentrating it at one -- each individual violation here (~1 unit) is
+## smaller than that already-validated spike, so this is expected to be
+## equally or more stable, not less; see this session's own verification
+## (sampling total chain reach over the first several ticks after a throw,
+## not just checking for solver errors) for how that held up in practice.
+## When the dart is anchored closer than DART_ROPE_LENGTH, the chain still
+## carries visible slack/sag between the two ends once fully paid out, rather
+## than stretching taut -- the physically correct look for a rope longer
+## than the gap it spans, unchanged from before this fix.
 const ROPE_PHYSICS_SEGMENT_LENGTH: float = DART_ROPE_LENGTH / float(ROPE_PHYSICS_SEGMENTS)
 const ROPE_PHYSICS_SEGMENT_HALF_LENGTH: float = ROPE_PHYSICS_SEGMENT_LENGTH * 0.5
+## How far apart (along the initial layout direction) successive segments are
+## spawned when bunched near the hand -- see ROPE_PHYSICS_SEGMENTS' doc
+## comment above. Deliberately small (a small fraction of one segment's own
+## length, not zero): a few centimeters of initial fan-out reads as "coiled
+## at the hand" rather than "one exact point" on the very first render frame,
+## while still being negligible next to DART_ROPE_LENGTH (8.0) -- the real
+## unspooling distance is driven by the joints' own constraint violations
+## (see above), not by this spacing.
+const ROPE_BUNCH_SPACING: float = 0.06
 const ROPE_SEGMENT_MASS: float = 0.03
 const ROPE_LINEAR_DAMP: float = 1.6
 const ROPE_ANGULAR_DAMP: float = 2.2
+## EXPERIMENT TRIED AND REJECTED, kept as a note so it isn't retried blindly:
+## explicitly setting pin-joint bias LOWER than PhysicsServer3D's own default
+## (0.3), on the theory that bias directly scales how much of a joint's
+## positional error gets corrected per step (Baumgarte stabilization:
+## correction_speed ~= bias * error / delta) so a softer bias should slow the
+## bunched-spawn chain's single-tick unspool propagation down. Measured via
+## the same real per-tick chain-reach probe used elsewhere in this file: a
+## bias of 0.04 made the tick-1 overshoot WORSE, not better (chain_max_reach
+## spiked past 12 units vs. ~7.6 with the default 0.3 + the velocity clamp
+## below) -- the actual effect of a WEAKER bias here is that each joint holds
+## its own pair of bodies together less firmly, so the whole chain resists
+## cascading disturbance from its OTHER 8 joints less, letting the chain's
+## effective total length balloon further past its own physical capacity
+## instead of less. Left at PhysicsServer3D's own default (unset, 0.3) --
+## the working fix is rope_segment_body.gd's MAX_SEGMENT_SPEED clamp alone,
+## see its own doc comment.
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing
@@ -1415,11 +1469,13 @@ func _spawn_physics_rope() -> void:
 	var prev: RigidBody3D = _physics_rope_hand_anchor
 	var prev_local_far := Vector3.ZERO  # the hand anchor's own attachment point is always its own origin
 	for i in range(ROPE_PHYSICS_SEGMENTS):
-		# Always laid out at full segment length along span_dir, from the hand
-		# outward -- NOT compressed/scaled to the current (possibly ~0 at
-		# throw-instant) hand-tip distance. See the ROPE_PHYSICS_SEGMENT_LENGTH
-		# comment for why that's fine now (no baked-in offset error either way).
-		var seg_center: Vector3 = hand_pos + span_dir * (ROPE_PHYSICS_SEGMENT_HALF_LENGTH + float(i) * ROPE_PHYSICS_SEGMENT_LENGTH)
+		# BUNCHED near the hand, only ROPE_BUNCH_SPACING apart -- NOT laid out
+		# along span_dir to the chain's full fixed length. See
+		# ROPE_PHYSICS_SEGMENTS' doc comment above for why: this is what makes
+		# the chain visibly drag itself out from the hand over several ticks
+		# as the tip anchor pulls away (paying out from a spool), instead of
+		# the whole rope appearing pre-extended on the very first frame.
+		var seg_center: Vector3 = hand_pos + span_dir * (float(i) * ROPE_BUNCH_SPACING)
 		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis, plane_y)
 		_physics_rope_segments.append(seg)
 		_join_rope_pin(prev, prev_local_far, seg, local_near)
@@ -1519,7 +1575,11 @@ func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: V
 	## _physics_rope_joint_rids' own comment). Bias/damping are deliberately
 	## left unset (PhysicsServer3D's own defaults apply) -- see the
 	## ROPE_PHYSICS_* consts' comment for why a stiffer tuning was tried and
-	## measured to actively cause the chain to explode.
+	## measured to actively cause the chain to explode, AND (separately) why a
+	## SOFTER bias was also tried and rejected for the bunched-unspool spawn
+	## specifically (see ROPE_SEGMENT_MASS's neighboring comment) -- the
+	## working fix for that is rope_segment_body.gd's MAX_SEGMENT_SPEED clamp,
+	## not a bias change in either direction.
 	var joint_rid: RID = PhysicsServer3D.joint_create()
 	PhysicsServer3D.joint_make_pin(joint_rid, a.get_rid(), local_a, b.get_rid(), local_b)
 	_physics_rope_joint_rids.append(joint_rid)
