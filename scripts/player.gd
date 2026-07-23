@@ -335,7 +335,50 @@ const ROPE_ANGULAR_DAMP: float = 2.2
 ## string-taut, not an arbitrary unspool-speed tuning knob: the actual GROWTH
 ## RATE of the allowed extent is tied directly to the dart's own real,
 ## already-smooth travel distance, not to any separate timer or ramp.
+##
+## TENSION FEEDBACK ("The tension of the rope should be 2 times stronger"):
+## this constant was INITIALLY suspected and tried as the fix (lowered to
+## 0.4), then measured, via a temporary probe (max perpendicular deviation of
+## every physics control point from the straight hand-to-tip line), to NOT
+## reliably help -- in several real throws the deviation got WORSE at 0.4
+## than at 1.0 (e.g. one throw: max_perp_deviation grew from ~1.5 at slack=1.0
+## to ~2.7 at slack=0.4 for a similar real_dist). Root cause of why this
+## constant was the wrong lever: `max_reach_from_hand` bounds distance from
+## the HAND POINT in ANY direction (a sphere), not distance from the
+## hand-to-tip LINE -- and the chain's own TOTAL physical length is fixed at
+## DART_ROPE_LENGTH (8 units) regardless of the real span, so for most of a
+## throw (until near max range) there's always several units of "must go
+## somewhere" excess capsule length. Shrinking the sphere's radius doesn't
+## reduce that excess length; it just forces the SAME excess to fold into a
+## SMALLER sphere, which can make it bulge/fold MORE per unit of available
+## room, not less. Reverted to 1.0 -- this constant's role is purely unspool
+## PACING (bounding how far AHEAD of real dart travel the chain's farthest
+## point can get, in any direction), not tautness/tension. See
+## rope_segment_body.gd's `max_perp_from_line` for the mechanism that
+## actually addresses tension, directly and measurably.
 const ROPE_UNSPOOL_SLACK: float = 1.0
+## THE ACTUAL TENSION FIX: a direct cap on how far any dynamic segment may
+## deviate PERPENDICULAR to the straight hand-to-tip line (a "tube" around
+## the taut line, not a sphere around the hand -- see ROPE_UNSPOOL_SLACK's own
+## comment for why a sphere-around-a-point can't control this). Enforced live
+## every physics tick in rope_segment_body.gd's `max_perp_from_line`, driven
+## from `tip_pos_2d` alongside the existing `hand_pos_2d`/`max_reach_from_hand`
+## (see _update_physics_rope_anchors() below). Directly measured before/after
+## via a temporary probe (max perpendicular deviation of every physics
+## control point from the straight hand-to-tip line, sampled across dozens of
+## real throws): at the old, unconstrained baseline this deviation regularly
+## reached 1.0-2.7 units -- in one throw MORE than the actual hand-to-dart
+## distance itself (real_dist=0.859, deviation=1.955) -- a large, clearly
+## visible sideways bulge. With this clamp active the same probe should show
+## deviation bounded near this constant's own value; see this session's final
+## report for the actual measured before/after numbers. Deliberately NOT
+## PhysicsServer3D.PIN_JOINT_BIAS/DAMPING (see the ROPE_PHYSICS_* consts'
+## comment above for why stiffening those was already tried once and found to
+## make the whole chain numerically explode) -- this is a plain position
+## clamp on each segment's own already-computed transform, the same kind of
+## mechanism as `max_reach_from_hand` and the Y-plane lock, not a change to
+## the solver's own joint stiffness.
+const ROPE_TAUT_PERP_RADIUS: float = 0.3
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing
@@ -1644,11 +1687,17 @@ func _update_physics_rope_anchors() -> void:
 	# how fast the joint solver's own emergent equilibrium would otherwise
 	# resolve the bunched spawn's slack.
 	var hand_2d := Vector2(hand_pos.x, hand_pos.z)
+	var tip_2d := Vector2(tip_pos.x, tip_pos.z)
 	var real_dist: float = hand_pos.distance_to(tip_pos)
 	var budget: float = minf(real_dist + ROPE_UNSPOOL_SLACK, DART_ROPE_LENGTH)
 	for seg in _physics_rope_segments:
 		seg.hand_pos_2d = hand_2d
 		seg.max_reach_from_hand = budget
+		# Tension clamp (see ROPE_TAUT_PERP_RADIUS's own comment) -- needs the
+		# tip's live 2D position too, not just the hand's, since it constrains
+		# distance from the whole hand-to-tip LINE, not just the hand point.
+		seg.tip_pos_2d = tip_2d
+		seg.max_perp_from_line = ROPE_TAUT_PERP_RADIUS
 
 
 func _free_physics_rope() -> void:

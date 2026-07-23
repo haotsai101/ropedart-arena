@@ -76,6 +76,15 @@ const MAX_SEGMENT_SPEED: float = 45.0
 var hand_pos_2d: Vector2 = Vector2.ZERO
 var max_reach_from_hand: float = 1.0e9
 
+## --- Tension clamp (see the doc comment inside _integrate_forces() below,
+## and player.gd's ROPE_TAUT_PERP_RADIUS comment, for the full writeup) ---
+## Also updated every physics tick by player.gd's _update_physics_rope_anchors(),
+## same lifecycle reasoning as hand_pos_2d/max_reach_from_hand above.
+## max_perp_from_line defaults large so the clamp is a no-op before the first
+## live update, same reasoning as max_reach_from_hand's own default.
+var tip_pos_2d: Vector2 = Vector2.ZERO
+var max_perp_from_line: float = 1.0e9
+
 
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	var t: Transform3D = state.transform
@@ -165,6 +174,38 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 			v2 -= radial_dir * radial_speed
 			v.x = v2.x
 			v.z = v2.y
+
+	# TENSION CLAMP (per explicit user feedback: "The tension of the rope
+	# should be 2 times stronger" -- see player.gd's ROPE_TAUT_PERP_RADIUS
+	# doc comment for the full root-cause writeup on why max_reach_from_hand
+	# above -- a SPHERE around the hand point -- was tried first and measured
+	# to NOT reliably help, sometimes making the visible bulge worse). This
+	# clamps the segment's distance to the straight HAND-TO-TIP LINE (a
+	# "tube" around the taut line), which is what actually controls how
+	# straight/taut the rope looks, independent of the sphere-radius clamp
+	# above (which only controls unspool PACING -- how far ahead of real dart
+	# travel the chain's farthest point can get in ANY direction, not how
+	# straight the path there is).
+	var line_vec: Vector2 = tip_pos_2d - hand_pos_2d
+	var line_len: float = line_vec.length()
+	if line_len > 0.01:
+		var line_dir: Vector2 = line_vec / line_len
+		var xz_pos2 := Vector2(t.origin.x, t.origin.z)
+		var rel: Vector2 = xz_pos2 - hand_pos_2d
+		var along: float = rel.dot(line_dir)
+		var perp_vec: Vector2 = rel - line_dir * along
+		var perp_dist: float = perp_vec.length()
+		if perp_dist > max_perp_from_line and perp_dist > 0.0001:
+			var perp_dir: Vector2 = perp_vec / perp_dist
+			var clamped_xz2: Vector2 = hand_pos_2d + line_dir * along + perp_dir * max_perp_from_line
+			t.origin.x = clamped_xz2.x
+			t.origin.z = clamped_xz2.y
+			var v3 := Vector2(v.x, v.z)
+			var perp_speed: float = v3.dot(perp_dir)
+			if perp_speed > 0.0:
+				v3 -= perp_dir * perp_speed
+				v.x = v3.x
+				v.z = v3.y
 
 	state.transform = t
 	state.linear_velocity = v
