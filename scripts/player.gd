@@ -1591,6 +1591,40 @@ func _update_rope_tube_mesh() -> void:
 	if _physics_rope_tube_mesh == null:
 		var mi := MeshInstance3D.new()
 		mi.name = "RopeTubeMesh"
+		# ROOT-CAUSE FIX: top_level = true. The ORIGINAL version of this code
+		# added this MeshInstance3D as a plain child of `self` (the player)
+		# with NO top_level flag, while feeding it vertex data that's already
+		# in WORLD space (every control point below comes from .global_position
+		# reads). A non-top_level MeshInstance3D renders its mesh data through
+		# its own global_transform, which for a plain child is derived from
+		# its parent's -- so those already-global vertices were being
+		# double-transformed: rendered at `player.global_transform *
+		# (already-global point)`, not the literal point. This is exactly
+		# what a real user screen recording showed: a rope-like shape
+		# floating disconnected from the character, reshaping into a
+		# DIFFERENT distorted curve every single frame (tracking the
+		# player's own rotation, which changes continuously while aiming/
+		# moving -- see _facing_dir/aim_dir), not the physics chain's real,
+		# comparatively stable shape. It also explains a separate live
+		# report ("the dart is flying correctly but the rope is not")
+		# during FLYING specifically -- the physics bodies and the dart
+		# itself were always positioned correctly; only THIS mesh's
+		# rendering was wrong, most visible exactly when the player is
+		# actively turning to track a fast-moving thrown dart.
+		# top_level = true makes this node's global_transform NOT inherit
+		# from its parent at all (stays at the identity transform this line
+		# leaves it at, since nothing here ever sets mi.position/rotation/
+		# scale) -- so feeding it already-global vertices renders them
+		# correctly with no further transform code needed. Kept as a
+		# persistent child of `self` (created once, like the old
+		# _rope_segments array) rather than under _physics_rope_root, so its
+		# lifecycle is independent of the physics chain's own -- reusing it
+		# across throws, and specifically NOT needing to be recreated or
+		# nulled out in _free_physics_rope() (which frees _physics_rope_root
+		# and everything under it; this mesh living elsewhere avoids ever
+		# holding a dangling reference to a freed node after a chain is torn
+		# down and a new one spawned).
+		mi.top_level = true
 		# Material is applied AFTER _build_tube_mesh() gives this mesh its
 		# first real surface (below) -- set_surface_override_material(0, ...)
 		# errors ("Index p_surface = 0 is out of bounds") on a MeshInstance3D
