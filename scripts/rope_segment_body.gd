@@ -63,11 +63,23 @@ var locked_y: float = 0.0
 ## instead of compounding.
 const MAX_SEGMENT_SPEED: float = 45.0
 
+## --- Growing-leash unspool clamp (see the doc comment inside
+## _integrate_forces() below for the full root-cause writeup) ---
+## Updated every physics tick by player.gd's _update_physics_rope_anchors(),
+## NOT set once at spawn like locked_y -- both need to track the hand's real
+## (animated) position and the dart's real, currently-growing travel distance
+## live. hand_pos_2d/max_reach_from_hand default to values that make the
+## clamp a no-op (max_reach_from_hand very large) until the first tick
+## player.gd drives them, so a freshly spawned segment before its first
+## _update_physics_rope_anchors() call this tick doesn't get spuriously
+## snapped to the origin.
+var hand_pos_2d: Vector2 = Vector2.ZERO
+var max_reach_from_hand: float = 1.0e9
+
 
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	var t: Transform3D = state.transform
 	t.origin.y = locked_y
-	state.transform = t
 	var v: Vector3 = state.linear_velocity
 	v.y = 0.0
 	# UNSPOOL WHIPLASH FIX: when player.gd started spawning every segment of
@@ -106,4 +118,53 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 		var clamp_ratio: float = MAX_SEGMENT_SPEED / xz_speed
 		v.x *= clamp_ratio
 		v.z *= clamp_ratio
+
+	# GROWING-LEASH FIX (this round, on top of the speed clamp above): a
+	# per-body velocity cap alone was tried in isolation (down to 8.0, far
+	# below the already-shipped 45.0) and measured, via the same real per-tick
+	# probe, to barely change the chain's overall unspool timing at all --
+	# the chain still reached ~70-90% of its full 8-unit length within the
+	# same ~4-6 ticks regardless. Root cause: a per-body speed clamp only
+	# bounds how fast any ONE body moves, but multiple bodies along the chain
+	# can each move at a modest, individually-legal speed SIMULTANEOUSLY,
+	# and their combined effect can still unfold a large fraction of the
+	# chain's total slack within a handful of ticks -- the real bottleneck is
+	# the AGGREGATE rate the whole chain's length grows at, not any single
+	# body's speed, and no per-body speed limit can bound that on its own.
+	#
+	# Fix: directly cap this segment's own distance from the hand (XZ only,
+	# matching this game's flat-plane invariant) to max_reach_from_hand --
+	# updated every physics tick by player.gd to equal the REAL, currently
+	# known hand-to-dart distance plus a small fixed slack allowance (see
+	# player.gd's ROPE_UNSPOOL_SLACK), capped at the chain's own total
+	# capacity (DART_ROPE_LENGTH). This directly and deterministically ties
+	# how far ANY point of the rope can be from the hand to how far the REAL
+	# dart has ACTUALLY traveled so far -- which is itself already smooth and
+	# non-explosive (a kinematic read of the dart's own position, not
+	# anything joint-solver-derived) -- rather than hoping the joint solver's
+	# emergent, hard-to-bound-precisely equilibrium happens to grow at a
+	# similar rate. Any segment the solver tries to push out past that live
+	# budget gets pulled back radially (preserving its current angle/side, so
+	# it doesn't fight the solver's own XZ shaping -- draping over obstacles
+	# etc. from the existing real-physics collision is unaffected, since nothing
+	# here touches the segments' capsule collision response, only this extra
+	# position ceiling); the outward-radial component of its velocity is also
+	# zeroed so it doesn't immediately re-violate the same cap next tick and
+	# buzz/jitter against it.
+	var xz_pos := Vector2(t.origin.x, t.origin.z)
+	var offset: Vector2 = xz_pos - hand_pos_2d
+	var dist: float = offset.length()
+	if dist > max_reach_from_hand and dist > 0.0001:
+		var radial_dir: Vector2 = offset / dist
+		var clamped_xz: Vector2 = hand_pos_2d + radial_dir * max_reach_from_hand
+		t.origin.x = clamped_xz.x
+		t.origin.z = clamped_xz.y
+		var v2 := Vector2(v.x, v.z)
+		var radial_speed: float = v2.dot(radial_dir)
+		if radial_speed > 0.0:
+			v2 -= radial_dir * radial_speed
+			v.x = v2.x
+			v.z = v2.y
+
+	state.transform = t
 	state.linear_velocity = v

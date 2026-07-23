@@ -311,9 +311,31 @@ const ROPE_ANGULAR_DAMP: float = 2.2
 ## its own pair of bodies together less firmly, so the whole chain resists
 ## cascading disturbance from its OTHER 8 joints less, letting the chain's
 ## effective total length balloon further past its own physical capacity
-## instead of less. Left at PhysicsServer3D's own default (unset, 0.3) --
-## the working fix is rope_segment_body.gd's MAX_SEGMENT_SPEED clamp alone,
-## see its own doc comment.
+## instead of less. Left at PhysicsServer3D's own default (unset, 0.3).
+## SECOND EXPERIMENT TRIED AND ALSO INSUFFICIENT ALONE: rope_segment_body.gd's
+## MAX_SEGMENT_SPEED clamp (a per-body XZ speed cap) meaningfully prevented
+## multi-tick runaway divergence, but tested in isolation at a much lower
+## value (8.0, vs. the shipped 45.0) it barely changed how fast the WHOLE
+## chain's length grew in the first several ticks -- still reached ~70-90% of
+## full length within the same ~4-6 ticks. Root cause: a per-body speed limit
+## bounds any ONE body's motion, but multiple bodies moving concurrently (each
+## individually within its own legal speed) can still unfold a large fraction
+## of the chain's total slack together within a few ticks -- the real
+## bottleneck is the chain's AGGREGATE growth rate, which no per-body speed
+## cap can bound on its own. THE ACTUAL WORKING FIX for the unspool RATE is
+## the growing-leash position clamp in rope_segment_body.gd
+## (`max_reach_from_hand`, driven live every tick from ROPE_UNSPOOL_SLACK
+## below) -- MAX_SEGMENT_SPEED is kept as a secondary safety net against
+## divergence, not the primary unspool-pacing mechanism.
+## How far the rope's visible/simulated extent is allowed to exceed the REAL,
+## currently-known hand-to-dart distance at any given tick (see
+## rope_segment_body.gd's `max_reach_from_hand`, driven every tick by
+## _update_physics_rope_anchors() below) -- a small constant slack allowance
+## so the rope still reads as a bit loose/sagging rather than perfectly
+## string-taut, not an arbitrary unspool-speed tuning knob: the actual GROWTH
+## RATE of the allowed extent is tied directly to the dart's own real,
+## already-smooth travel distance, not to any separate timer or ramp.
+const ROPE_UNSPOOL_SLACK: float = 1.0
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing
@@ -1605,10 +1627,28 @@ func _update_physics_rope_anchors() -> void:
 	## how it actually looks on screen -- no screenshot access this session.
 	if not _physics_rope_active:
 		return
+	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
 	if _physics_rope_hand_anchor != null:
-		_physics_rope_hand_anchor.global_position = _get_rope_hand_anchor_pos()
+		_physics_rope_hand_anchor.global_position = hand_pos
+	var tip_pos: Vector3 = _get_rope_tip_target()
 	if _physics_rope_tip_anchor != null:
-		_physics_rope_tip_anchor.global_position = _get_rope_tip_target()
+		_physics_rope_tip_anchor.global_position = tip_pos
+
+	# Growing-leash unspool pacing (see ROPE_UNSPOOL_SLACK's own comment and
+	# rope_segment_body.gd's `max_reach_from_hand` doc comment for the full
+	# root-cause writeup): every dynamic segment's own live budget is
+	# recomputed here, every physics tick, directly from the REAL,
+	# already-known hand-to-dart distance -- not from any separate timer or
+	# ramp -- so the rope's visible/simulated extent can never get further
+	# ahead of the dart's own actual travel than ROPE_UNSPOOL_SLACK, no matter
+	# how fast the joint solver's own emergent equilibrium would otherwise
+	# resolve the bunched spawn's slack.
+	var hand_2d := Vector2(hand_pos.x, hand_pos.z)
+	var real_dist: float = hand_pos.distance_to(tip_pos)
+	var budget: float = minf(real_dist + ROPE_UNSPOOL_SLACK, DART_ROPE_LENGTH)
+	for seg in _physics_rope_segments:
+		seg.hand_pos_2d = hand_2d
+		seg.max_reach_from_hand = budget
 
 
 func _free_physics_rope() -> void:

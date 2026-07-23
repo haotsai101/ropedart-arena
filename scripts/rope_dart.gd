@@ -19,9 +19,11 @@ extends Node3D
 ##
 ## The rope has a fixed length (ROPE_LENGTH, 4x a character's height) rather
 ## than growing with charge power -- charge now scales travel_speed only.
-## Reaching full extension without hitting anything doesn't anchor it in
-## place; it immediately yanks back into RECALLING instead, like snapping
-## taut on a real tether.
+## Reaching full extension without hitting anything now ANCHORS the dart in
+## open air at that point (same as an obstacle/player hit) -- per explicit
+## user direction, reversing an earlier design decision where this instead
+## auto-triggered recall() ("yank back") without ever anchoring. See the
+## FLYING branch's own comment in _physics_process() for the change.
 ##
 ## Player hit detection (_check_hits()) is unchanged: still pure 2D capsule
 ## math, head vs. body, kill vs. trip()'s "clothesline" stagger -- that's a
@@ -201,10 +203,14 @@ func _physics_process(delta: float) -> void:
 					head_2d = (hit_point_2d as Vector2) + dir_2d * ANCHOR_EMBED_DEPTH
 					_anchor()
 				elif head_2d.distance_to(origin_2d) >= ROPE_LENGTH:
-					# Fixed-length rope snapping taut: rather than anchoring at empty
-					# air, it yanks straight back toward the owner.
+					# Per explicit user direction (reversing an earlier design
+					# decision that auto-recalled here instead): reaching max
+					# range without hitting anything now ANCHORS the dart in
+					# open air at that point, same as an obstacle/player hit --
+					# it stays stuck there until the owner recalls it or walks
+					# over it (pickup_radius), rather than auto-yanking back.
 					head_2d = origin_2d + dir_2d * ROPE_LENGTH
-					recall()
+					_anchor()
 
 		State.ANCHORED:
 			if owner_player.get_pos_2d().distance_to(head_2d) < pickup_radius:
