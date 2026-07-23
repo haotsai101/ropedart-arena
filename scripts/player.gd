@@ -671,10 +671,23 @@ func _rpc_set_input(move: Vector2, aim: Vector2, throwing: bool) -> void:
 ## old fruit rig, just with a fuller ~20-bone map and re-exported under the
 ## "Rig_Medium" name so its track paths resolve the same way as the two
 ## KayKit files below).
+## spell_cast.glb is the same technique applied to 3 more UAL clips --
+## Spell_Simple_Enter/Spell_Simple_Idle_Loop/Spell_Simple_Exit -- retargeted
+## in a separate Blender pass (headless `blender --background --python`, not
+## the interactive MCP bridge, which crashed on this project's UAL1_Standard
+## import; see the retargeting commit for the reconstructed 16-bone map:
+## hips/spine/chest/head + both arms + both legs) and exported as its own
+## small glb rather than appended into the already-working combat_moves.glb,
+## so the two throw/melee clips already retargeted there are never touched.
+## Drives the throw's Enter->Idle->Exit sequence in _process() (see
+## ThrowAnimPhase) -- Spell_Simple_Shoot itself (still in combat_moves.glb)
+## is no longer played; the 3-phase sequence replaces it entirely per
+## explicit user direction ("Use Spell Simple Enter, idle, and exit").
 const ANIM_SOURCES: Array[String] = [
 	"res://assets/kaykit_adventurers/animations/Rig_Medium_MovementBasic.glb",
 	"res://assets/kaykit_adventurers/animations/Rig_Medium_General.glb",
 	"res://assets/animations/combat_moves.glb",
+	"res://assets/animations/spell_cast.glb",
 ]
 
 ## The old fruit-character locomotion clips were authored with a "_Loop"
@@ -690,10 +703,56 @@ const LOOPING_CLIPS: Array[String] = [
 	"Idle_A", "Idle_B", "Walking_A", "Walking_B", "Walking_C", "Running_A", "Running_B",
 ]
 
-## One-shot action clips triggered from gameplay code (throw/slash/kick) --
+## One-shot action clips triggered from gameplay code (slash/kick) --
 ## _process()'s per-frame locomotion selection must not stomp these mid-play,
-## see the action_playing guard there.
-const ONE_SHOT_ACTION_CLIPS: Array[String] = ["Spell_Simple_Shoot", "Sword_Attack", "Punch_Jab"]
+## see the action_playing guard there. Throw/recall are NOT one-shot clips
+## any more -- see ThrowAnimPhase/RecallAnimPhase below for their own
+## Enter->Hold->Exit sequencing, which is driven by elapsed time rather than
+## AnimationPlayer.is_playing() (see _advance_throw_anim()'s comment for why).
+const ONE_SHOT_ACTION_CLIPS: Array[String] = ["Sword_Attack", "Punch_Jab"]
+
+## Throw and recall are each a 3-phase Enter -> Hold -> Exit sequence built
+## from the same two bookend clips (Spell_Simple_Enter/Spell_Simple_Exit,
+## see spell_cast.glb's own doc comment above) around a different Hold clip
+## per action -- Spell_Simple_Idle_Loop for the throw's brief "cast held"
+## moment, the pre-existing "Push" loop for the recall's actual reel-in
+## motion (unchanged from before this feature; CLAUDE.md's own move-design
+## notes already call this "Retrieval (Reel In)" and Push_Loop already reads
+## as pulling something back, so it stays the Hold clip rather than being
+## replaced).
+##
+## Phase advancement is driven by ELAPSED TIME (per-phase timers below,
+## ticked every _process() frame in _advance_throw_anim()/
+## _advance_recall_anim()), not by AnimationPlayer.is_playing() -- unlike
+## the melee ONE_SHOT_ACTION_CLIPS guard above. This is deliberate: per this
+## feature's hard requirement, movement must be able to instantly cut the
+## DISPLAYED clip to Walking_A/Running_A mid-sequence (see _process()'s
+## selection chain), which means the AnimationPlayer itself may be showing a
+## movement clip instead of the sequence's own clip for a stretch of real
+## time -- so is_playing()/is the-sequence-clip-still-current can't be relied
+## on to track sequence progress, since the sequence's own clip may not be
+## the one actually loaded into the (single, shared) AnimationPlayer at all
+## right then. A plain elapsed-time timer against each clip's own real
+## Animation.length (see _anim_clip_length()) advances correctly regardless
+## of what's currently being displayed, then resumes displaying whatever
+## phase is current the moment movement stops -- at the cost of not
+## resuming mid-clip (a fresh movement interruption always restarts the
+## current phase's clip from frame 0 once movement stops), a deliberate,
+## documented trade-off for correctness+simplicity over frame-perfect
+## resumption.
+enum ThrowAnimPhase { NONE, ENTER, HOLD, EXIT }
+var _throw_anim_phase: int = ThrowAnimPhase.NONE
+var _throw_anim_timer: float = 0.0
+var _recall_anim_phase: int = ThrowAnimPhase.NONE
+var _recall_anim_timer: float = 0.0
+## Mirrors rope_dart.gd's State.FLYING ordinal -- see DART_STATE_ANCHORED's
+## own comment above for why this is duplicated by hand rather than shared.
+## Drives the throw sequence's HOLD->EXIT transition: held for as long as
+## the just-thrown dart is still actually flying (a fast point-blank hit
+## exits almost immediately; a full-range throw that anchors at max
+## ROPE_LENGTH holds noticeably longer), matching the real weapon behavior
+## instead of a fixed timer.
+const DART_STATE_FLYING: int = 0
 
 func _setup_animation() -> void:
 	## Attach a fresh AnimationPlayer next to this character's Skeleton3D and
@@ -978,6 +1037,87 @@ func _play_anim(anim_name: String, speed: float = 1.0) -> void:
 	_current_anim = anim_name
 
 
+## Real length of an imported clip, or a short fallback if the clip is
+## missing (e.g. the Blender retarget didn't produce it) -- see
+## ThrowAnimPhase's doc comment for why phase advancement is timed against
+## this instead of AnimationPlayer.is_playing(). Godot's glTF importer
+## strips a "_Loop"/"-loop" suffix and marks the result as looping (see
+## LOOPING_CLIPS' own comment on this codebase's existing precedent with
+## "Push_Loop" -> "Push") -- callers pass the POST-STRIP name, matching
+## every other clip-name reference in this file.
+func _anim_clip_length(clip_name: String, fallback: float = 0.3) -> float:
+	if _anim_player != null and _anim_player.has_animation(clip_name):
+		return maxf(_anim_player.get_animation(clip_name).length, 0.05)
+	return fallback
+
+
+## Advances the throw sequence's own phase/timer state every _process()
+## frame, independent of whether that phase's clip is actually the one
+## loaded in the (single, shared) AnimationPlayer right now -- see
+## ThrowAnimPhase's doc comment. No-op once the phase is NONE (nothing
+## thrown, or the previous sequence already finished).
+func _advance_throw_anim(delta: float) -> void:
+	if _throw_anim_phase == ThrowAnimPhase.NONE:
+		return
+	_throw_anim_timer += delta
+	match _throw_anim_phase:
+		ThrowAnimPhase.ENTER:
+			if _throw_anim_timer >= _anim_clip_length("Spell_Simple_Enter"):
+				_throw_anim_phase = ThrowAnimPhase.HOLD
+				_throw_anim_timer = 0.0
+		ThrowAnimPhase.HOLD:
+			# Held for as long as the dart is still actually FLYING -- see
+			# DART_STATE_FLYING's own comment for why this (not a fixed
+			# timer) drives the HOLD->EXIT transition.
+			var dart_flying: bool = dart != null and is_instance_valid(dart) and dart.state == DART_STATE_FLYING
+			if not dart_flying:
+				_throw_anim_phase = ThrowAnimPhase.EXIT
+				_throw_anim_timer = 0.0
+		ThrowAnimPhase.EXIT:
+			if _throw_anim_timer >= _anim_clip_length("Spell_Simple_Exit"):
+				_throw_anim_phase = ThrowAnimPhase.NONE
+				_throw_anim_timer = 0.0
+
+
+## Same shape as _advance_throw_anim() but for the recall/retrieval
+## sequence -- HOLD lasts for as long as _is_recalling stays true (cleared
+## in _on_dart_returned() the instant the dart is actually back in hand),
+## then EXIT plays out on its own real length before returning to NONE.
+func _advance_recall_anim(delta: float) -> void:
+	if _recall_anim_phase == ThrowAnimPhase.NONE:
+		return
+	_recall_anim_timer += delta
+	match _recall_anim_phase:
+		ThrowAnimPhase.ENTER:
+			if _recall_anim_timer >= _anim_clip_length("Spell_Simple_Enter"):
+				_recall_anim_phase = ThrowAnimPhase.HOLD
+				_recall_anim_timer = 0.0
+		ThrowAnimPhase.HOLD:
+			if not _is_recalling:
+				_recall_anim_phase = ThrowAnimPhase.EXIT
+				_recall_anim_timer = 0.0
+		ThrowAnimPhase.EXIT:
+			if _recall_anim_timer >= _anim_clip_length("Spell_Simple_Exit"):
+				_recall_anim_phase = ThrowAnimPhase.NONE
+				_recall_anim_timer = 0.0
+
+
+func _throw_anim_clip() -> String:
+	match _throw_anim_phase:
+		ThrowAnimPhase.ENTER: return "Spell_Simple_Enter"
+		ThrowAnimPhase.HOLD: return "Spell_Simple_Idle"
+		ThrowAnimPhase.EXIT: return "Spell_Simple_Exit"
+	return ""
+
+
+func _recall_anim_clip() -> String:
+	match _recall_anim_phase:
+		ThrowAnimPhase.ENTER: return "Spell_Simple_Enter"
+		ThrowAnimPhase.HOLD: return "Push"
+		ThrowAnimPhase.EXIT: return "Spell_Simple_Exit"
+	return ""
+
+
 func _process(delta: float) -> void:
 	# Smooth speed ratio toward current velocity magnitude (0.0–1.0)
 	var speed_ratio: float = velocity.length() / move_speed
@@ -994,31 +1134,45 @@ func _process(delta: float) -> void:
 
 	var is_moving: bool = _move_speed_smooth > 0.1 and not _is_dashing
 
+	# Advance both sequences' own phase/timer state every frame regardless of
+	# what's actually selected for display below -- see ThrowAnimPhase's doc
+	# comment for why this has to be decoupled from AnimationPlayer.is_playing().
+	_advance_throw_anim(delta)
+	_advance_recall_anim(delta)
+
 	# Skeletal locomotion animation, using KayKit's actual clip names
 	# (Idle_A from Rig_Medium_General.glb, Walking_A/Running_A from
 	# Rig_Medium_MovementBasic.glb — see _setup_animation()'s ANIM_SOURCES).
-	# Dash takes priority over the is_moving check — while dashing we're moving
-	# far faster than a walk, so cut straight to the run clip regardless of the
-	# (dash-excluded) is_moving state used for Walk/Idle and the procedural bob.
-	# A one-shot action clip (throw/slash/kick) gets to finish playing first --
+	# A one-shot melee clip (slash/kick) gets to finish playing first --
 	# otherwise this per-frame selection would stomp it within a single frame
-	# of it starting, since nothing here else calls _play_anim(). Recall is a
-	# separate override since "Push" is a looping clip -- is_playing() never
-	# goes false on its own, so it needs the explicit _is_recalling flag
-	# (cleared in _on_dart_returned()) as its end condition instead. Charging
-	# also needs its own override even though "Sword_Idle" is NOT looping
-	# (plays once and holds its last frame, deliberately -- see
+	# of it starting, since nothing here else calls _play_anim(). Charging
+	# needs its own override even though "Sword_Idle" is NOT looping (plays
+	# once and holds its last frame, deliberately -- see
 	# _update_charge_shake() for the tremble once that held pose means "max
 	# charge"): without this branch, once is_playing() goes false on its own
 	# at the end, the elif chain below would fall through to Idle_A/Walking_A
-	# and stomp the held pose. _is_charging is cleared on throw_just_released
-	# in the throw/charge block below, right as _throw() fires and plays the
-	# one-shot "Spell_Simple_Shoot" -- so charging's held "Sword_Idle" pose
-	# hands off to the throw clip in the same frame the button is released.
+	# and stomp the held pose. Neither of these two can actually coincide
+	# with movement in practice (melee is gated off during a dash/charge, and
+	# charging itself zeroes velocity), so their position relative to
+	# dash/is_moving below is moot either way -- left exactly where they were
+	# before this feature to minimize the diff.
+	#
+	# Movement (dash/walk) comes next and, per this feature's hard
+	# requirement, ALWAYS wins over the throw/recall Enter->Hold->Exit
+	# sequences below it -- if the player starts moving mid-sequence, the
+	# displayed clip cuts straight to Running_A/Walking_A; the sequence's own
+	# phase timers keep advancing in the background regardless (see
+	# _advance_throw_anim()/_advance_recall_anim() above) and pick back up
+	# displaying correctly the moment movement stops. This is a deliberate
+	# reversal from the OLD behavior, where recall's "Push" sat ABOVE
+	# movement in this same chain (a player could walk around freely while
+	# "Push" kept looping the whole time, unbroken) -- per explicit user
+	# direction this session, movement must now always take visible priority.
+	# Melee's one-shot clips keep their OLD relative position (above
+	# movement, via action_playing below) since that's out of scope for this
+	# feature and wasn't reported as an issue.
 	var action_playing: bool = _anim_player != null and _current_anim in ONE_SHOT_ACTION_CLIPS and _anim_player.is_playing()
-	if _is_recalling:
-		_play_anim("Push")
-	elif _is_charging:
+	if _is_charging:
 		_play_anim("Sword_Idle")
 	elif action_playing:
 		pass
@@ -1026,6 +1180,10 @@ func _process(delta: float) -> void:
 		_play_anim("Running_A")
 	elif is_moving:
 		_play_anim("Walking_A", WALK_ANIM_SPEED)
+	elif _recall_anim_phase != ThrowAnimPhase.NONE:
+		_play_anim(_recall_anim_clip())
+	elif _throw_anim_phase != ThrowAnimPhase.NONE:
+		_play_anim(_throw_anim_clip())
 	else:
 		_play_anim("Idle_A")
 
@@ -1256,6 +1414,8 @@ func _physics_process(delta: float) -> void:
 			elif dart.has_method("recall"):
 				dart.recall()
 				_is_recalling = true
+				_recall_anim_phase = ThrowAnimPhase.ENTER
+				_recall_anim_timer = 0.0
 
 		if _is_charging:
 			if throw_held:
@@ -1355,7 +1515,11 @@ func _throw(ratio: float) -> void:
 	dart = dart_scene.instantiate()
 	get_parent().add_child(dart)
 	dart.launch(self, get_pos_2d(), aim_dir, ratio)
-	_play_anim("Spell_Simple_Shoot")
+	# Enter->Hold->Exit sequence (see ThrowAnimPhase) replaces the old single
+	# "Spell_Simple_Shoot" one-shot clip -- _process()'s _advance_throw_anim()
+	# drives the phase forward every frame from here.
+	_throw_anim_phase = ThrowAnimPhase.ENTER
+	_throw_anim_timer = 0.0
 
 
 func get_pos_2d() -> Vector2:
@@ -2024,6 +2188,17 @@ func kill() -> void:
 	if dart != null:
 		dart.queue_free()
 		dart = null
+	# Force-freeing the dart above bypasses _on_dart_returned() (only called
+	# from rope_dart.gd's own _pick_up(), which never runs here) -- without
+	# this, a kill mid-recall would leave _is_recalling/_recall_anim_phase
+	# permanently stuck true, so after respawning the recall Hold phase
+	# ("Push") would loop forever with no dart and no way to clear it. Same
+	# reasoning applies to a kill mid-throw-sequence (_throw_anim_phase).
+	_is_recalling = false
+	_throw_anim_phase = ThrowAnimPhase.NONE
+	_throw_anim_timer = 0.0
+	_recall_anim_phase = ThrowAnimPhase.NONE
+	_recall_anim_timer = 0.0
 	player_killed.emit(self)
 	if lives > 0:
 		_respawn_timer = get_tree().create_timer(1.5)
@@ -2064,6 +2239,10 @@ func reset_for_round(new_lives: int, start_pos: Vector3) -> void:
 	_charge_time = 0.0
 	_charge_shake_time = 0.0
 	_is_recalling = false
+	_throw_anim_phase = ThrowAnimPhase.NONE
+	_throw_anim_timer = 0.0
+	_recall_anim_phase = ThrowAnimPhase.NONE
+	_recall_anim_timer = 0.0
 	_trip_timer = 0.0
 	_slow_timer = 0.0
 	_is_tripped = false
