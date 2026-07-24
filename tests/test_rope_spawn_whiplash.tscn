@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://bqf7wk2n8x4t5"]
+
+[ext_resource type="Script" path="res://tests/test_rope_spawn_whiplash.gd" id="1_whip"]
+
+[node name="TestRopeSpawnWhiplash" type="Node"]
+script = ExtResource("1_whip")

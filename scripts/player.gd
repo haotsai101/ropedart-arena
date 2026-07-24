@@ -235,11 +235,19 @@ const ROPE_COIL_RADIUS_OUTER: float = 0.24
 ## collision purposes -- this is a pure decoupling of the rendered mesh from
 ## the physics representation, not a change to the simulation itself.
 ##
-## Segment count is lower than the idle coil's 16 -- physics joint chains get
-## less stable as they get longer, and 8 is enough to read as a rope at this
-## game's camera distance without excess joint count per simultaneously
-## thrown dart (up to ~6 at once in a full match).
-const ROPE_PHYSICS_SEGMENTS: int = 8
+## EXPERIMENT (2026-07-24, "core simulation only" round -- per direct user
+## request: "Let's try only core simulation and do 24 segments instead of
+## 8"). Raised from 8 to 24 specifically to test whether finer physics
+## resolution alone (shorter, lighter links) can hug corners/obstacles
+## accurately enough that the hand-tuned geometric clamps removed this same
+## round (see rope_segment_body.gd's own EXPERIMENT note, and the
+## now-simplified _update_physics_rope_anchors()/_compute_rope_tube_curve_points()
+## below) were never strictly necessary -- rather than 8 long segments that
+## needed those clamps to fake accurate draping. See CLAUDE.md's dated entry
+## for this round for the measured before/after results (spawn-time
+## stability, corner-wrap fidelity, tautness, multi-bot soak stability) and
+## the final recommendation.
+const ROPE_PHYSICS_SEGMENTS: int = 24
 ## Total simulated chain length always equals DART_ROPE_LENGTH (the dart's
 ## own fixed max range), regardless of the CURRENT hand-to-dart distance --
 ## matches rope_dart.gd's own "fixed rope length, not charge-scaled" design.
@@ -295,90 +303,28 @@ const ROPE_PHYSICS_SEGMENT_HALF_LENGTH: float = ROPE_PHYSICS_SEGMENT_LENGTH * 0.
 ## unspooling distance is driven by the joints' own constraint violations
 ## (see above), not by this spacing.
 const ROPE_BUNCH_SPACING: float = 0.06
-const ROPE_SEGMENT_MASS: float = 0.03
+## Total chain mass stays fixed at what 8 segments x the old 0.03 each summed
+## to (0.24), split evenly across however many segments ROPE_PHYSICS_SEGMENTS
+## is set to -- so the EXPERIMENT above (8 -> 24 segments) changes resolution
+## without also making the simulated rope 3x heavier, which would confound
+## the comparison with an unrelated dynamics change.
+const ROPE_TOTAL_MASS: float = 0.24
+const ROPE_SEGMENT_MASS: float = ROPE_TOTAL_MASS / float(ROPE_PHYSICS_SEGMENTS)
 const ROPE_LINEAR_DAMP: float = 1.6
 const ROPE_ANGULAR_DAMP: float = 2.2
-## EXPERIMENT TRIED AND REJECTED, kept as a note so it isn't retried blindly:
-## explicitly setting pin-joint bias LOWER than PhysicsServer3D's own default
-## (0.3), on the theory that bias directly scales how much of a joint's
-## positional error gets corrected per step (Baumgarte stabilization:
-## correction_speed ~= bias * error / delta) so a softer bias should slow the
-## bunched-spawn chain's single-tick unspool propagation down. Measured via
-## the same real per-tick chain-reach probe used elsewhere in this file: a
-## bias of 0.04 made the tick-1 overshoot WORSE, not better (chain_max_reach
-## spiked past 12 units vs. ~7.6 with the default 0.3 + the velocity clamp
-## below) -- the actual effect of a WEAKER bias here is that each joint holds
-## its own pair of bodies together less firmly, so the whole chain resists
-## cascading disturbance from its OTHER 8 joints less, letting the chain's
-## effective total length balloon further past its own physical capacity
-## instead of less. Left at PhysicsServer3D's own default (unset, 0.3).
-## SECOND EXPERIMENT TRIED AND ALSO INSUFFICIENT ALONE: rope_segment_body.gd's
-## MAX_SEGMENT_SPEED clamp (a per-body XZ speed cap) meaningfully prevented
-## multi-tick runaway divergence, but tested in isolation at a much lower
-## value (8.0, vs. the shipped 45.0) it barely changed how fast the WHOLE
-## chain's length grew in the first several ticks -- still reached ~70-90% of
-## full length within the same ~4-6 ticks. Root cause: a per-body speed limit
-## bounds any ONE body's motion, but multiple bodies moving concurrently (each
-## individually within its own legal speed) can still unfold a large fraction
-## of the chain's total slack together within a few ticks -- the real
-## bottleneck is the chain's AGGREGATE growth rate, which no per-body speed
-## cap can bound on its own. THE ACTUAL WORKING FIX for the unspool RATE is
-## the growing-leash position clamp in rope_segment_body.gd
-## (`max_reach_from_hand`, driven live every tick from ROPE_UNSPOOL_SLACK
-## below) -- MAX_SEGMENT_SPEED is kept as a secondary safety net against
-## divergence, not the primary unspool-pacing mechanism.
-## How far the rope's visible/simulated extent is allowed to exceed the REAL,
-## currently-known hand-to-dart distance at any given tick (see
-## rope_segment_body.gd's `max_reach_from_hand`, driven every tick by
-## _update_physics_rope_anchors() below) -- a small constant slack allowance
-## so the rope still reads as a bit loose/sagging rather than perfectly
-## string-taut, not an arbitrary unspool-speed tuning knob: the actual GROWTH
-## RATE of the allowed extent is tied directly to the dart's own real,
-## already-smooth travel distance, not to any separate timer or ramp.
-##
-## TENSION FEEDBACK ("The tension of the rope should be 2 times stronger"):
-## this constant was INITIALLY suspected and tried as the fix (lowered to
-## 0.4), then measured, via a temporary probe (max perpendicular deviation of
-## every physics control point from the straight hand-to-tip line), to NOT
-## reliably help -- in several real throws the deviation got WORSE at 0.4
-## than at 1.0 (e.g. one throw: max_perp_deviation grew from ~1.5 at slack=1.0
-## to ~2.7 at slack=0.4 for a similar real_dist). Root cause of why this
-## constant was the wrong lever: `max_reach_from_hand` bounds distance from
-## the HAND POINT in ANY direction (a sphere), not distance from the
-## hand-to-tip LINE -- and the chain's own TOTAL physical length is fixed at
-## DART_ROPE_LENGTH (8 units) regardless of the real span, so for most of a
-## throw (until near max range) there's always several units of "must go
-## somewhere" excess capsule length. Shrinking the sphere's radius doesn't
-## reduce that excess length; it just forces the SAME excess to fold into a
-## SMALLER sphere, which can make it bulge/fold MORE per unit of available
-## room, not less. Reverted to 1.0 -- this constant's role is purely unspool
-## PACING (bounding how far AHEAD of real dart travel the chain's farthest
-## point can get, in any direction), not tautness/tension. See
-## rope_segment_body.gd's `max_perp_from_line` for the mechanism that
-## actually addresses tension, directly and measurably.
-const ROPE_UNSPOOL_SLACK: float = 1.0
-## THE ACTUAL TENSION FIX: a direct cap on how far any dynamic segment may
-## deviate PERPENDICULAR to the straight hand-to-tip line (a "tube" around
-## the taut line, not a sphere around the hand -- see ROPE_UNSPOOL_SLACK's own
-## comment for why a sphere-around-a-point can't control this). Enforced live
-## every physics tick in rope_segment_body.gd's `max_perp_from_line`, driven
-## from `tip_pos_2d` alongside the existing `hand_pos_2d`/`max_reach_from_hand`
-## (see _update_physics_rope_anchors() below). Directly measured before/after
-## via a temporary probe (max perpendicular deviation of every physics
-## control point from the straight hand-to-tip line, sampled across dozens of
-## real throws): at the old, unconstrained baseline this deviation regularly
-## reached 1.0-2.7 units -- in one throw MORE than the actual hand-to-dart
-## distance itself (real_dist=0.859, deviation=1.955) -- a large, clearly
-## visible sideways bulge. With this clamp active the same probe should show
-## deviation bounded near this constant's own value; see this session's final
-## report for the actual measured before/after numbers. Deliberately NOT
-## PhysicsServer3D.PIN_JOINT_BIAS/DAMPING (see the ROPE_PHYSICS_* consts'
-## comment above for why stiffening those was already tried once and found to
-## make the whole chain numerically explode) -- this is a plain position
-## clamp on each segment's own already-computed transform, the same kind of
-## mechanism as `max_reach_from_hand` and the Y-plane lock, not a change to
-## the solver's own joint stiffness.
-const ROPE_TAUT_PERP_RADIUS: float = 0.3
+## EXPERIMENT (2026-07-24, "core simulation only" round): PhysicsServer3D pin
+## joint bias/damping are still deliberately left at their own defaults
+## (0.3 / 1.0) -- stiffening them was tried and measured, in an earlier
+## round, to make the whole chain numerically explode (per-joint gaps
+## growing to trillions of units within seconds); nothing in this round
+## re-tested that, so it's left alone. The two clamps that WERE removed this
+## round -- rope_segment_body.gd's old MAX_SEGMENT_SPEED speed cap and the
+## growing-leash `max_reach_from_hand`/ROPE_UNSPOOL_SLACK position clamp that
+## used to pace the rope's visible extent to the dart's real travel distance
+## -- are gone; see rope_segment_body.gd's own EXPERIMENT note and CLAUDE.md's
+## dated entry for this round for what that did to spawn-time stability
+## ("crack the whip" whiplash), measured with the same per-tick reach-vs-real-
+## distance probe this project has used throughout its history.
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing
@@ -394,7 +340,7 @@ const RopeSegmentBodyScript: Script = preload("res://scripts/rope_segment_body.g
 ## --- Continuous tube-mesh rendering for the thrown/physics rope (visual
 ## only -- see this const block's parent doc comment above) ---
 ## Sample count along the Catmull-Rom curve through the chain's control
-## points -- deliberately much higher than ROPE_PHYSICS_SEGMENTS (8) itself,
+## points -- deliberately higher than ROPE_PHYSICS_SEGMENTS itself,
 ## since this is purely a rendering smoothness knob with no physics cost
 ## (the curve is evaluated in plain Vector3 math, not simulated).
 const ROPE_TUBE_CURVE_SAMPLES: int = 48
@@ -404,43 +350,19 @@ const ROPE_TUBE_CURVE_SAMPLES: int = 48
 ## ~6 simultaneous darts in a full match).
 const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
 
-## CORNER-CUTTING TUBE-OVERSHOOT FIX (real user screen recording,
-## frame-extracted and reviewed directly: circling TIGHTLY around a pillar's
-## near corner -- not pushing outward at max leash, the trigger for the
-## already-fixed ROUND 6 fold bug -- made the rendered rope arc in a smooth
-## curved dip through the pillar's solid base for a couple of frames, clean
-## again once past the corner). Root-caused via a new deterministic
-## regression test, tests/test_rope_corner_tube_overshoot.gd: it drives a
-## tight (~0.75-radius), purely tangential sweep around a real pillar corner
-## with the dart safely anchored on the far side, and measures BOTH the raw
-## RigidBody3D segment positions AND the exact Catmull-Rom curve
-## _update_rope_tube_mesh() samples through them, against the pillar's own
-## get_rect_2d(), every few ticks. Result: max_pen_raw stayed 0.0000 the
-## whole sweep (the real physics chain never enters the pillar -- ROUND 5's
-## guarantee holds) while max_pen_curve reached 0.11 -- the RENDERED spline
-## alone dips into solid geometry despite every real control point it's
-## drawn through staying clear. This is a textbook property of Catmull-Rom
-## (and any interpolating spline) at a sharp bend: wherever the real
-## polyline bends convexly around an obstacle's corner, the smooth curve
-## fit through it overshoots toward the CONCAVE side of that bend to stay
-## smooth -- which, for a rope wrapping the OUTSIDE of a convex pillar
-## corner, is exactly the pillar's own interior. This is a pure render-side
-## artifact, not a physics-chain regression, and NOT the previously-rejected
-## "detect obstruction, draw a synthetic straight line through a computed
-## contact point" approach (see the ROUND 4 CLAUDE.md entry / player.gd's
-## own _spawn_physics_rope() doc comment) -- nothing here decides where the
-## rope SHOULD go or fabricates a new position; see
-## _clamp_curve_point_to_obstacles() below, which only ever falls back to a
-## LINEAR interpolation between the SAME two already-real, already-verified
-## control points the smooth curve was sampling between, exactly at the one
-## sample where the smoothing itself would cut through solid geometry.
-## Sized close to ROPE_RADIUS (0.035) plus a small buffer -- same reasoning
-## as rope_segment_body.gd's CLAMP_OBSTACLE_MARGIN (there sized ~3x
-## ROPE_RADIUS for a physics position clamp fighting real joint-solver
-## drift; here there's no such drift to fight, just a one-shot per-sample
-## geometry test, so a smaller margin suffices while still keeping the
-## tube's own visible radius from grazing the surface).
-const ROPE_TUBE_OBSTACLE_MARGIN: float = 0.12
+## CORNER-CUTTING TUBE-OVERSHOOT FIX -- REMOVED this round (2026-07-24,
+## "core simulation only" experiment). A prior round found the rendered
+## Catmull-Rom tube could dip into a pillar's interior at a sharp corner bend
+## even when every real control point stayed outside it (a pure render-side
+## spline-overshoot artifact, not a physics-chain regression), and added a
+## per-sample obstacle-rect fallback (linear blend, then nearest-boundary
+## snap) to _compute_rope_tube_curve_points() to correct it. Per this round's
+## explicit experiment scope, that fallback -- along with
+## _point_inside_any_obstacle()/_nearest_point_outside_obstacles() -- has been
+## removed; the tube mesh now traces the raw Catmull-Rom curve through the
+## physics chain's real control points with zero geometric correction. See
+## CLAUDE.md's dated entry for this round for whether 24 segments (vs. the
+## old 8) keeps this overshoot small enough to not matter in practice.
 
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
@@ -1819,16 +1741,11 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	## segment either -- strictly one-directional, so the chain can never
 	## push a player or otherwise leak into gameplay logic.
 	##
-	## contact_monitor / max_contacts_reported: ROUND 5 CLIPPING FIX -- see
-	## rope_segment_body.gd's own doc comment on why _integrate_forces needs
-	## to know, per tick, whether THIS segment is actually touching real
-	## obstacle geometry right now. Godot only populates
-	## PhysicsDirectBodyState3D.get_contact_count() when contact_monitor is
-	## on and max_contacts_reported > 0 -- both default off/0. Since this
-	## body's collision_mask only ever matches ROPE_OBSTACLE_LAYER_BIT (see
-	## above -- never another segment, a player, or the ground), any contact
-	## reported here is unambiguously "resting against a real obstacle,"
-	## with no extra filtering needed.
+	## contact_monitor / max_contacts_reported: the ROUND 5 clamp that used to
+	## ACT on get_contact_count() every tick was removed this round (see
+	## rope_segment_body.gd's EXPERIMENT note) -- these are kept ON purely so
+	## rope_segment_body.gd's `_debug_last_has_contact` (pure introspection,
+	## read by tests/test_rope_obstacle_clip.gd) still reports real data.
 	var body := RigidBody3D.new()
 	body.name = node_name
 	body.set_script(RopeSegmentBodyScript)
@@ -1909,68 +1826,29 @@ func _update_physics_rope_anchors() -> void:
 	if _physics_rope_tip_anchor != null:
 		_physics_rope_tip_anchor.global_position = tip_pos
 
-	# Growing-leash unspool pacing (see ROPE_UNSPOOL_SLACK's own comment and
-	# rope_segment_body.gd's `max_reach_from_hand` doc comment for the full
-	# root-cause writeup): every dynamic segment's own live budget is
-	# recomputed here, every physics tick, directly from the REAL,
-	# already-known hand-to-dart distance -- not from any separate timer or
-	# ramp -- so the rope's visible/simulated extent can never get further
-	# ahead of the dart's own actual travel than ROPE_UNSPOOL_SLACK, no matter
-	# how fast the joint solver's own emergent equilibrium would otherwise
-	# resolve the bunched spawn's slack.
-	#
-	# CORNER-WRAP FIX (see this session's CLAUDE.md entry): `real_dist` used
-	# to be a naive straight-line `hand_pos.distance_to(tip_pos)` -- correct
-	# only when nothing sits between the hand and the dart. Whenever a real
-	# obstacle corner is between them (the dart anchored on the far side of a
-	# pillar from the player), the ACTUAL rope has to travel further than
-	# that beeline to reach around the corner, so the beeline systematically
-	# UNDER-counts how much of the chain's fixed DART_ROPE_LENGTH capacity is
-	# really in use. That undercount fed `max_reach_from_hand` (a sphere
-	# clamp centered on the HAND) too small a radius, which forcibly yanked
-	# the non-contact tail segments -- the ones between the corner and the
-	# anchor, which legitimately need to be far from the hand along the
-	# wrapped path -- back toward the hand every tick, fighting the pin
-	# joint that's simultaneously dragging the tip anchor to the fixed real
-	# dart position. That tug-of-war is what read as a sharp zigzag/hook fold
-	# right at the corner once the player pushed far enough around it.
-	# `_rope_chain_current_path_length_2d()` sums the REAL, already-simulated
-	# chain's own consecutive control-point distances (hand -> every dynamic
-	# segment, in joint order -> tip) instead of guessing at the corner's
-	# geometry -- a segment genuinely resting against real obstacle contact
-	# is exactly where the physics solver actually put it, wrap included, so
-	# this is reading real physics state, not computing a synthetic path. In
-	# the unobstructed common case this is numerically almost identical to
-	# the old beeline (the chain settles close to the straight line, bounded
-	# by ROPE_TAUT_PERP_RADIUS), so this is not expected to change behavior
-	# when there's no obstacle in the way.
-	var hand_2d := Vector2(hand_pos.x, hand_pos.z)
-	var tip_2d := Vector2(tip_pos.x, tip_pos.z)
-	var real_dist: float = _rope_chain_current_path_length_2d(hand_2d, tip_2d)
-	var budget: float = minf(real_dist + ROPE_UNSPOOL_SLACK, DART_ROPE_LENGTH)
-	for seg in _physics_rope_segments:
-		seg.hand_pos_2d = hand_2d
-		seg.max_reach_from_hand = budget
-		# Tension clamp (see ROPE_TAUT_PERP_RADIUS's own comment) -- needs the
-		# tip's live 2D position too, not just the hand's, since it constrains
-		# distance from the whole hand-to-tip LINE, not just the hand point.
-		seg.tip_pos_2d = tip_2d
-		seg.max_perp_from_line = ROPE_TAUT_PERP_RADIUS
+	## EXPERIMENT (2026-07-24, "core simulation only" round): this used to
+	## also recompute a per-tick "growing leash" budget (`max_reach_from_hand`)
+	## and a tension-clamp target (`max_perp_from_line`) and push them onto
+	## every dynamic segment -- both removed this round, along with the
+	## fields themselves, from rope_segment_body.gd (see its own EXPERIMENT
+	## note). The kinematic hand/tip anchor tracking above is the entire
+	## mechanism left: from here on, the chain's shape between them is
+	## whatever the real joints + capsule-vs-obstacle collision solve to, on
+	## their own, at ROPE_PHYSICS_SEGMENTS (now 24) resolution.
 
 
 func get_rope_polyline_2d() -> Array[Vector2]:
 	## Ordered hand -> tip control points of the CURRENTLY SIMULATED physics
-	## rope chain -- the exact same points _rope_chain_current_path_length_2d()
-	## sums and _update_rope_tube_mesh() draws a curve through -- exposed for
-	## rope_dart.gd's own use during RECALLING (see its
-	## _get_full_rope_path_2d()), so a returning dart can retrace the rope's
-	## real live shape (obstacle wrap included) instead of cutting a straight
-	## line back to wherever the owner currently stands. Deliberately does
-	## NOT include the tip/dart's own position -- rope_dart.gd already knows
-	## its own head_2d with zero extra lag (this function's own tip anchor,
-	## by contrast, tracks the dart one physics tick behind), so callers that
-	## want the full hand -> ... -> dart path append their own current
-	## position themselves.
+	## rope chain -- the exact same points _update_rope_tube_mesh() draws a
+	## curve through -- exposed for rope_dart.gd's own use during RECALLING
+	## (see its _get_full_rope_path_2d()), so a returning dart can retrace the
+	## rope's real live shape (obstacle wrap included) instead of cutting a
+	## straight line back to wherever the owner currently stands. Deliberately
+	## does NOT include the tip/dart's own position -- rope_dart.gd already
+	## knows its own head_2d with zero extra lag (this function's own tip
+	## anchor, by contrast, tracks the dart one physics tick behind), so
+	## callers that want the full hand -> ... -> dart path append their own
+	## current position themselves.
 	var points: Array[Vector2] = []
 	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
 	points.append(Vector2(hand_pos.x, hand_pos.z))
@@ -1980,36 +1858,10 @@ func get_rope_polyline_2d() -> Array[Vector2]:
 	return points
 
 
-func _rope_chain_current_path_length_2d(hand_2d: Vector2, tip_2d: Vector2) -> float:
-	## Real (not beeline) 2D length of the currently-simulated physics chain:
-	## sums consecutive distances hand -> seg[0] -> seg[1] -> ... -> tip, in
-	## the same order _spawn_physics_rope() jointed them, using every dynamic
-	## segment's OWN CURRENTLY RESOLVED global position (one physics tick
-	## stale relative to hand_2d/tip_2d, same lag already accepted throughout
-	## this system -- see e.g. rope_segment_body.gd's contact_count() doc
-	## comment). Falls back to the plain beeline distance before the chain
-	## exists yet (segments empty) so callers don't have to special-case that.
-	## See _update_physics_rope_anchors()'s own CORNER-WRAP FIX comment for
-	## why this replaced a naive `hand_2d.distance_to(tip_2d)` call -- a
-	## segment genuinely resting against real obstacle contact is exactly
-	## where the physics solver put it, wrap included, so this reads real
-	## physics state rather than computing any synthetic path/route.
-	if _physics_rope_segments.is_empty():
-		return hand_2d.distance_to(tip_2d)
-	var total: float = 0.0
-	var prev: Vector2 = hand_2d
-	for seg in _physics_rope_segments:
-		var p3: Vector3 = (seg as RigidBody3D).global_position
-		var p2d := Vector2(p3.x, p3.z)
-		total += prev.distance_to(p2d)
-		prev = p2d
-	total += prev.distance_to(tip_2d)
-	return total
-
-
 func _rope_chain_rest_length_2d(tip_2d: Vector2) -> float:
-	## Companion to _rope_chain_current_path_length_2d() above, used by
-	## _clamp_to_rope_leash(): the real chain's own already-committed length
+	## Used by _clamp_to_rope_leash() (the OWNER's own movement tether, a
+	## fundamental gameplay mechanic unrelated to this round's experiment --
+	## see that function's own comment) -- the real chain's own already-committed length
 	## from its FIRST dynamic segment (the link nearest the hand) through
 	## every remaining segment to the tip/anchor -- i.e. how much of the
 	## chain's fixed DART_ROPE_LENGTH capacity is already spent on whatever's
@@ -2137,34 +1989,19 @@ func _compute_rope_tube_curve_points(control_points: Array[Vector3]) -> Array[Ve
 	##
 	## Split out of _update_rope_tube_mesh() into its own function specifically
 	## so tests/test_rope_corner_tube_overshoot.gd can call the EXACT real
-	## sampling/fix code directly on a synthetic control-point list, instead
-	## of maintaining a second hand-written copy of this logic that could
+	## sampling code directly on a synthetic control-point list, instead of
+	## maintaining a second hand-written copy of this logic that could
 	## silently drift from what actually ships.
 	##
-	## CORNER-CUTTING TUBE-OVERSHOOT FIX (see ROPE_TUBE_OBSTACLE_MARGIN's own
-	## doc comment for the full root-cause writeup): a smooth spline sampled
-	## through control points that bend sharply around a real obstacle corner
-	## can dip to the CONCAVE side of that bend (the obstacle's own interior)
-	## even though every real control point it passes through stays outside
-	## it. Two fallback tiers, each strictly preferred over inventing a new
-	## position, tried in order:
-	##   1. A plain LINEAR blend between the SAME two already-real,
-	##      already-verified control points (p1 -> p2, at this sample's own
-	##      local_t) -- this can never introduce a position the real chain
-	##      didn't already occupy (p1/p2 come straight from
-	##      _physics_rope_hand_anchor / a real dynamic segment / the tip
-	##      anchor's own live global_position).
-	##   2. Only if EVEN the linear blend still lands inside an obstacle (the
-	##      real discrete polyline itself can still "cut a corner" between two
-	##      genuinely-outside points, when a convex corner pokes into the gap
-	##      between them -- verified to actually occur in
-	##      tests/test_rope_corner_tube_overshoot.gd, not a hypothetical
-	##      edge case) -- push the point to the NEAREST point on the violated
-	##      obstacle's own grown-rect boundary, i.e. the smallest possible
-	##      correction that gets it back outside real, already-known
-	##      obstacle geometry (get_rect_2d(), the same ground truth every
-	##      other obstacle-aware system in this codebase reads). Still not a
-	##      fabricated route -- it's the minimal nudge off a real boundary.
+	## EXPERIMENT (2026-07-24, "core simulation only" round): the obstacle-rect
+	## fallback that used to live here (a prior round's fix for the rendered
+	## Catmull-Rom curve dipping into a pillar's interior at a sharp corner
+	## bend, even when every real control point stayed outside it) has been
+	## REMOVED, per this round's explicit scope -- this now returns the raw,
+	## uncorrected spline through the physics chain's real control points,
+	## with zero geometry awareness. See CLAUDE.md's dated entry for this
+	## round for whether 24 segments (vs. the old 8) keeps the raw overshoot
+	## small enough that this matters less in practice.
 	var n: int = control_points.size()
 	var curve_points: Array[Vector3] = []
 	curve_points.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
@@ -2177,69 +2014,8 @@ func _compute_rope_tube_curve_points(control_points: Array[Vector3]) -> Array[Ve
 		var p1: Vector3 = control_points[seg_i]
 		var p2: Vector3 = control_points[clampi(seg_i + 1, 0, n - 1)]
 		var p3: Vector3 = control_points[clampi(seg_i + 2, 0, n - 1)]
-		var sample: Vector3 = p1.cubic_interpolate(p2, p0, p3, local_t)
-		if _point_inside_any_obstacle(Vector2(sample.x, sample.z)):
-			sample = p1.lerp(p2, local_t)
-			if _point_inside_any_obstacle(Vector2(sample.x, sample.z)):
-				var pushed_2d: Vector2 = _nearest_point_outside_obstacles(Vector2(sample.x, sample.z))
-				sample = Vector3(pushed_2d.x, sample.y, pushed_2d.y)
-		curve_points[i] = sample
+		curve_points[i] = p1.cubic_interpolate(p2, p0, p3, local_t)
 	return curve_points
-
-
-func _point_inside_any_obstacle(p: Vector2) -> bool:
-	## Ground-truth obstacle check for the corner-cutting tube-overshoot fix
-	## above -- same pattern as rope_segment_body.gd's own
-	## _clamp_target_inside_obstacle() (grown rect via get_rect_2d(), the same
-	## ground truth rope_dart.gd's own obstacle stop and every other
-	## obstacle-aware system in this codebase already reads), duplicated here
-	## rather than shared since rope_segment_body.gd's version is a method on
-	## a RigidBody3D instance, not something this Node3D-derived script can
-	## call into directly.
-	if not is_inside_tree():
-		return false
-	for obs in get_tree().get_nodes_in_group("obstacles"):
-		if not obs.has_method("get_rect_2d"):
-			continue
-		var rect: Rect2 = obs.get_rect_2d().grow(ROPE_TUBE_OBSTACLE_MARGIN)
-		if rect.has_point(p):
-			return true
-	return false
-
-
-func _nearest_point_outside_obstacles(p: Vector2) -> Vector2:
-	## Tier-2 fallback for _compute_rope_tube_curve_points() above -- only
-	## reached when even a straight blend between two real, verified-outside
-	## control points still lands inside an obstacle's grown rect (a convex
-	## corner poking into the gap between them). Pushes `p` to the closest
-	## point on that rect's own boundary (compares distance to each of the 4
-	## edges, moves along whichever is nearest) -- the smallest possible
-	## correction that clears real geometry, not a computed route/contact
-	## point. If `p` happens to violate more than one obstacle's rect
-	## (extremely unlikely given this game's obstacle spacing), the first
-	## match found is used, same iteration order as _point_inside_any_obstacle().
-	if not is_inside_tree():
-		return p
-	for obs in get_tree().get_nodes_in_group("obstacles"):
-		if not obs.has_method("get_rect_2d"):
-			continue
-		var rect: Rect2 = obs.get_rect_2d().grow(ROPE_TUBE_OBSTACLE_MARGIN)
-		if not rect.has_point(p):
-			continue
-		var d_min_x: float = p.x - rect.position.x
-		var d_max_x: float = rect.end.x - p.x
-		var d_min_y: float = p.y - rect.position.y
-		var d_max_y: float = rect.end.y - p.y
-		var m: float = minf(minf(d_min_x, d_max_x), minf(d_min_y, d_max_y))
-		if m == d_min_x:
-			return Vector2(rect.position.x, p.y)
-		elif m == d_max_x:
-			return Vector2(rect.end.x, p.y)
-		elif m == d_min_y:
-			return Vector2(p.x, rect.position.y)
-		else:
-			return Vector2(p.x, rect.end.y)
-	return p
 
 
 func _build_tube_mesh(mi: MeshInstance3D, curve_points: Array[Vector3], radius: float, radial_segments: int) -> void:
