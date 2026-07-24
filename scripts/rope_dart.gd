@@ -40,6 +40,25 @@ extends Node3D
 ## math, head vs. body, kill vs. trip()'s "clothesline" stagger -- that's a
 ## separate concern from the map-collision system above and was never the
 ## part reported as broken.
+##
+## ROPE OVER THE VOID: the FLYING branch no longer clamps/anchors at a fixed
+## arena_half boundary. Per explicit user direction ("The dart should be able
+## to throw outside of the map. Let it be hang by the rope."), a thrown dart
+## now keeps flying straight out past the platform's edge, over the void, and
+## can anchor there -- stopped only by the same three conditions everything
+## else already used (a real obstacle hit, a player hit, or ROPE_LENGTH max
+## range), never by proximity to the platform edge itself. This is
+## deliberately DART-ONLY: player.gd's own ARENA_HALF/_check_boundary_fall()
+## ring-out (a completely separate constant/system -- confirmed by grep, this
+## script's old arena_half=14.5 was never read anywhere else) is untouched, so
+## the player themselves still cannot walk off the platform. There's no
+## obstacle collision geometry out over the void for the raycast to hit, and
+## no ground mesh either, so an off-platform anchor simply floats in open
+## space at plane_y -- exactly the "hanging by the rope" look asked for.
+## _clamp_to_rope_leash() (player.gd) already worked purely in terms of
+## distance from the anchor point regardless of where that point is, and
+## bot_controller.gd never paths toward a dart's anchor position (only toward
+## the enemy player) -- so neither needed any change for this.
 
 enum State { FLYING, ANCHORED, RECALLING }
 
@@ -49,7 +68,6 @@ enum State { FLYING, ANCHORED, RECALLING }
 ## head hit (kill); anywhere else within hit_radius along the capsule is a
 ## body hit (clothesline).
 @export var head_hit_radius: float = 0.35
-@export var arena_half: float = 14.5
 ## How close the owner needs to be (walking up, or via recall) to reclaim the dart.
 @export var pickup_radius: float = 0.9
 ## Recall is deliberately faster than the base throw speed -- pulling it back
@@ -201,34 +219,31 @@ func _physics_process(delta: float) -> void:
 				_anchor()
 				_render()
 				return
-			# Anchor at the arena boundary walls
-			if absf(head_2d.x) >= arena_half or absf(head_2d.y) >= arena_half:
-				head_2d.x = clampf(head_2d.x, -arena_half, arena_half)
-				head_2d.y = clampf(head_2d.y, -arena_half, arena_half)
+			# NOTE: the arena boundary is deliberately NOT checked here anymore --
+			# see ROPE OVER THE VOID below. The dart's only remaining stop
+			# conditions are a real obstacle hit and ROPE_LENGTH max range.
+			# Real physics raycast (prev_head_2d -> head_2d, at plane_y) against
+			# the map's actual CollisionShape3D geometry instead of a hand-rolled
+			# 2D rect test -- this is what actually stops the dart on pillars,
+			# trees, and cacti using the same collision the player already
+			# bumps into, with player bodies explicitly excluded so the dart
+			# never anchors on a character it merely grazed.
+			var hit_point_2d: Variant = _raycast_obstacle(prev_head_2d, head_2d)
+			if hit_point_2d != null:
+				# Push past the surface along the travel direction so the
+				# blade reads as embedded rather than just touching it --
+				# see ANCHOR_EMBED_DEPTH's comment.
+				head_2d = (hit_point_2d as Vector2) + dir_2d * ANCHOR_EMBED_DEPTH
 				_anchor()
-			else:
-				# Real physics raycast (prev_head_2d -> head_2d, at plane_y) against
-				# the map's actual CollisionShape3D geometry instead of a hand-rolled
-				# 2D rect test -- this is what actually stops the dart on pillars,
-				# trees, and cacti using the same collision the player already
-				# bumps into, with player bodies explicitly excluded so the dart
-				# never anchors on a character it merely grazed.
-				var hit_point_2d: Variant = _raycast_obstacle(prev_head_2d, head_2d)
-				if hit_point_2d != null:
-					# Push past the surface along the travel direction so the
-					# blade reads as embedded rather than just touching it --
-					# see ANCHOR_EMBED_DEPTH's comment.
-					head_2d = (hit_point_2d as Vector2) + dir_2d * ANCHOR_EMBED_DEPTH
-					_anchor()
-				elif head_2d.distance_to(origin_2d) >= ROPE_LENGTH:
-					# Per explicit user direction (reversing an earlier design
-					# decision that auto-recalled here instead): reaching max
-					# range without hitting anything now ANCHORS the dart in
-					# open air at that point, same as an obstacle/player hit --
-					# it stays stuck there until the owner recalls it or walks
-					# over it (pickup_radius), rather than auto-yanking back.
-					head_2d = origin_2d + dir_2d * ROPE_LENGTH
-					_anchor()
+			elif head_2d.distance_to(origin_2d) >= ROPE_LENGTH:
+				# Per explicit user direction (reversing an earlier design
+				# decision that auto-recalled here instead): reaching max
+				# range without hitting anything now ANCHORS the dart in
+				# open air at that point, same as an obstacle/player hit --
+				# it stays stuck there until the owner recalls it or walks
+				# over it (pickup_radius), rather than auto-yanking back.
+				head_2d = origin_2d + dir_2d * ROPE_LENGTH
+				_anchor()
 
 		State.ANCHORED:
 			# ROUND (walk-to-pickup retrieval fix, see CLAUDE.md): walking up to

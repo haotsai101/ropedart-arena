@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://c8xk2vb7wdart"]
+
+[ext_resource type="Script" path="res://tests/test_dart_void_throw.gd" id="1_void"]
+
+[node name="TestDartVoidThrow" type="Node"]
+script = ExtResource("1_void")
