@@ -1763,6 +1763,17 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	## head. collision_layer = 0: nothing else's mask can ever detect this
 	## segment either -- strictly one-directional, so the chain can never
 	## push a player or otherwise leak into gameplay logic.
+	##
+	## contact_monitor / max_contacts_reported: ROUND 5 CLIPPING FIX -- see
+	## rope_segment_body.gd's own doc comment on why _integrate_forces needs
+	## to know, per tick, whether THIS segment is actually touching real
+	## obstacle geometry right now. Godot only populates
+	## PhysicsDirectBodyState3D.get_contact_count() when contact_monitor is
+	## on and max_contacts_reported > 0 -- both default off/0. Since this
+	## body's collision_mask only ever matches ROPE_OBSTACLE_LAYER_BIT (see
+	## above -- never another segment, a player, or the ground), any contact
+	## reported here is unambiguously "resting against a real obstacle,"
+	## with no extra filtering needed.
 	var body := RigidBody3D.new()
 	body.name = node_name
 	body.set_script(RopeSegmentBodyScript)
@@ -1774,6 +1785,8 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	body.continuous_cd = true
 	body.collision_layer = 0
 	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
+	body.contact_monitor = true
+	body.max_contacts_reported = 4
 
 	var shape := CollisionShape3D.new()
 	var capsule := CapsuleShape3D.new()

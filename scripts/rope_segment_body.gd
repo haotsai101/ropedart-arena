@@ -63,6 +63,21 @@ var locked_y: float = 0.0
 ## instead of compounding.
 const MAX_SEGMENT_SPEED: float = 45.0
 
+## Small outward safety margin used by _clamp_target_inside_obstacle() --
+## grows every obstacle's rect by this much before testing a clamp candidate
+## against it. Without this, a handful of ticks in soak-testing still showed
+## brief (single-tick, non-sustained) penetration up to ~0.12 units: the
+## candidate point tested exactly on/just outside a rect's true edge, passed
+## the check, got committed, and then the joint solver's own next correction
+## (pulling a NEIGHBORING segment, which drags this one slightly via the pin
+## joint) nudged it the last fraction of a unit across the boundary before
+## the next tick's own check could catch it. A small buffer here means a
+## candidate has to clear the surface by a bit of headroom, not just
+## technically not-yet-touch it, closing that gap. Roughly 3x ROPE_RADIUS
+## (0.035, see player.gd) -- big enough to matter, small enough not to
+## visibly push the rope away from a surface it should be resting against.
+const CLAMP_OBSTACLE_MARGIN: float = 0.2
+
 ## --- Growing-leash unspool clamp (see the doc comment inside
 ## _integrate_forces() below for the full root-cause writeup) ---
 ## Updated every physics tick by player.gd's _update_physics_rope_anchors(),
@@ -86,7 +101,106 @@ var tip_pos_2d: Vector2 = Vector2.ZERO
 var max_perp_from_line: float = 1.0e9
 
 
+## ROUND 5 CLIPPING FIX (per direct user course-correction rejecting the prior
+## round's "detect obstruction, draw a synthetic straight line through a
+## computed contact point" render-only approach -- see player.gd's
+## _make_rope_segment_body() doc comment and this session's CLAUDE.md entry
+## for the full writeup): root-caused via direct measurement (segment
+## position vs. a pillar's own get_rect_2d(), sampled every tick through a
+## real draped throw), not assumed from the symptom alone. The two position
+## clamps below (max_reach_from_hand's sphere-around-the-hand, and
+## max_perp_from_line's tube-around-the-straight-hand-to-tip-LINE) are BOTH
+## computed purely from the hand/tip's own live positions, with zero
+## awareness of obstacle geometry -- so whenever the straight hand-to-tip
+## line itself passes through a pillar's interior (exactly the "dart anchored
+## behind a pillar" screenshot), max_perp_from_line's 0.3-unit tube sits
+## centered ON a line that runs through solid geometry, and every tick
+## forcibly recenters any segment the REAL collision solver had just
+## correctly pushed outward (draping it around the pillar's edge) back
+## in toward that line -- i.e. back through the pillar -- fighting the
+## solver's own contact response every single step. This produces both
+## halves of the reported bug at once: visible interpenetration (the clamp
+## literally relocates the segment inside the obstacle's footprint every
+## tick) AND lost tautness (the segment never settles into the solver's real
+## resting position; it's yanked back and forth between "pushed out by
+## contact" and "pulled back by the clamp" instead).
+##
+## Fix has TWO layers, because the first one alone was measured (via the same
+## direct penetration-vs-rect probe) to be insufficient on its own:
+##
+## Layer 1: both clamps YIELD whenever this segment has a real, currently
+## active contact (state.get_contact_count() > 0 -- see player.gd's
+## contact_monitor/max_contacts_reported setup on why this is unambiguously
+## "touching an obstacle," never a player/ground/another segment) -- skip
+## repositioning entirely for that tick and let the solver's own contact
+## resolution stand, instead of overriding it.
+##
+## Layer 2 (the one that actually closes the gap Layer 1 leaves open):
+## contact_count() reflects contacts detected as of the END of the PREVIOUS
+## physics step, so it can flicker off for a single tick even while a segment
+## is still resting right at an obstacle's surface (sub-tick jitter in the
+## narrow phase, or the joint solver nudging the segment a hair off the
+## surface as it resolves other constraints in the chain) -- and on exactly
+## that tick, Layer 1's gate reads false, so the clamp reactivates and pulls
+## the segment straight back onto the hand-to-tip line, which (by definition
+## of "this line is obstructed") runs THROUGH the obstacle's interior,
+## re-injecting the segment into solid geometry it had just correctly been
+## pushed out of. Measured directly: with Layer 1 alone, a diagonal
+## corner-wrap scenario (hand/tip on opposite corners of a pillar, forcing
+## real wraparound instead of a flat face-press) showed WORSE sustained
+## penetration than with no gating at all (0.70 max vs. 0.59 ungated),
+## because contact flicker was actually made the trigger for repeated
+## yank-back-through-the-box cycles instead of a steady-state fight.
+## Fix: before actually committing to either clamp's own candidate
+## destination point, test that point directly against every real obstacle's
+## own get_rect_2d() (arena_obstacle.gd's already-established ground truth
+## for "solid footprint," the same rect rope_dart.gd's obstacle stop and this
+## whole bug's own verification probe use) -- if the clamp's candidate would
+## itself land inside an obstacle, skip applying that clamp this tick,
+## regardless of whether get_contact_count() happened to catch it. This is
+## NOT a synthetic path/route computation (nothing here decides where the
+## rope SHOULD go, or draws any line) -- it's a plain "is this specific
+## candidate point I'm about to move a physics body to solid ground" safety
+## check on the clamp's own existing math, the same category of concern as
+## Layer 1 (don't let a hand-authored position override fight real collision
+## geometry), just checked directly against ground truth instead of inferred
+## from a one-tick-stale proxy signal. Segments with no active contact AND
+## whose clamp target isn't inside any obstacle (the common case: mid-air
+## spans, or anchored in open space) are completely unaffected -- both clamps
+## still apply exactly as before, which is what keeps the free portions of
+## the rope from sagging/whipping.
+## Lightweight introspection field, kept (not stripped after round-5
+## verification) because tests/test_rope_obstacle_clip.gd -- the permanent
+## regression test for this whole bug class -- reads it every sampled tick to
+## report how many segments are genuinely yielding to real collision
+## response, alongside its own direct penetration-vs-rect measurement.
+## Mirrors has_obstacle_contact every tick; no gameplay behavior depends on
+## it.
+var _debug_last_has_contact: bool = false
+
+
+func _clamp_target_inside_obstacle(p: Vector2) -> bool:
+	## Layer 2 of the ROUND 5 CLIPPING FIX (see this file's doc comment above
+	## _integrate_forces()) -- a plain, direct ground-truth check: would
+	## relocating this segment to `p` land it inside a real obstacle's own
+	## footprint? Queried live every call (not cached) since obstacles don't
+	## move but the candidate point does, every tick, for every segment.
+	## Cheap in practice -- this codebase's arenas only ever have a handful of
+	## obstacles (see arena_obstacle.gd/nature_scatter.gd).
+	if not is_inside_tree():
+		return false
+	for obs in get_tree().get_nodes_in_group("obstacles"):
+		if not obs.has_method("get_rect_2d"):
+			continue
+		var rect: Rect2 = obs.get_rect_2d().grow(CLAMP_OBSTACLE_MARGIN)
+		if rect.has_point(p):
+			return true
+	return false
+
+
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
+	var has_obstacle_contact: bool = state.get_contact_count() > 0
+	_debug_last_has_contact = has_obstacle_contact
 	var t: Transform3D = state.transform
 	t.origin.y = locked_y
 	var v: Vector3 = state.linear_velocity
@@ -163,17 +277,18 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	var xz_pos := Vector2(t.origin.x, t.origin.z)
 	var offset: Vector2 = xz_pos - hand_pos_2d
 	var dist: float = offset.length()
-	if dist > max_reach_from_hand and dist > 0.0001:
+	if not has_obstacle_contact and dist > max_reach_from_hand and dist > 0.0001:
 		var radial_dir: Vector2 = offset / dist
 		var clamped_xz: Vector2 = hand_pos_2d + radial_dir * max_reach_from_hand
-		t.origin.x = clamped_xz.x
-		t.origin.z = clamped_xz.y
-		var v2 := Vector2(v.x, v.z)
-		var radial_speed: float = v2.dot(radial_dir)
-		if radial_speed > 0.0:
-			v2 -= radial_dir * radial_speed
-			v.x = v2.x
-			v.z = v2.y
+		if not _clamp_target_inside_obstacle(clamped_xz):
+			t.origin.x = clamped_xz.x
+			t.origin.z = clamped_xz.y
+			var v2 := Vector2(v.x, v.z)
+			var radial_speed: float = v2.dot(radial_dir)
+			if radial_speed > 0.0:
+				v2 -= radial_dir * radial_speed
+				v.x = v2.x
+				v.z = v2.y
 
 	# TENSION CLAMP (per explicit user feedback: "The tension of the rope
 	# should be 2 times stronger" -- see player.gd's ROPE_TAUT_PERP_RADIUS
@@ -195,17 +310,18 @@ func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 		var along: float = rel.dot(line_dir)
 		var perp_vec: Vector2 = rel - line_dir * along
 		var perp_dist: float = perp_vec.length()
-		if perp_dist > max_perp_from_line and perp_dist > 0.0001:
+		if not has_obstacle_contact and perp_dist > max_perp_from_line and perp_dist > 0.0001:
 			var perp_dir: Vector2 = perp_vec / perp_dist
 			var clamped_xz2: Vector2 = hand_pos_2d + line_dir * along + perp_dir * max_perp_from_line
-			t.origin.x = clamped_xz2.x
-			t.origin.z = clamped_xz2.y
-			var v3 := Vector2(v.x, v.z)
-			var perp_speed: float = v3.dot(perp_dir)
-			if perp_speed > 0.0:
-				v3 -= perp_dir * perp_speed
-				v.x = v3.x
-				v.z = v3.y
+			if not _clamp_target_inside_obstacle(clamped_xz2):
+				t.origin.x = clamped_xz2.x
+				t.origin.z = clamped_xz2.y
+				var v3 := Vector2(v.x, v.z)
+				var perp_speed: float = v3.dot(perp_dir)
+				if perp_speed > 0.0:
+					v3 -= perp_dir * perp_speed
+					v.x = v3.x
+					v.z = v3.y
 
 	state.transform = t
 	state.linear_velocity = v
