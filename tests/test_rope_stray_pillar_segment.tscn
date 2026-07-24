@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://d9s8t7r4a2y1p6i2"]
+
+[ext_resource type="Script" path="res://tests/test_rope_stray_pillar_segment.gd" id="1_stray"]
+
+[node name="TestRopeStrayPillarSegment" type="Node"]
+script = ExtResource("1_stray")

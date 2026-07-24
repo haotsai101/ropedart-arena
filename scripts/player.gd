@@ -2165,9 +2165,90 @@ func _compute_rope_tube_curve_points(control_points: Array[Vector3]) -> Array[Ve
 	##      obstacle geometry (get_rect_2d(), the same ground truth every
 	##      other obstacle-aware system in this codebase reads). Still not a
 	##      fabricated route -- it's the minimal nudge off a real boundary.
+	##
+	## STRAY-CORNER-SEGMENT FIX (real user screen recording, frame-cropped and
+	## reviewed directly: dart anchored far away near DART_ROPE_LENGTH,
+	## character standing tight against a pillar -- a SEPARATE, disconnected
+	## short line rendered on the pillar's own face, apart from the main
+	## curve that correctly arcs around the far corner). Root-caused via a
+	## dedicated repro test (tests/test_rope_stray_pillar_segment.gd, which
+	## holds the player STATIONARY tight against a pillar -- a materially
+	## different, longer-duration configuration than
+	## tests/test_rope_corner_tube_overshoot.gd's continuous corner sweep):
+	## the OLD tier-2 fallback above pushed EACH violating SAMPLE
+	## independently to whichever single rect edge was nearest to THAT sample
+	## alone. For a run of consecutive samples whose positions straddle a
+	## real box corner, "nearest edge" flips discontinuously right at the
+	## rect's own internal 45-degree bisector between two adjacent edges --
+	## samples on one side all pin to edge A, samples on the other pin to
+	## edge B, and the join between them is a straight chord connecting two
+	## DIFFERENT edge lines instead of passing near the box's real corner --
+	## exactly the reported "short mark on the pillar's face, disconnected
+	## from the main curve."
+	##
+	## Getting the actual, robust fix took several rounds against this same
+	## repro test, kept here as notes since each one looked complete until
+	## measured and found wanting:
+	##  1. One shared waypoint per real control-point SPAN instead of per
+	##     sample. Broke again whenever a REAL control point itself briefly
+	##     sat inside the tube's own small ROPE_TUBE_OBSTACLE_MARGIN
+	##     (harmless on its own, narrower than rope_segment_body.gd's own
+	##     0.2 margin -- not a physics penetration) -- the two spans on
+	##     either side of that point computed two different waypoints, so
+	##     the discontinuity just moved to the shared boundary instead of
+	##     disappearing.
+	##  2. Grouping by CONTIGUOUS RUNS of bad samples (bracketed by the
+	##     nearest known-good samples on either side) instead of by which
+	##     control-point span contains each sample -- this part stuck and
+	##     is still how runs are found below. But `bad[i]` was still gated
+	##     on the raw Catmull-Rom sample, whose own natural wiggle can dip
+	##     in and back OUT of the rect within what should be one continuous
+	##     crossing, fragmenting it into several tiny runs that each pick
+	##     their own waypoint independently, reproducing the same jump
+	##     through a different path. Fixed by gating `bad[i]` on the LINEAR
+	##     blend between the sample's real bracketing control points
+	##     instead -- it moves monotonically between two fixed points as
+	##     local_t increases, so it can't flicker the way the spline's own
+	##     curvature can; only genuinely stubborn samples (where even that
+	##     blend stays inside) ever join a run at all.
+	##  3. Picking the run's shared waypoint via
+	##     _nearest_point_outside_obstacles() on the run's own midpoint --
+	##     the nearest single EDGE from one arbitrary interior point (same
+	##     mechanism as the old broken per-sample tier 2) -- still let the
+	##     leg from that edge-point to the far anchor re-cut the corner.
+	##  4. Brute-force validating all 4 of the rect's corners as waypoint
+	##     candidates (requiring a densely-sampled straight leg from each
+	##     anchor to test clear of the rect end-to-end) -- still failed,
+	##     SUSTAINED across up to 8 consecutive ticks in one run: the
+	##     validation could reject all 4 real corners in some configurations
+	##     (an anchor very close to the rect has a leg to an adjacent corner
+	##     that grazes near-parallel to a face for a long stretch, and
+	##     floating-point/margin noise in the discrete leg check can flip it
+	##     to "blocked"), silently falling through to the same broken
+	##     fallback for the whole run.
+	##
+	## THE ACTUAL FIX (see _corner_route_waypoints()): instead of validating
+	## candidate corners after the fact, derive the correct waypoint(s)
+	## directly from which EDGE each of the run's own two anchors
+	## independently resolves nearest to (_rect_nearest_edge_index() -- the
+	## exact same comparison _nearest_point_outside_obstacles() already
+	## makes). If both anchors agree, there's no real corner-straddling, so
+	## the plain single-edge push still applies. If they resolve to two
+	## ADJACENT edges (one X-edge, one Z-edge), route through the ONE corner
+	## vertex those two edges actually share (_rect_shared_corner()) -- always
+	## well-defined, no per-candidate validation needed. If they resolve to
+	## two OPPOSITE edges (west+east, or south+north -- confirmed to occur in
+	## real anchor pairs, meaning the true detour has to wrap one entire side
+	## of the box, not just one vertex), route through BOTH of that side's
+	## corners, choosing north/south (or west/east) by checking which side a
+	## real sample from deep in the run actually sits closer to. The full
+	## polyline (anchor_before -> 0-2 waypoints -> anchor_after) is then
+	## walked by the generalized _route_through_polyline().
 	var n: int = control_points.size()
-	var curve_points: Array[Vector3] = []
-	curve_points.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
+	var raw_points: Array[Vector3] = []
+	var bad: Array[bool] = []
+	raw_points.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
+	bad.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
 	for i in range(ROPE_TUBE_CURVE_SAMPLES + 1):
 		var t: float = float(i) / float(ROPE_TUBE_CURVE_SAMPLES)
 		var f: float = t * float(n - 1)
@@ -2179,12 +2260,237 @@ func _compute_rope_tube_curve_points(control_points: Array[Vector3]) -> Array[Ve
 		var p3: Vector3 = control_points[clampi(seg_i + 2, 0, n - 1)]
 		var sample: Vector3 = p1.cubic_interpolate(p2, p0, p3, local_t)
 		if _point_inside_any_obstacle(Vector2(sample.x, sample.z)):
-			sample = p1.lerp(p2, local_t)
-			if _point_inside_any_obstacle(Vector2(sample.x, sample.z)):
-				var pushed_2d: Vector2 = _nearest_point_outside_obstacles(Vector2(sample.x, sample.z))
-				sample = Vector3(pushed_2d.x, sample.y, pushed_2d.y)
-		curve_points[i] = sample
+			var linear_sample: Vector3 = p1.lerp(p2, local_t)
+			if _point_inside_any_obstacle(Vector2(linear_sample.x, linear_sample.z)):
+				raw_points[i] = linear_sample
+				bad[i] = true
+			else:
+				raw_points[i] = linear_sample
+				bad[i] = false
+		else:
+			raw_points[i] = sample
+			bad[i] = false
+
+	var curve_points: Array[Vector3] = raw_points.duplicate()
+	var i: int = 0
+	while i <= ROPE_TUBE_CURVE_SAMPLES:
+		if not bad[i]:
+			i += 1
+			continue
+		var run_start: int = i
+		var run_end: int = i
+		while run_end + 1 <= ROPE_TUBE_CURVE_SAMPLES and bad[run_end + 1]:
+			run_end += 1
+		# Anchors are the nearest KNOWN-GOOD samples bracketing this run --
+		# falls back to the run's own (still-bad) raw endpoint only in the
+		# degenerate edge case where the run starts at index 0 or ends at the
+		# very last index (no good sample exists on that side at all).
+		var anchor_before: Vector3 = curve_points[run_start - 1] if run_start > 0 else raw_points[run_start]
+		var anchor_after: Vector3 = curve_points[run_end + 1] if run_end < ROPE_TUBE_CURVE_SAMPLES else raw_points[run_end]
+		@warning_ignore("integer_division")
+		var mid_idx: int = (run_start + run_end) / 2
+		# BUG FOUND VIA THIS FIX'S OWN REPRO TEST, STILL FAILING SUSTAINED ON A
+		# LATER RUN: using ONLY raw_points[mid_idx] (the run's geometric middle
+		# SAMPLE) to find "the violated rect" silently breaks whenever that one
+		# specific sample doesn't itself land inside any obstacle's rect even
+		# though OTHER samples earlier/later in the SAME run do (a short or
+		# lopsided bad run, common right where a run is forming/dissolving at
+		# its edges) -- _find_violated_obstacle_rect() then returns an empty
+		# Rect2, silently falling through to the old, already-broken
+		# nearest-edge-from-a-single-point fallback for the WHOLE run, exactly
+		# reproducing the original bug. Fixed by scanning every raw sample in
+		# the run (not just the middle one) for the first that actually
+		# resolves a violated rect.
+		var violated_rect: Rect2 = Rect2()
+		for scan_idx in range(run_start, run_end + 1):
+			var p2d := Vector2(raw_points[scan_idx].x, raw_points[scan_idx].z)
+			var candidate_rect: Rect2 = _find_violated_obstacle_rect(p2d)
+			if candidate_rect.size.x > 0.0 and candidate_rect.size.y > 0.0:
+				violated_rect = candidate_rect
+				break
+		var waypoints: Array[Vector3] = _corner_route_waypoints(violated_rect, raw_points[mid_idx], anchor_before, anchor_after)
+		var route: Array[Vector3] = [anchor_before]
+		route.append_array(waypoints)
+		route.append(anchor_after)
+		var span_len: int = (run_end + 1) - (run_start - 1)
+		for k in range(run_start, run_end + 1):
+			var local_frac: float = float(k - (run_start - 1)) / float(span_len) if span_len > 0 else 0.0
+			var routed: Vector3 = _route_through_polyline(route, local_frac)
+			if _point_inside_any_obstacle(Vector2(routed.x, routed.z)):
+				var pushed_2d: Vector2 = _nearest_point_outside_obstacles(Vector2(routed.x, routed.z))
+				routed = Vector3(pushed_2d.x, routed.y, pushed_2d.y)
+			curve_points[k] = routed
+		i = run_end + 1
 	return curve_points
+
+
+func _find_violated_obstacle_rect(p: Vector2) -> Rect2:
+	## Returns the grown get_rect_2d() of the FIRST obstacle whose rect
+	## contains `p` (same iteration/margin convention as
+	## _point_inside_any_obstacle()) -- an empty Rect2 (has_area() == false)
+	## if none does. Used by _corner_route_waypoints() to find the SPECIFIC
+	## rect to route around, not just "is some obstacle violated."
+	if not is_inside_tree():
+		return Rect2()
+	for obs in get_tree().get_nodes_in_group("obstacles"):
+		if not obs.has_method("get_rect_2d"):
+			continue
+		var rect: Rect2 = obs.get_rect_2d().grow(ROPE_TUBE_OBSTACLE_MARGIN)
+		if rect.has_point(p):
+			return rect
+	return Rect2()
+
+
+func _rect_nearest_edge_index(p: Vector2, rect: Rect2) -> int:
+	## Which of `rect`'s 4 edges `p` is nearest to -- 0=west(min x),
+	## 1=east(max x), 2=south(min y/z), 3=north(max y/z). Exactly the same
+	## distance comparison _nearest_point_outside_obstacles() already makes,
+	## factored out here as an index rather than a pushed position so
+	## _corner_route_waypoints() can compare which edge TWO different points
+	## would each independently resolve to.
+	var d_min_x: float = p.x - rect.position.x
+	var d_max_x: float = rect.end.x - p.x
+	var d_min_y: float = p.y - rect.position.y
+	var d_max_y: float = rect.end.y - p.y
+	var m: float = minf(minf(d_min_x, d_max_x), minf(d_min_y, d_max_y))
+	if m == d_min_x:
+		return 0
+	elif m == d_max_x:
+		return 1
+	elif m == d_min_y:
+		return 2
+	else:
+		return 3
+
+
+func _rect_shared_corner(rect: Rect2, edge_a: int, edge_b: int) -> Variant:
+	## The single corner vertex shared by two of `rect`'s ADJACENT edges (one
+	## X-axis edge -- 0 or 1 -- and one Z-axis edge -- 2 or 3). Returns null
+	## if edge_a/edge_b are the same edge, or are the two OPPOSITE edges on
+	## the same axis (0&1, or 2&3) -- those don't share a single corner at
+	## all; see _corner_route_waypoints() for the two-corner wrap-around path
+	## that case needs instead.
+	var x_edge: int = -1
+	var z_edge: int = -1
+	for e in [edge_a, edge_b]:
+		if e == 0 or e == 1:
+			x_edge = e
+		else:
+			z_edge = e
+	if x_edge == -1 or z_edge == -1:
+		return null
+	var x: float = rect.position.x if x_edge == 0 else rect.end.x
+	var z: float = rect.position.y if z_edge == 2 else rect.end.y
+	return Vector2(x, z)
+
+
+func _corner_route_waypoints(rect: Rect2, mid_sample: Vector3, anchor_before: Vector3, anchor_after: Vector3) -> Array[Vector3]:
+	## THE ACTUAL FIX for the stray-corner-segment bug (see this function's
+	## own caller, _compute_rope_tube_curve_points(), for the full writeup).
+	## Returns the ordered list of intermediate waypoints (0, 1, or 2 of
+	## them) the caller inserts between anchor_before and anchor_after to
+	## build the full detour polyline -- an empty array means "no detour
+	## needed / fall back to the plain single nearest-edge push."
+	##
+	## Two earlier versions of this function were tried and found
+	## insufficient by this fix's OWN repro test (tests/test_rope_stray_pillar_segment.gd),
+	## re-run repeatedly through each iteration -- kept as notes so they
+	## aren't retried blindly:
+	##  1. Brute-force-testing all 4 of the rect's corners, keeping only ones
+	##     where a densely-sampled straight leg from each anchor tested clear
+	##     of the rect end-to-end. Still reproduced the bug SUSTAINED across
+	##     up to 8 consecutive ticks -- the validation could reject ALL 4
+	##     corners in some real configurations (an anchor very close to the
+	##     rect has a leg to an adjacent corner that grazes near-parallel to
+	##     a face for a long stretch, and floating-point/margin noise in the
+	##     discrete per-leg sample check can flip it to "blocked"), silently
+	##     falling through to the OLD nearest-edge-from-a-single-point
+	##     fallback for the WHOLE run.
+	##  2. Comparing which single EDGE each anchor independently resolves to
+	##     (_rect_nearest_edge_index()) and routing through the ONE corner
+	##     those two edges share (_rect_shared_corner()) when they differ.
+	##     Correct for the common case (anchors on two ADJACENT sides of the
+	##     rect) but still reproduced the bug -- direct logging showed real
+	##     cases where the run's own bracketing anchors land on two OPPOSITE
+	##     sides of the rect (e.g. one west, one east) rather than adjacent
+	##     ones, which _rect_shared_corner() correctly refuses to resolve (no
+	##     single vertex is shared by opposite edges) -- the run silently fell
+	##     through to the same broken single-point fallback for that case.
+	##
+	## The actual fix: handle BOTH cases explicitly.
+	##  - Adjacent edges (one X-edge + one Z-edge, e.g. west+north): route
+	##    through their one shared corner -- unchanged from version 2 above.
+	##  - Opposite edges (west+east, or south+north): the path must wrap
+	##    around ONE ENTIRE SIDE of the rect via its two corners on that
+	##    side, not just one vertex. Which side (e.g., wrap north-of vs.
+	##    south-of the rect when going west<->east) is chosen by checking
+	##    which side `mid_sample` -- a real sample known to be deep inside
+	##    the bad run -- actually sits closer to on the OTHER axis: that's
+	##    concretely where the real obstruction is, so wrapping via that
+	##    side's two corners routes around where the real trouble is, not an
+	##    arbitrary guess.
+	if rect.size.x <= 0.0 or rect.size.y <= 0.0:
+		var pushed_empty: Vector2 = _nearest_point_outside_obstacles(Vector2(mid_sample.x, mid_sample.z))
+		return [Vector3(pushed_empty.x, mid_sample.y, pushed_empty.y)]
+	var a2 := Vector2(anchor_before.x, anchor_before.z)
+	var b2 := Vector2(anchor_after.x, anchor_after.z)
+	var edge_a: int = _rect_nearest_edge_index(a2, rect)
+	var edge_b: int = _rect_nearest_edge_index(b2, rect)
+	if edge_a == edge_b:
+		var pushed_2d: Vector2 = _nearest_point_outside_obstacles(Vector2(mid_sample.x, mid_sample.z))
+		return [Vector3(pushed_2d.x, mid_sample.y, pushed_2d.y)]
+	var corner: Variant = _rect_shared_corner(rect, edge_a, edge_b)
+	if corner != null:
+		var c: Vector2 = corner
+		return [Vector3(c.x, mid_sample.y, c.y)]
+	# OPPOSITE edges -- wrap via two corners on whichever side mid_sample
+	# actually sits closer to on the other axis.
+	var mid_2d := Vector2(mid_sample.x, mid_sample.z)
+	if edge_a == 0 and edge_b == 1 or edge_a == 1 and edge_b == 0:
+		# west<->east: wrap via north (edge 3) or south (edge 2), whichever
+		# mid_sample is nearer to.
+		var to_south: float = mid_2d.y - rect.position.y
+		var to_north: float = rect.end.y - mid_2d.y
+		var z: float = rect.end.y if to_north < to_south else rect.position.y
+		return [Vector3(rect.position.x, mid_sample.y, z), Vector3(rect.end.x, mid_sample.y, z)]
+	else:
+		# south<->north: wrap via west (edge 0) or east (edge 1).
+		var to_west: float = mid_2d.x - rect.position.x
+		var to_east: float = rect.end.x - mid_2d.x
+		var x: float = rect.end.x if to_east < to_west else rect.position.x
+		return [Vector3(x, mid_sample.y, rect.position.y), Vector3(x, mid_sample.y, rect.end.y)]
+
+
+func _route_through_polyline(points: Array[Vector3], local_t: float) -> Vector3:
+	## Generalized N-point version of the old two-leg
+	## _route_through_waypoint() -- interpolates along the whole
+	## points[0]->points[1]->...->points[-1] polyline at local_t (0..1 across
+	## the WHOLE polyline), splitting proportionally by each leg's own real
+	## length so points stay roughly constant-speed along the detour rather
+	## than bunching at any one waypoint. `points` always has at least 2
+	## entries (anchor_before and anchor_after, from this function's only
+	## caller) -- 0-2 extra waypoints from _corner_route_waypoints() may sit
+	## in between.
+	var n: int = points.size()
+	if n < 2:
+		return points[0] if n == 1 else Vector3.ZERO
+	var leg_lengths: Array[float] = []
+	var total: float = 0.0
+	for i in range(n - 1):
+		var d: float = points[i].distance_to(points[i + 1])
+		leg_lengths.append(d)
+		total += d
+	if total < 0.0001:
+		return points[0].lerp(points[n - 1], local_t)
+	var dist_along: float = local_t * total
+	var accumulated: float = 0.0
+	for i in range(n - 1):
+		var leg_len: float = leg_lengths[i]
+		if dist_along <= accumulated + leg_len or i == n - 2:
+			var leg_t: float = ((dist_along - accumulated) / leg_len) if leg_len > 0.0001 else 0.0
+			return points[i].lerp(points[i + 1], clampf(leg_t, 0.0, 1.0))
+		accumulated += leg_len
+	return points[n - 1]
 
 
 func _point_inside_any_obstacle(p: Vector2) -> bool:
