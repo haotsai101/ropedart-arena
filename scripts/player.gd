@@ -417,6 +417,11 @@ const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
 
 var player_mesh: Node3D = null
 var character_id: String = "char_barbarian"
+## "" means "use character_id's own native accessory" -- see
+## GameManager.resolve_headwear_id/resolve_cloth_id, called in _ready() below.
+## Set by GameManager before add_child(player), same as character_id.
+var character_headwear_id: String = ""
+var character_cloth_id: String = ""
 var _mesh_base_scale: Vector3 = Vector3.ONE
 ## The handslot.r BoneAttachment3D itself -- stays visible=true always;
 ## _static_dagger_mesh and the charge-spin visuals (its children) each
@@ -556,18 +561,16 @@ var _net_throwing: bool = false
 func _ready() -> void:
 	add_to_group("players")
 	player_color = PLAYER_COLORS[clamp(player_index, 0, PLAYER_COLORS.size() - 1)]
-	# Load and attach character mesh dynamically
-	var char_def: Dictionary = {}
-	for def in GameManager.CHARACTER_DEFS:
-		if def["id"] == character_id:
-			char_def = def
-			break
-	if char_def.is_empty():
-		char_def = GameManager.CHARACTER_DEFS[0]
-	var char_scene: PackedScene = load(char_def["glb_path"])
-	if char_scene != null:
-		player_mesh = char_scene.instantiate()
-		player_mesh.name = "CharacterMesh"
+	# Build the assembled character mesh (base body + headwear/cloth swap +
+	# color tint) via the shared builder -- see character_builder.gd's header
+	# comment for why swapping parts across characters skins correctly. "" on
+	# either accessory id falls back to character_id's own native pick.
+	var char_def: Dictionary = GameManager.get_character_def(character_id)
+	var resolved_headwear: String = GameManager.resolve_headwear_id(character_id, character_headwear_id)
+	var resolved_cloth: String = GameManager.resolve_cloth_id(character_id, character_cloth_id)
+	player_mesh = CharacterBuilder.build_character_visual(character_id, resolved_headwear, resolved_cloth)
+	character_color = char_def.get("character_color", player_color)
+	if player_mesh != null:
 		# KayKit Adventurers models are realistically human-proportioned
 		# (~2.4-2.5 units tall at scale 1.0) — 0.85 uniform brings them to
 		# roughly the same on-screen height the old fruit characters read at
@@ -576,16 +579,16 @@ func _ready() -> void:
 		_mesh_base_scale = player_mesh.scale
 		add_child(player_mesh)
 		player_mesh.position.y = _mesh_ground_offset
-	# Tint every mesh part with the character color (emission layer, texture
-	# stays visible underneath) — see _player_materials' declaration for why.
-	character_color = char_def.get("character_color", player_color)
+	# Collect references to the override materials CharacterBuilder already
+	# created (one per mesh part, including any swapped-in accessories) --
+	# see _player_materials' declaration for why trip()/spawn-invincibility
+	# need direct handles to these rather than re-deriving them each time.
 	_player_materials.clear()
 	if player_mesh != null:
-		for mi in _find_mesh_instances(player_mesh):
-			var base_mat: Material = mi.get_active_material(0)
-			var mat: StandardMaterial3D = (base_mat.duplicate() as StandardMaterial3D) if base_mat is StandardMaterial3D else StandardMaterial3D.new()
-			mi.set_surface_override_material(0, mat)
-			_player_materials.append(mat)
+		for mi in CharacterBuilder.find_mesh_instances(player_mesh):
+			var mat: StandardMaterial3D = mi.get_active_material(0) as StandardMaterial3D
+			if mat != null:
+				_player_materials.append(mat)
 	_reset_player_tint()
 	_setup_animation()
 	_setup_dagger_in_hand()
@@ -1000,15 +1003,6 @@ func _find_animation_player(node: Node) -> AnimationPlayer:
 		if found != null:
 			return found
 	return null
-
-
-func _find_mesh_instances(node: Node) -> Array[MeshInstance3D]:
-	var found: Array[MeshInstance3D] = []
-	if node is MeshInstance3D:
-		found.append(node)
-	for child in node.get_children():
-		found.append_array(_find_mesh_instances(child))
-	return found
 
 
 func _apply_player_tint(color: Color, transparency: BaseMaterial3D.Transparency = BaseMaterial3D.TRANSPARENCY_DISABLED) -> void:
