@@ -1857,9 +1857,35 @@ func _update_physics_rope_anchors() -> void:
 	# ahead of the dart's own actual travel than ROPE_UNSPOOL_SLACK, no matter
 	# how fast the joint solver's own emergent equilibrium would otherwise
 	# resolve the bunched spawn's slack.
+	#
+	# CORNER-WRAP FIX (see this session's CLAUDE.md entry): `real_dist` used
+	# to be a naive straight-line `hand_pos.distance_to(tip_pos)` -- correct
+	# only when nothing sits between the hand and the dart. Whenever a real
+	# obstacle corner is between them (the dart anchored on the far side of a
+	# pillar from the player), the ACTUAL rope has to travel further than
+	# that beeline to reach around the corner, so the beeline systematically
+	# UNDER-counts how much of the chain's fixed DART_ROPE_LENGTH capacity is
+	# really in use. That undercount fed `max_reach_from_hand` (a sphere
+	# clamp centered on the HAND) too small a radius, which forcibly yanked
+	# the non-contact tail segments -- the ones between the corner and the
+	# anchor, which legitimately need to be far from the hand along the
+	# wrapped path -- back toward the hand every tick, fighting the pin
+	# joint that's simultaneously dragging the tip anchor to the fixed real
+	# dart position. That tug-of-war is what read as a sharp zigzag/hook fold
+	# right at the corner once the player pushed far enough around it.
+	# `_rope_chain_current_path_length_2d()` sums the REAL, already-simulated
+	# chain's own consecutive control-point distances (hand -> every dynamic
+	# segment, in joint order -> tip) instead of guessing at the corner's
+	# geometry -- a segment genuinely resting against real obstacle contact
+	# is exactly where the physics solver actually put it, wrap included, so
+	# this is reading real physics state, not computing a synthetic path. In
+	# the unobstructed common case this is numerically almost identical to
+	# the old beeline (the chain settles close to the straight line, bounded
+	# by ROPE_TAUT_PERP_RADIUS), so this is not expected to change behavior
+	# when there's no obstacle in the way.
 	var hand_2d := Vector2(hand_pos.x, hand_pos.z)
 	var tip_2d := Vector2(tip_pos.x, tip_pos.z)
-	var real_dist: float = hand_pos.distance_to(tip_pos)
+	var real_dist: float = _rope_chain_current_path_length_2d(hand_2d, tip_2d)
 	var budget: float = minf(real_dist + ROPE_UNSPOOL_SLACK, DART_ROPE_LENGTH)
 	for seg in _physics_rope_segments:
 		seg.hand_pos_2d = hand_2d
@@ -1869,6 +1895,57 @@ func _update_physics_rope_anchors() -> void:
 		# distance from the whole hand-to-tip LINE, not just the hand point.
 		seg.tip_pos_2d = tip_2d
 		seg.max_perp_from_line = ROPE_TAUT_PERP_RADIUS
+
+
+func _rope_chain_current_path_length_2d(hand_2d: Vector2, tip_2d: Vector2) -> float:
+	## Real (not beeline) 2D length of the currently-simulated physics chain:
+	## sums consecutive distances hand -> seg[0] -> seg[1] -> ... -> tip, in
+	## the same order _spawn_physics_rope() jointed them, using every dynamic
+	## segment's OWN CURRENTLY RESOLVED global position (one physics tick
+	## stale relative to hand_2d/tip_2d, same lag already accepted throughout
+	## this system -- see e.g. rope_segment_body.gd's contact_count() doc
+	## comment). Falls back to the plain beeline distance before the chain
+	## exists yet (segments empty) so callers don't have to special-case that.
+	## See _update_physics_rope_anchors()'s own CORNER-WRAP FIX comment for
+	## why this replaced a naive `hand_2d.distance_to(tip_2d)` call -- a
+	## segment genuinely resting against real obstacle contact is exactly
+	## where the physics solver put it, wrap included, so this reads real
+	## physics state rather than computing any synthetic path/route.
+	if _physics_rope_segments.is_empty():
+		return hand_2d.distance_to(tip_2d)
+	var total: float = 0.0
+	var prev: Vector2 = hand_2d
+	for seg in _physics_rope_segments:
+		var p3: Vector3 = (seg as RigidBody3D).global_position
+		var p2d := Vector2(p3.x, p3.z)
+		total += prev.distance_to(p2d)
+		prev = p2d
+	total += prev.distance_to(tip_2d)
+	return total
+
+
+func _rope_chain_rest_length_2d(tip_2d: Vector2) -> float:
+	## Companion to _rope_chain_current_path_length_2d() above, used by
+	## _clamp_to_rope_leash(): the real chain's own already-committed length
+	## from its FIRST dynamic segment (the link nearest the hand) through
+	## every remaining segment to the tip/anchor -- i.e. how much of the
+	## chain's fixed DART_ROPE_LENGTH capacity is already spent on whatever's
+	## happening between the first segment and the dart (a corner wrap,
+	## typically), leaving the rest as budget for the hand-to-first-segment
+	## span specifically. Deliberately excludes the hand->seg[0] leg (the
+	## caller supplies its own live hand position for that part). Returns 0.0
+	## if there's no chain yet.
+	if _physics_rope_segments.is_empty():
+		return 0.0
+	var total: float = 0.0
+	var prev_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
+	for i in range(1, _physics_rope_segments.size()):
+		var p3: Vector3 = (_physics_rope_segments[i] as RigidBody3D).global_position
+		total += Vector2(prev_pos.x, prev_pos.z).distance_to(Vector2(p3.x, p3.z))
+		prev_pos = p3
+	var prev_2d := Vector2(prev_pos.x, prev_pos.z)
+	total += prev_2d.distance_to(tip_2d)
+	return total
 
 
 func _free_physics_rope() -> void:
@@ -2096,13 +2173,59 @@ func _clamp_to_rope_leash() -> void:
 	## Once the rope dart is anchored, its rope is a fixed-length physical
 	## tether (see rope_dart.gd's class doc comment) -- the owner shouldn't be
 	## able to walk further from the anchor point than the rope allows.
-	## Pulls the player back onto the circle of radius DART_ROPE_LENGTH around
-	## the anchor instead of blocking movement outright, so running at an
-	## angle slides along the tether's edge rather than just stopping dead.
+	## Pulls the player back instead of blocking movement outright, so running
+	## at an angle slides along the tether's edge rather than just stopping
+	## dead.
 	if dart == null or dart.state != DART_STATE_ANCHORED:
 		return
 	var anchor: Vector2 = dart.head_2d
 	var pos: Vector2 = get_pos_2d()
+
+	## CORNER-WRAP FIX (see this session's CLAUDE.md entry -- real user screen
+	## recording: wrapping around a pillar corner read clean until the player
+	## reached max leash range and kept pushing further/around, at which
+	## point the rope visibly folded/hooked right at the corner). Root cause:
+	## this used to clamp the player onto a plain circle of radius
+	## DART_ROPE_LENGTH around the ANCHOR -- a straight-line (beeline) bound.
+	## When a real obstacle corner sits between the player and the anchor,
+	## the TRUE physical tether has to travel further than that beeline to
+	## reach around the corner, so the beeline circle is strictly too
+	## permissive: it let the player keep walking outward well past the
+	## point where the real, already-wrapped chain had used up its entire
+	## fixed length, forcing the physics solver to fight an impossible
+	## stretch right at the corner contact -- exactly the reported fold.
+	##
+	## Fix: pivot the clamp on the chain's own FIRST dynamic segment (the
+	## link nearest the hand, always topologically adjacent to it regardless
+	## of how many corners are involved) instead of the anchor, with the
+	## clamp radius shrunk by _rope_chain_rest_length_2d() -- the REAL,
+	## already-simulated remaining chain length from that first segment to
+	## the tip, wrap included. This reads real physics state (not a computed
+	## corner/route) the same way _rope_chain_current_path_length_2d() does
+	## for the growing-leash budget above -- a segment resting against real
+	## obstacle contact is exactly where the solver actually put it. By the
+	## triangle inequality, satisfying this clamp always also satisfies the
+	## old plain anchor-circle bound, so the fallback below never fights it;
+	## it only ever adds a stricter, wrap-aware bound on top.
+	if _physics_rope_active and not _physics_rope_segments.is_empty():
+		var first_seg_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
+		var first_2d := Vector2(first_seg_pos.x, first_seg_pos.z)
+		var rest_len: float = _rope_chain_rest_length_2d(anchor)
+		var max_from_first: float = maxf(DART_ROPE_LENGTH - rest_len, 0.0)
+		var offset0: Vector2 = pos - first_2d
+		if offset0.length() > max_from_first:
+			var dir0: Vector2 = offset0.normalized() if offset0.length() > 0.0001 else Vector2.ZERO
+			var clamped0: Vector2 = first_2d + dir0 * max_from_first
+			global_position.x = clamped0.x
+			global_position.z = clamped0.y
+			pos = clamped0
+
+	## Fallback safety net: never let the player exceed a plain straight-line
+	## DART_ROPE_LENGTH from the anchor either -- covers the tick(s) before
+	## the physics chain exists/settles (e.g. right at throw-instant), and
+	## acts as a hard backstop. Always at least as permissive as the
+	## wrap-aware clamp above (see its own comment), so this never overrides
+	## a position that clamp already committed to.
 	var offset: Vector2 = pos - anchor
 	if offset.length() <= DART_ROPE_LENGTH:
 		return

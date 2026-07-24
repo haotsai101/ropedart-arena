@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://d5x6y7z8a9b0c"]
+
+[ext_resource type="Script" path="res://tests/test_rope_leash_corner_wrap.gd" id="1_leash"]
+
+[node name="TestRopeLeashCornerWrap" type="Node"]
+script = ExtResource("1_leash")
