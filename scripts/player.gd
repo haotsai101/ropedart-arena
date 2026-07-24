@@ -404,6 +404,100 @@ const ROPE_TUBE_CURVE_SAMPLES: int = 48
 ## ~6 simultaneous darts in a full match).
 const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
 
+## --- ROUND 4 "ALWAYS TAUT + VISIBLE COIL" FIX (per direct user feedback with
+## a screenshot: "I'm expecting the tension of the rope to ALWAYS be tight...
+## The rope should be coiling and uncoiling as the distance between the dart
+## and character changes" -- the screenshot showed an obvious S-curve/wavy
+## line between hand and dart despite round 3's ROPE_TAUT_PERP_RADIUS clamp
+## already being active) ---
+##
+## ROOT CAUSE, confirmed by re-reading round 3's own numbers rather than
+## re-measuring from scratch: ROPE_TAUT_PERP_RADIUS only bounds how far EACH
+## INDIVIDUAL segment may bow off the straight hand-to-tip line (a thin tube
+## around it, +-0.3 units) -- it says nothing about where WITHIN that tube
+## different segments land relative to EACH OTHER. The chain's total physical
+## length is always DART_ROPE_LENGTH (8.0) regardless of the real span, so
+## whenever real_dist < 8.0 (the common case -- an anchored dart a few units
+## away is typical, and the growing-leash clamp only shrinks the budget
+## toward real_dist, never removes the excess capsule length), several units
+## of "must go somewhere" rope have to fold into that +-0.3 tube. Multiple
+## segments each independently settling to different points/sides within that
+## tolerance is EXACTLY what an S-curve is -- round 3's own fix bounded the
+## bulge's SIZE but never addressed its SHAPE. Shrinking the tolerance further
+## was already tried and rejected in round 3 (concentrates the same excess
+## into a smaller space, doesn't remove it) -- not retried here.
+##
+## FIX: decouple what gets RENDERED from the raw physics segment positions
+## for the common (unobstructed) case, instead of interpolating a curve
+## through them. _update_rope_tube_mesh() now checks, every frame, whether a
+## straight ray from the hand to the tip is obstructed by real obstacle
+## geometry (_rope_line_obstructed(), a plain PhysicsDirectSpaceState3D
+## raycast against ROPE_OBSTACLE_LAYER_BIT -- the same dedicated layer bit the
+## physics segments themselves already collide against, see that const's own
+## comment):
+##  - UNOBSTRUCTED (the common case): render a literal straight line from hand
+##    to tip (_build_taut_rope_control_points()) -- zero reliance on the
+##    physics chain's own emergent, clamp-bounded-but-still-wiggly shape at
+##    all. Any excess length (DART_ROPE_LENGTH - real_dist) is diverted into a
+##    small flat spiral (in the SAME horizontal XZ plane the whole rope+dart
+##    system already lives in, per this game's 2D-gameplay-math invariant --
+##    this is rendering-only geometry, not new gameplay math) at the hand end,
+##    sized continuously from real_dist (see ROPE_COIL_TURN_ARC_LENGTH/
+##    ROPE_COIL_RADIUS_PER_EXCESS below) -- shrinking toward zero as real_dist
+##    approaches DART_ROPE_LENGTH (rope fully paid out, no coil at all), and
+##    growing as the player walks closer to an anchored dart. This is the
+##    literal "coiling and uncoiling... as the distance... changes" the user
+##    asked for, reusing the same closed-form idle-coil-style spiral math as
+##    _render_rope_coiled() (same shape family, different anchor/plane/sizing)
+##    rather than inventing a new visual language for it.
+##  - OBSTRUCTED (a pillar/tree/cactus sits on the straight hand-to-tip line):
+##    falls back to exactly the PRE-round-4 behavior -- interpolate through
+##    the raw physics segment positions, unchanged -- since draping over an
+##    obstacle is something only Godot's own real collision solver can do
+##    correctly (see the ROPE_PHYSICS_SEGMENTS' own doc comment on why a
+##    scripted/hand-computed bend point was already tried and rejected
+##    entirely, twice, before the physics-chain approach was adopted). The
+##    underlying RigidBody3D chain, its capsule collision shapes, and every
+##    existing clamp (Y-lock, growing-leash, tension) are COMPLETELY UNCHANGED
+##    by this fix -- only which positions get fed into the tube mesh's control
+##    points differs, and only in the unobstructed case.
+##
+## Known, disclosed limitation: switching between the two rendering modes at
+## the obstruction boundary (e.g. walking to the very edge of a pillar's
+## silhouette from the dart) is an instant cut, not a cross-fade/blend -- the
+## tube can visibly "pop" between straight-with-coil and raw-chain-drape right
+## at that boundary. Out of scope for this round (the user's ask was about
+## tautness/coiling, not this transition specifically) but flagged here as the
+## first place to look if a future report calls out a visible snap while
+## walking around an obstacle's edge.
+const ROPE_COIL_MAX_TURNS: float = 2.25
+## Arc length of "excess" rope consumed per full coil turn -- controls how
+## many turns are visible for a given amount of excess (turns = excess /
+## this, capped at ROPE_COIL_MAX_TURNS). Tuned so a typical mid-range anchored
+## dart (a few units of excess) reads as a handful of loops, not a single
+## nub or an unreadable tangle.
+const ROPE_COIL_TURN_ARC_LENGTH: float = 1.1
+## How much the coil's outer radius grows per unit of excess length, before
+## being capped at ROPE_COIL_MAX_RADIUS_PHYS -- separate consts from
+## ROPE_COIL_RADIUS_INNER/OUTER above (the idle arm coil) since this is a
+## different visual (floating at the hand anchor in the flat gameplay plane,
+## not wrapped around the forearm bone) with no reason to share the same
+## calibrated size.
+const ROPE_COIL_RADIUS_PER_EXCESS: float = 0.05
+const ROPE_COIL_MAX_RADIUS_PHYS: float = 0.3
+const ROPE_COIL_INNER_RADIUS_FRACTION: float = 0.35
+## Below this much excess, skip the coil entirely (render a pure 2-point
+## straight line) -- avoids generating a visually-meaningless sliver of spiral
+## right as the rope approaches fully paid out, and guarantees "no coil at
+## all" at true max range rather than an always-present quarter-turn nub.
+const ROPE_COIL_MIN_EXCESS_TO_SHOW: float = 0.05
+## Points sampled along the coil's own spiral polyline before being handed to
+## the shared Catmull-Rom smoothing pass in _update_rope_tube_mesh() -- a
+## separate knob from ROPE_TUBE_CURVE_SAMPLES (the FINAL smoothed sample
+## count), since this only needs enough raw control points to describe the
+## spiral's own shape, not final on-screen smoothness.
+const ROPE_COIL_SAMPLE_COUNT: int = 14
+
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
 ## global_position.y sits at the physics capsule's CENTER (spawn markers add
@@ -1877,19 +1971,106 @@ func _free_physics_rope() -> void:
 		_physics_rope_tube_mesh.visible = false
 
 
+func _rope_line_obstructed(from3: Vector3, to3: Vector3) -> bool:
+	## Plain PhysicsDirectSpaceState3D raycast, masked to ROPE_OBSTACLE_LAYER_BIT
+	## ONLY -- the same dedicated layer bit arena_obstacle.gd tags every pillar/
+	## tree/cactus with and the physics rope segments themselves already
+	## collide against (see that const's own comment for the one-directional
+	## layer/mask design). Nothing else -- players, the ground, the dart head
+	## -- carries this bit, so this cleanly answers "is there real obstacle
+	## geometry between the hand and the tip" with no need to exclude anything
+	## by RID (unlike rope_dart.gd's own obstacle raycast, which must exclude
+	## every player body since its query runs on the default/broader layer).
+	var space_state: PhysicsDirectSpaceState3D = get_world_3d().direct_space_state
+	var query := PhysicsRayQueryParameters3D.create(from3, to3)
+	query.collision_mask = ROPE_OBSTACLE_LAYER_BIT
+	var result: Dictionary = space_state.intersect_ray(query)
+	return not result.is_empty()
+
+
+func _build_taut_rope_control_points(hand_pos: Vector3, tip_pos: Vector3) -> Array[Vector3]:
+	## Unobstructed rendering path -- see this file's ROUND 4 "ALWAYS TAUT +
+	## VISIBLE COIL" doc comment (above the ROPE_COIL_* consts) for the full
+	## root-cause writeup. Returns just [hand_pos, tip_pos] (a literal straight
+	## line) when there's no meaningful excess to show; otherwise prepends a
+	## flat spiral -- in the SAME horizontal XZ plane both hand_pos and tip_pos
+	## already share (both are always at the dart's fixed plane_y) -- that
+	## consumes the excess length, ending exactly ON the hand->tip ray so it
+	## blends into the straight lead line without an abrupt direction jump.
+	var real_dist: float = hand_pos.distance_to(tip_pos)
+	var points: Array[Vector3] = [hand_pos]
+	var excess: float = maxf(DART_ROPE_LENGTH - real_dist, 0.0)
+	if excess > ROPE_COIL_MIN_EXCESS_TO_SHOW and real_dist > 0.01:
+		var dir: Vector3 = (tip_pos - hand_pos) / real_dist
+		# Perpendicular axis in the same flat plane -- both dir and perp have
+		# zero Y component, so every generated point stays exactly on the
+		# plane both endpoints already share; no new vertical gameplay math,
+		# purely a rendering-space basis.
+		var perp: Vector3 = Vector3(-dir.z, 0.0, dir.x)
+		var turns: float = clampf(excess / ROPE_COIL_TURN_ARC_LENGTH, 0.0, ROPE_COIL_MAX_TURNS)
+		var outer_radius: float = clampf(excess * ROPE_COIL_RADIUS_PER_EXCESS, 0.0, ROPE_COIL_MAX_RADIUS_PHYS)
+		# Never let the coil's own radius reach out past (or even close to)
+		# the tip itself -- only relevant on a very short real_dist with a lot
+		# of excess (e.g. right after a near-point-blank throw).
+		outer_radius = minf(outer_radius, real_dist * 0.4)
+		var inner_radius: float = outer_radius * ROPE_COIL_INNER_RADIUS_FRACTION
+		# BUGFIX (found during round-4 verification, not shipped as originally
+		# written): angle(t) is now built BACKWARD from a fixed end angle of
+		# PI/2 (`angle(t) = PI/2 + (t-1)*turns*TAU`) so the LAST spiral point
+		# (t=1) always lands at exactly `hand_pos + dir * outer_radius` -- a
+		# point already ON the straight hand->tip ray -- for ANY `turns`
+		# value, not just when `turns` happens to be an integer. The original
+		# "+0.25 turns, angle = t*total_turns*TAU" version only produced an
+		# exact on-ray endpoint when `turns` (a continuously-varying quantity
+		# driven by `excess`, essentially never an integer) had a zero
+		# fractional part -- verified via a temporary probe measuring the
+		# rendered curve's own perpendicular deviation from the hand-to-tip
+		# line beyond the coil's own radius: the old version left a real,
+		# non-negligible ~0.1-0.2 unit residual bow right where the coil met
+		# the "straight" segment (e.g. one sample: real_dist=5.169,
+		# coil_r=0.142, deviation measured 0.099 units beyond that radius) --
+		# a smaller-scale echo of the exact wavy-line problem this whole round
+		# is meant to fix, just localized to the coil/line transition instead
+		# of spread along the whole span. A short straight "lead-in" point is
+		# also appended right after the spiral (see LEAD_IN below) so the
+		# Catmull-Rom curve's tangent context for the long final span to
+		# tip_pos is anchored by two colinear points, not just one, further
+		# damping any residual curvature from the spiral's own local tangent.
+		const LEAD_IN: float = 0.06
+		for i in range(1, ROPE_COIL_SAMPLE_COUNT + 1):
+			var t: float = float(i) / float(ROPE_COIL_SAMPLE_COUNT)
+			var angle: float = PI * 0.5 + (t - 1.0) * turns * TAU
+			var radius: float = lerp(inner_radius, outer_radius, t)
+			points.append(hand_pos + perp * (cos(angle) * radius) + dir * (sin(angle) * radius))
+		points.append(hand_pos + dir * (outer_radius + LEAD_IN))
+	points.append(tip_pos)
+	return points
+
+
 func _update_rope_tube_mesh() -> void:
 	## Per an explicit follow-up user request ("Can the rope be rope instead
 	## of segments of bars?"), the thrown rope's VISUAL is decoupled from the
 	## discrete RigidBody3D collision segments entirely: this rebuilds one
 	## continuous ArrayMesh every _process() frame the physics chain is
-	## active, tracing a smooth Catmull-Rom curve through the control points
-	## [hand anchor, every dynamic segment's center, tip anchor] (in that
-	## order -- matches the actual joint chain order from
-	## _spawn_physics_rope()) and extruding a round tube of ROPE_RADIUS along
-	## it. The underlying RigidBody3D segments and their capsule collision
-	## shapes are completely unchanged by this -- they still exist, still
-	## collide with real obstacle geometry, and still drive this curve's
-	## shape; only what gets DRAWN from their positions changed.
+	## active, tracing a smooth Catmull-Rom curve through a set of control
+	## points and extruding a round tube of ROPE_RADIUS along it. The
+	## underlying RigidBody3D segments and their capsule collision shapes are
+	## completely unchanged by any of this -- they still exist and still
+	## collide with real obstacle geometry.
+	##
+	## ROUND 4 UPDATE: which control points get used now depends on whether
+	## the straight hand-to-tip line is obstructed (see
+	## _rope_line_obstructed()/_build_taut_rope_control_points() and this
+	## file's ROUND 4 "ALWAYS TAUT + VISIBLE COIL" doc comment above the
+	## ROPE_COIL_* consts for the full root-cause writeup) -- previously this
+	## always used [hand anchor, every dynamic segment's center, tip anchor]
+	## (the raw physics chain order from _spawn_physics_rope()) unconditionally,
+	## which is what produced a visible S-curve/wavy bulge whenever the real
+	## hand-to-dart distance was less than the chain's fixed DART_ROPE_LENGTH
+	## capacity (the common case). That raw-chain path is now used ONLY when a
+	## real obstacle sits on the straight line (so draping still works,
+	## unchanged); otherwise a literal straight line + hand-side coil is used
+	## instead.
 	if _physics_rope_root == null or _physics_rope_hand_anchor == null or _physics_rope_tip_anchor == null:
 		return
 	if _physics_rope_segments.size() != ROPE_PHYSICS_SEGMENTS:
@@ -1941,10 +2122,26 @@ func _update_rope_tube_mesh() -> void:
 		add_child(mi)
 		_physics_rope_tube_mesh = mi
 
-	var control_points: Array[Vector3] = [_physics_rope_hand_anchor.global_position]
-	for seg in _physics_rope_segments:
-		control_points.append((seg as RigidBody3D).global_position)
-	control_points.append(_physics_rope_tip_anchor.global_position)
+	var hand_pos: Vector3 = _physics_rope_hand_anchor.global_position
+	var tip_pos: Vector3 = _physics_rope_tip_anchor.global_position
+	var real_dist: float = hand_pos.distance_to(tip_pos)
+	var obstructed: bool = real_dist > 0.01 and _rope_line_obstructed(hand_pos, tip_pos)
+	var control_points: Array[Vector3]
+	if obstructed:
+		# OBSTRUCTED: unchanged pre-round-4 behavior -- trace the raw physics
+		# chain's own emergent shape (draping over the obstacle is Godot's own
+		# collision solver's job, not anything computed here). See the ROUND 4
+		# "ALWAYS TAUT + VISIBLE COIL" doc comment above the ROPE_COIL_* consts
+		# for the full writeup.
+		control_points = [hand_pos]
+		for seg in _physics_rope_segments:
+			control_points.append((seg as RigidBody3D).global_position)
+		control_points.append(tip_pos)
+	else:
+		# UNOBSTRUCTED (the common case): genuinely straight taut line, excess
+		# length diverted into a coil at the hand instead of bowing along the
+		# line -- see _build_taut_rope_control_points().
+		control_points = _build_taut_rope_control_points(hand_pos, tip_pos)
 	var n: int = control_points.size()
 
 	# Sample a Catmull-Rom curve through control_points at ROPE_TUBE_CURVE_SAMPLES
