@@ -756,6 +756,15 @@ var _recall_anim_timer: float = 0.0
 ## ROPE_LENGTH holds noticeably longer), matching the real weapon behavior
 ## instead of a fixed timer.
 const DART_STATE_FLYING: int = 0
+## Mirrors rope_dart.gd's State.RECALLING ordinal -- same hand-synced
+## duplication as DART_STATE_ANCHORED/DART_STATE_FLYING above. Used by
+## _physics_process()'s recall-anim sync check so the Enter->Push->Exit
+## sequence and _is_recalling stay in step with the dart's REAL state
+## regardless of what triggered RECALLING -- an explicit throw-again press
+## (which already sets these directly) or rope_dart.gd's own walk-to-pickup
+## path (see rope_dart.gd's ANCHORED branch), which transitions the dart into
+## RECALLING internally with no player.gd involvement at all.
+const DART_STATE_RECALLING: int = 2
 
 func _setup_animation() -> void:
 	## Attach a fresh AnimationPlayer next to this character's Skeleton3D and
@@ -1245,6 +1254,20 @@ func _physics_process(delta: float) -> void:
 	# physics tick (not _process()) -- unconditional/no-op-safe regardless of
 	# state below, see _update_physics_rope_anchors()'s own comment.
 	_update_physics_rope_anchors()
+	# Keep _is_recalling / the recall Enter->Push->Exit sequence in sync with
+	# the dart's OWN state, not just the explicit throw-again button press
+	# further below -- rope_dart.gd's walk-to-pickup path now also transitions
+	# ANCHORED -> RECALLING internally (see DART_STATE_RECALLING's comment),
+	# and this is what makes that path play the same reel-in animation
+	# instead of silently retracting with no arm motion. A one-tick lag
+	# behind the actual dart transition (this runs before the throw-again
+	# branch fires on a fresh manual press, and before rope_dart.gd's own
+	# _physics_process on a walk-to-pickup trigger) is inaudible/invisible at
+	# 60Hz and not worth fighting node-processing order for.
+	if dart != null and is_instance_valid(dart) and dart.state == DART_STATE_RECALLING and not _is_recalling:
+		_is_recalling = true
+		_recall_anim_phase = ThrowAnimPhase.ENTER
+		_recall_anim_timer = 0.0
 	if is_dead:
 		_is_charging = false
 		return
@@ -1895,6 +1918,28 @@ func _update_physics_rope_anchors() -> void:
 		# distance from the whole hand-to-tip LINE, not just the hand point.
 		seg.tip_pos_2d = tip_2d
 		seg.max_perp_from_line = ROPE_TAUT_PERP_RADIUS
+
+
+func get_rope_polyline_2d() -> Array[Vector2]:
+	## Ordered hand -> tip control points of the CURRENTLY SIMULATED physics
+	## rope chain -- the exact same points _rope_chain_current_path_length_2d()
+	## sums and _update_rope_tube_mesh() draws a curve through -- exposed for
+	## rope_dart.gd's own use during RECALLING (see its
+	## _get_full_rope_path_2d()), so a returning dart can retrace the rope's
+	## real live shape (obstacle wrap included) instead of cutting a straight
+	## line back to wherever the owner currently stands. Deliberately does
+	## NOT include the tip/dart's own position -- rope_dart.gd already knows
+	## its own head_2d with zero extra lag (this function's own tip anchor,
+	## by contrast, tracks the dart one physics tick behind), so callers that
+	## want the full hand -> ... -> dart path append their own current
+	## position themselves.
+	var points: Array[Vector2] = []
+	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
+	points.append(Vector2(hand_pos.x, hand_pos.z))
+	for seg in _physics_rope_segments:
+		var p3: Vector3 = (seg as RigidBody3D).global_position
+		points.append(Vector2(p3.x, p3.z))
+	return points
 
 
 func _rope_chain_current_path_length_2d(hand_2d: Vector2, tip_2d: Vector2) -> float:

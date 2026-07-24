@@ -15,7 +15,18 @@ extends Node3D
 ## already collide with) to detect pillars/trees/cacti -- explicitly
 ## excluding every player body, so the rope/dart always passes through
 ## characters. A hit ANCHORS the dart there, stuck until the owner recalls
-## it or walks over it (pickup_radius) -- same as before.
+## it or walks over it (pickup_radius).
+##
+## WALK-TO-PICKUP RETRIEVAL FIX (see this session's CLAUDE.md entry): walking
+## within pickup_radius of an ANCHORED dart used to insta-pick-up it on the
+## spot, regardless of the rope's own current shape -- fine when unobstructed,
+## but visibly wrong once the rope was wrapped around an obstacle corner (the
+## rope would just vanish instead of visibly retracting). Walking into range
+## now calls recall() instead, same as pressing throw again -- RECALLING then
+## retraces the dart along the rope's REAL, currently-simulated control-point
+## path (see _get_full_rope_path_2d()/_advance_along_path_2d()) rather than a
+## straight line, and only finishes once the real remaining path length (not
+## just straight-line proximity) drops below pickup_radius.
 ##
 ## The rope has a fixed length (ROPE_LENGTH, 4x a character's height) rather
 ## than growing with charge power -- charge now scales travel_speed only.
@@ -111,6 +122,11 @@ var plane_y: float = 1.0
 ## orientation fixed once stuck, instead of continuously re-aiming at
 ## wherever the owner currently stands.
 var _anchor_dir_2d: Vector2 = Vector2.ZERO
+## Total real path distance consumed so far during the CURRENT RECALLING run
+## -- see recall()/_advance_recalling()'s own doc comment for why this is a
+## monotonic ACCUMULATOR (reset to 0.0 by recall()) rather than something
+## re-derived by measuring "how much rope is left" fresh every tick.
+var _recall_travel_dist: float = 0.0
 
 @onready var head_mesh: Node3D = $Head
 
@@ -162,12 +178,14 @@ func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) 
 	_render()
 
 
-## Called by the owner (pressing throw again while the dart is out) to pull
-## it back regardless of whether it's still flying or already anchored.
-## No-op while already recalling.
+## Called by the owner (pressing throw again while the dart is out, or
+## rope_dart.gd's own ANCHORED walk-to-pickup branch below) to pull it back
+## regardless of whether it's still flying or already anchored. No-op while
+## already recalling.
 func recall() -> void:
 	if state != State.RECALLING:
 		state = State.RECALLING
+		_recall_travel_dist = 0.0
 
 
 func _physics_process(delta: float) -> void:
@@ -213,18 +231,131 @@ func _physics_process(delta: float) -> void:
 					_anchor()
 
 		State.ANCHORED:
+			# ROUND (walk-to-pickup retrieval fix, see CLAUDE.md): walking up to
+			# an anchored dart used to insta-pick-up here regardless of the
+			# rope's own current shape -- see the class doc comment's own note
+			# on this. Routing through recall() instead means the RECALLING
+			# branch below (now wrap-aware) decides when the pickup actually
+			# completes, based on the REAL remaining rope path length, not just
+			# straight-line proximity to the dart's ground position.
 			if owner_player.get_pos_2d().distance_to(head_2d) < pickup_radius:
-				_pick_up()
-				return
+				recall()
 
 		State.RECALLING:
-			var to_owner: Vector2 = owner_player.get_pos_2d() - head_2d
-			if to_owner.length() < pickup_radius:
+			# ROUND (walk-to-pickup retrieval fix): the dart head used to travel
+			# in a straight line toward wherever the owner currently stands,
+			# ignoring obstacles -- fine when the rope was already straight, but
+			# visibly wrong once the rope was wrapped around a pillar corner
+			# (see this session's CLAUDE.md entry): the dart would cut straight
+			# back through the pillar instead of retracing the rope's own real,
+			# currently-simulated shape. See _advance_recalling()'s own doc
+			# comment for why this samples the LIVE polyline against a
+			# monotonic travel-distance budget rather than re-measuring "how
+			# much rope is left" fresh every tick (which was tried first and
+			# measured, via a temporary probe, to never reliably converge).
+			if _advance_recalling(delta):
 				_pick_up()
 				return
-			head_2d += to_owner.normalized() * recall_speed * delta
 
 	_render()
+
+
+func _advance_recalling(delta: float) -> bool:
+	## Moves head_2d toward the hand along the rope's LIVE control-point
+	## polyline (player.gd's get_rope_polyline_2d() -- hand anchor + every
+	## dynamic segment, in joint order; the same points the tube mesh and
+	## _rope_chain_current_path_length_2d() already use), instead of a
+	## straight line toward wherever the owner currently stands. Returns true
+	## once the dart is close enough to the hand to complete the pickup.
+	##
+	## FIRST ATTEMPT (rejected, kept as a note): re-measuring "how much rope
+	## is left" from scratch every tick -- total length of [hand, ...segments,
+	## head_2d] with head_2d appended fresh each call -- and consuming a fixed
+	## step of that fresh measurement. Verified via a temporary probe (dart
+	## position vs. the live polyline, logged across a real corner-wrap
+	## retrieval) to NEVER RELIABLY CONVERGE: head_2d wandered in a loose
+	## orbit near the anchor for a full 300-tick/5s run without making net
+	## progress toward the hand, and briefly clipped ~0.15 units into the
+	## pillar's own rect. Root cause: appending head_2d as the path's own tip
+	## makes the "remaining length" measurement self-referential with
+	## player.gd's TENSION CLAMP (rope_segment_body.gd's max_perp_from_line,
+	## driven every tick from _get_rope_tip_target() == this dart's own
+	## current position) -- as head_2d moves, the clamp's target hand-to-tip
+	## LINE moves with it, continuously re-centering nearby segments onto a
+	## fresh, differently-angled line rather than settling. That's fine and
+	## expected as a SHAPE change (the chain legitimately straightens as the
+	## tip nears the hand), but it means the fresh-measured "remaining length"
+	## is not a reliable monotonic progress signal on its own -- it can stay
+	## flat or even grow tick to tick while the shape churns.
+	##
+	## THE ACTUAL FIX: decouple "how far the dart has traveled" from "how long
+	## the live chain currently measures." `_recall_travel_dist` (reset to 0.0
+	## by recall()) is a plain accumulator, incremented by recall_speed*delta
+	## every tick regardless of what the chain's shape does -- a monotonic,
+	## never-reversing progress signal. Each tick, sample the point that is
+	## `_recall_travel_dist` real-path-distance from the TIP end of the FRESH
+	## live polyline (hand -> every segment, no head_2d appended -- see
+	## _sample_point_from_tip_2d()). Once `_recall_travel_dist` exceeds even
+	## the longest the live chain could possibly measure (bounded by
+	## DART_ROPE_LENGTH, ~0.33s at recall_speed=24), sampling always lands on
+	## the hand end regardless of shape, so this is guaranteed to terminate in
+	## bounded time no matter how the chain reshapes in between -- verified via
+	## the same probe (see this session's final report for the re-measured
+	## numbers).
+	_recall_travel_dist += recall_speed * delta
+	var hand_path: Array[Vector2] = _get_hand_rope_path_2d()
+	var new_head: Vector2 = _sample_point_from_tip_2d(hand_path, _recall_travel_dist)
+	head_2d = new_head
+	return new_head.distance_to(hand_path[0]) < pickup_radius
+
+
+func _get_hand_rope_path_2d() -> Array[Vector2]:
+	## player.gd's get_rope_polyline_2d() (hand anchor + every dynamic
+	## segment, in joint order) -- deliberately does NOT include head_2d/the
+	## dart's own tip (see _advance_recalling()'s doc comment for why
+	## including it created a self-referential, non-converging measurement).
+	## Falls back to a single-point [owner_pos] "path" if the owner doesn't
+	## expose the polyline (shouldn't happen -- only player.gd instantiates
+	## this scene -- but keeps this self-contained rather than assuming) so
+	## callers never have to null-check an empty array.
+	var path: Array[Vector2] = []
+	if owner_player.has_method("get_rope_polyline_2d"):
+		var polyline: Variant = owner_player.get_rope_polyline_2d()
+		if polyline is Array:
+			for p in (polyline as Array):
+				path.append(p as Vector2)
+	if path.is_empty():
+		path.append(owner_player.get_pos_2d())
+	return path
+
+
+func _sample_point_from_tip_2d(path: Array[Vector2], dist_from_tip: float) -> Vector2:
+	## Walks backward from `path`'s LAST point (its tip/hand-adjacent end)
+	## toward path[0] (the hand) by exactly `dist_from_tip` units of REAL
+	## PATH DISTANCE (not straight-line), returning the resulting point --
+	## clamped to path[0] once `dist_from_tip` exceeds the path's own total
+	## length. This is what makes a RECALLING dart retrace the rope's actual
+	## live shape -- including any obstacle wrap -- rather than cutting a
+	## straight line toward wherever the owner currently stands. In the
+	## common unobstructed case `path` is already close to a straight line
+	## (bounded by player.gd's ROPE_TAUT_PERP_RADIUS tension clamp), so this
+	## reduces to essentially the old straight-line-to-owner behavior there --
+	## not expected to change that case's feel.
+	var remaining: float = dist_from_tip
+	var i: int = path.size() - 1
+	while i > 0:
+		var a: Vector2 = path[i]
+		var b: Vector2 = path[i - 1]
+		var seg_len: float = a.distance_to(b)
+		if seg_len <= 0.0001:
+			i -= 1
+			continue
+		if seg_len <= remaining:
+			remaining -= seg_len
+			i -= 1
+		else:
+			return a.lerp(b, remaining / seg_len)
+	return path[0]
 
 
 func _anchor() -> void:
