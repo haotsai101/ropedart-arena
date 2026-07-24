@@ -434,13 +434,52 @@ const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
 ## LINEAR interpolation between the SAME two already-real, already-verified
 ## control points the smooth curve was sampling between, exactly at the one
 ## sample where the smoothing itself would cut through solid geometry.
-## Sized close to ROPE_RADIUS (0.035) plus a small buffer -- same reasoning
-## as rope_segment_body.gd's CLAMP_OBSTACLE_MARGIN (there sized ~3x
+## ROUND 10 "HORIZONTAL CHORD ACROSS THE PILLAR'S FACE" FIX (real user screen
+## recording, frame-cropped and reviewed directly): user reported a dart
+## anchored above/behind a pillar, character below-right, rendering a
+## straight horizontal line across the pillar's near face instead of
+## wrapping its bottom-left corner. Root-caused via a dedicated repro test
+## (see tests/test_rope_pillar_face_chord.gd, kept as a diagnostic scratch
+## scene, not a pass/fail regression test) that force-anchors a dart directly
+## opposite the player across a pillar (both bracketing anchor points
+## squarely facing OPPOSITE edges -- e.g. one due west of the pillar, one due
+## east, both within the pillar's own z-span) -- confirmed by direct manual
+## geometry proof (a single-corner polyline A -> corner -> B re-enters the
+## rect's interior for this exact class of configuration; only a genuine
+## two-corner "wrap one whole side" detour, exactly what
+## _corner_route_waypoints()'s OPPOSITE-edges branch already computes, stays
+## outside the rect for both legs) that _corner_route_waypoints()'s own
+## topology/corner selection is CORRECT and necessary here, not a misfire of
+## the ROUND 9 adjacent-vs-opposite edge logic -- this is a materially
+## different geometric case from ROUND 9's own repro (a diagonal near-corner
+## approach, resolved by ROUND 9's adjacent-edge single-corner path, still
+## verified unaffected by this round's change -- see this round's own soak
+## results in this file's git history / CLAUDE.md entry).
+## The actual, real, measured defect: a genuine one-whole-side wrap is a
+## SUSTAINED straight run hugging an entire pillar face for several
+## consecutive samples (unlike the brief single-sample nudge
+## ROPE_TUBE_OBSTACLE_MARGIN was originally sized for -- see the "Sized close
+## to ROPE_RADIUS..." reasoning below, which assumed "no [joint-solver-style]
+## drift to fight, just a one-shot per-sample geometry test") -- at the old
+## 0.12 clearance (barely more than 3x ROPE_RADIUS), that sustained run reads
+## as visually touching/cutting across the pillar's face, exactly matching
+## the report, even though it is numerically outside the real (ungrown)
+## rect. Fixed by raising this margin to match rope_segment_body.gd's own
+## CLAMP_OBSTACLE_MARGIN (0.2) -- the real physics-simulated rope segments
+## already never rest closer than that to a pillar, so the rendered tube's
+## corner-routed/pushed points should never look TIGHTER against a wall than
+## the real, physically-simulated portion of the same rope ever would; this
+## single shared constant feeds every push in this function (tier-1/tier-2
+## per-sample fallback AND the corner-route waypoints alike), so the fix
+## applies uniformly, not just to the reported full-face-wrap case.
+## Original reasoning (now superseded for the sustained-run case above, kept
+## for context on why 0.12 was chosen in the first place -- still describes
+## why this margin doesn't need to be even larger than the physics clamp's
+## own 0.2): sized close to ROPE_RADIUS (0.035) plus a small buffer -- same
+## reasoning as rope_segment_body.gd's CLAMP_OBSTACLE_MARGIN (there sized ~3x
 ## ROPE_RADIUS for a physics position clamp fighting real joint-solver
-## drift; here there's no such drift to fight, just a one-shot per-sample
-## geometry test, so a smaller margin suffices while still keeping the
-## tube's own visible radius from grazing the surface).
-const ROPE_TUBE_OBSTACLE_MARGIN: float = 0.12
+## drift).
+const ROPE_TUBE_OBSTACLE_MARGIN: float = 0.2
 
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
@@ -2445,6 +2484,31 @@ func _corner_route_waypoints(rect: Rect2, mid_sample: Vector3, anchor_before: Ve
 		return [Vector3(c.x, mid_sample.y, c.y)]
 	# OPPOSITE edges -- wrap via two corners on whichever side mid_sample
 	# actually sits closer to on the other axis.
+	##
+	## ROUND 10 WAYPOINT-ORDERING FIX (see this file's CLAUDE.md entry for the
+	## full writeup, root-caused via tests/test_rope_pillar_face_chord.gd): the
+	## two corners returned here MUST be ordered so the FIRST one is on
+	## anchor_before's own side -- the caller (_route_through_polyline(), via
+	## the fixed route [anchor_before, waypoints..., anchor_after]) walks
+	## these points strictly IN ORDER. The previous version always returned
+	## [west, east] (or [south, north]) regardless of which side
+	## anchor_before/anchor_after actually resolved to. Whenever
+	## anchor_before happened to be the one on the "second" side in that fixed
+	## order (e.g. anchor_before on the EAST edge, anchor_after on the WEST
+	## edge), the walked route became
+	## anchor_before(east) -> west_corner -> east_corner -> anchor_after(west)
+	## -- a self-crossing "bowtie": the first leg (anchor_before -> west
+	## corner) cuts diagonally back across the ENTIRE box interior (since
+	## anchor_before starts on the opposite side from where that leg heads),
+	## and the last leg mirrors the same crossing in reverse. Measured
+	## directly: this produced a sustained, large (~1.4-1.7 unit)
+	## discontinuous jump at the seam where the tier-2 fallback push
+	## (triggered because the crossing leg's own interpolated points land
+	## inside the real rect) met the correctly-routed middle leg -- exactly
+	## the user's reported "distinct line connecting to a point further right
+	## along the same bottom edge" symptom. Fixed by ordering each returned
+	## pair so its first entry is always the corner on anchor_before's actual
+	## side.
 	var mid_2d := Vector2(mid_sample.x, mid_sample.z)
 	if edge_a == 0 and edge_b == 1 or edge_a == 1 and edge_b == 0:
 		# west<->east: wrap via north (edge 3) or south (edge 2), whichever
@@ -2452,13 +2516,27 @@ func _corner_route_waypoints(rect: Rect2, mid_sample: Vector3, anchor_before: Ve
 		var to_south: float = mid_2d.y - rect.position.y
 		var to_north: float = rect.end.y - mid_2d.y
 		var z: float = rect.end.y if to_north < to_south else rect.position.y
-		return [Vector3(rect.position.x, mid_sample.y, z), Vector3(rect.end.x, mid_sample.y, z)]
+		var west_c := Vector3(rect.position.x, mid_sample.y, z)
+		var east_c := Vector3(rect.end.x, mid_sample.y, z)
+		var we_result: Array[Vector3] = []
+		if edge_a == 0:
+			we_result = [west_c, east_c]
+		else:
+			we_result = [east_c, west_c]
+		return we_result
 	else:
 		# south<->north: wrap via west (edge 0) or east (edge 1).
 		var to_west: float = mid_2d.x - rect.position.x
 		var to_east: float = rect.end.x - mid_2d.x
 		var x: float = rect.end.x if to_east < to_west else rect.position.x
-		return [Vector3(x, mid_sample.y, rect.position.y), Vector3(x, mid_sample.y, rect.end.y)]
+		var south_c := Vector3(x, mid_sample.y, rect.position.y)
+		var north_c := Vector3(x, mid_sample.y, rect.end.y)
+		var sn_result: Array[Vector3] = []
+		if edge_a == 2:
+			sn_result = [south_c, north_c]
+		else:
+			sn_result = [north_c, south_c]
+		return sn_result
 
 
 func _route_through_polyline(points: Array[Vector3], local_t: float) -> Vector3:
