@@ -404,6 +404,44 @@ const ROPE_TUBE_CURVE_SAMPLES: int = 48
 ## ~6 simultaneous darts in a full match).
 const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
 
+## CORNER-CUTTING TUBE-OVERSHOOT FIX (real user screen recording,
+## frame-extracted and reviewed directly: circling TIGHTLY around a pillar's
+## near corner -- not pushing outward at max leash, the trigger for the
+## already-fixed ROUND 6 fold bug -- made the rendered rope arc in a smooth
+## curved dip through the pillar's solid base for a couple of frames, clean
+## again once past the corner). Root-caused via a new deterministic
+## regression test, tests/test_rope_corner_tube_overshoot.gd: it drives a
+## tight (~0.75-radius), purely tangential sweep around a real pillar corner
+## with the dart safely anchored on the far side, and measures BOTH the raw
+## RigidBody3D segment positions AND the exact Catmull-Rom curve
+## _update_rope_tube_mesh() samples through them, against the pillar's own
+## get_rect_2d(), every few ticks. Result: max_pen_raw stayed 0.0000 the
+## whole sweep (the real physics chain never enters the pillar -- ROUND 5's
+## guarantee holds) while max_pen_curve reached 0.11 -- the RENDERED spline
+## alone dips into solid geometry despite every real control point it's
+## drawn through staying clear. This is a textbook property of Catmull-Rom
+## (and any interpolating spline) at a sharp bend: wherever the real
+## polyline bends convexly around an obstacle's corner, the smooth curve
+## fit through it overshoots toward the CONCAVE side of that bend to stay
+## smooth -- which, for a rope wrapping the OUTSIDE of a convex pillar
+## corner, is exactly the pillar's own interior. This is a pure render-side
+## artifact, not a physics-chain regression, and NOT the previously-rejected
+## "detect obstruction, draw a synthetic straight line through a computed
+## contact point" approach (see the ROUND 4 CLAUDE.md entry / player.gd's
+## own _spawn_physics_rope() doc comment) -- nothing here decides where the
+## rope SHOULD go or fabricates a new position; see
+## _clamp_curve_point_to_obstacles() below, which only ever falls back to a
+## LINEAR interpolation between the SAME two already-real, already-verified
+## control points the smooth curve was sampling between, exactly at the one
+## sample where the smoothing itself would cut through solid geometry.
+## Sized close to ROPE_RADIUS (0.035) plus a small buffer -- same reasoning
+## as rope_segment_body.gd's CLAMP_OBSTACLE_MARGIN (there sized ~3x
+## ROPE_RADIUS for a physics position clamp fighting real joint-solver
+## drift; here there's no such drift to fight, just a one-shot per-sample
+## geometry test, so a smaller margin suffices while still keeping the
+## tube's own visible radius from grazing the surface).
+const ROPE_TUBE_OBSTACLE_MARGIN: float = 0.12
+
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
 ## global_position.y sits at the physics capsule's CENTER (spawn markers add
@@ -2080,17 +2118,54 @@ func _update_rope_tube_mesh() -> void:
 	for seg in _physics_rope_segments:
 		control_points.append((seg as RigidBody3D).global_position)
 	control_points.append(_physics_rope_tip_anchor.global_position)
-	var n: int = control_points.size()
 
-	# Sample a Catmull-Rom curve through control_points at ROPE_TUBE_CURVE_SAMPLES
-	# steps -- Vector3.cubic_interpolate(b, pre_a, post_b, weight) needs a
-	# "before the start" and "after the end" handle for every interpolated
-	# span; clamping the index at both ends (rather than requiring 4 real
-	# neighbors) is what lets this work even at the very first/last span,
-	# and lets the whole curve work correctly with as few as 2 control points
-	# (a degenerate straight line -- possible right at throw-instant, when
-	# the tip anchor and every not-yet-separated segment can start nearly
-	# coincident).
+	var curve_points: Array[Vector3] = _compute_rope_tube_curve_points(control_points)
+	_build_tube_mesh(_physics_rope_tube_mesh, curve_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
+	_physics_rope_tube_mesh.visible = true
+
+
+func _compute_rope_tube_curve_points(control_points: Array[Vector3]) -> Array[Vector3]:
+	## Samples a Catmull-Rom curve through control_points at
+	## ROPE_TUBE_CURVE_SAMPLES steps -- Vector3.cubic_interpolate(b, pre_a,
+	## post_b, weight) needs a "before the start" and "after the end" handle
+	## for every interpolated span; clamping the index at both ends (rather
+	## than requiring 4 real neighbors) is what lets this work even at the
+	## very first/last span, and lets the whole curve work correctly with as
+	## few as 2 control points (a degenerate straight line -- possible right
+	## at throw-instant, when the tip anchor and every not-yet-separated
+	## segment can start nearly coincident).
+	##
+	## Split out of _update_rope_tube_mesh() into its own function specifically
+	## so tests/test_rope_corner_tube_overshoot.gd can call the EXACT real
+	## sampling/fix code directly on a synthetic control-point list, instead
+	## of maintaining a second hand-written copy of this logic that could
+	## silently drift from what actually ships.
+	##
+	## CORNER-CUTTING TUBE-OVERSHOOT FIX (see ROPE_TUBE_OBSTACLE_MARGIN's own
+	## doc comment for the full root-cause writeup): a smooth spline sampled
+	## through control points that bend sharply around a real obstacle corner
+	## can dip to the CONCAVE side of that bend (the obstacle's own interior)
+	## even though every real control point it passes through stays outside
+	## it. Two fallback tiers, each strictly preferred over inventing a new
+	## position, tried in order:
+	##   1. A plain LINEAR blend between the SAME two already-real,
+	##      already-verified control points (p1 -> p2, at this sample's own
+	##      local_t) -- this can never introduce a position the real chain
+	##      didn't already occupy (p1/p2 come straight from
+	##      _physics_rope_hand_anchor / a real dynamic segment / the tip
+	##      anchor's own live global_position).
+	##   2. Only if EVEN the linear blend still lands inside an obstacle (the
+	##      real discrete polyline itself can still "cut a corner" between two
+	##      genuinely-outside points, when a convex corner pokes into the gap
+	##      between them -- verified to actually occur in
+	##      tests/test_rope_corner_tube_overshoot.gd, not a hypothetical
+	##      edge case) -- push the point to the NEAREST point on the violated
+	##      obstacle's own grown-rect boundary, i.e. the smallest possible
+	##      correction that gets it back outside real, already-known
+	##      obstacle geometry (get_rect_2d(), the same ground truth every
+	##      other obstacle-aware system in this codebase reads). Still not a
+	##      fabricated route -- it's the minimal nudge off a real boundary.
+	var n: int = control_points.size()
 	var curve_points: Array[Vector3] = []
 	curve_points.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
 	for i in range(ROPE_TUBE_CURVE_SAMPLES + 1):
@@ -2102,10 +2177,69 @@ func _update_rope_tube_mesh() -> void:
 		var p1: Vector3 = control_points[seg_i]
 		var p2: Vector3 = control_points[clampi(seg_i + 1, 0, n - 1)]
 		var p3: Vector3 = control_points[clampi(seg_i + 2, 0, n - 1)]
-		curve_points[i] = p1.cubic_interpolate(p2, p0, p3, local_t)
+		var sample: Vector3 = p1.cubic_interpolate(p2, p0, p3, local_t)
+		if _point_inside_any_obstacle(Vector2(sample.x, sample.z)):
+			sample = p1.lerp(p2, local_t)
+			if _point_inside_any_obstacle(Vector2(sample.x, sample.z)):
+				var pushed_2d: Vector2 = _nearest_point_outside_obstacles(Vector2(sample.x, sample.z))
+				sample = Vector3(pushed_2d.x, sample.y, pushed_2d.y)
+		curve_points[i] = sample
+	return curve_points
 
-	_build_tube_mesh(_physics_rope_tube_mesh, curve_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
-	_physics_rope_tube_mesh.visible = true
+
+func _point_inside_any_obstacle(p: Vector2) -> bool:
+	## Ground-truth obstacle check for the corner-cutting tube-overshoot fix
+	## above -- same pattern as rope_segment_body.gd's own
+	## _clamp_target_inside_obstacle() (grown rect via get_rect_2d(), the same
+	## ground truth rope_dart.gd's own obstacle stop and every other
+	## obstacle-aware system in this codebase already reads), duplicated here
+	## rather than shared since rope_segment_body.gd's version is a method on
+	## a RigidBody3D instance, not something this Node3D-derived script can
+	## call into directly.
+	if not is_inside_tree():
+		return false
+	for obs in get_tree().get_nodes_in_group("obstacles"):
+		if not obs.has_method("get_rect_2d"):
+			continue
+		var rect: Rect2 = obs.get_rect_2d().grow(ROPE_TUBE_OBSTACLE_MARGIN)
+		if rect.has_point(p):
+			return true
+	return false
+
+
+func _nearest_point_outside_obstacles(p: Vector2) -> Vector2:
+	## Tier-2 fallback for _compute_rope_tube_curve_points() above -- only
+	## reached when even a straight blend between two real, verified-outside
+	## control points still lands inside an obstacle's grown rect (a convex
+	## corner poking into the gap between them). Pushes `p` to the closest
+	## point on that rect's own boundary (compares distance to each of the 4
+	## edges, moves along whichever is nearest) -- the smallest possible
+	## correction that clears real geometry, not a computed route/contact
+	## point. If `p` happens to violate more than one obstacle's rect
+	## (extremely unlikely given this game's obstacle spacing), the first
+	## match found is used, same iteration order as _point_inside_any_obstacle().
+	if not is_inside_tree():
+		return p
+	for obs in get_tree().get_nodes_in_group("obstacles"):
+		if not obs.has_method("get_rect_2d"):
+			continue
+		var rect: Rect2 = obs.get_rect_2d().grow(ROPE_TUBE_OBSTACLE_MARGIN)
+		if not rect.has_point(p):
+			continue
+		var d_min_x: float = p.x - rect.position.x
+		var d_max_x: float = rect.end.x - p.x
+		var d_min_y: float = p.y - rect.position.y
+		var d_max_y: float = rect.end.y - p.y
+		var m: float = minf(minf(d_min_x, d_max_x), minf(d_min_y, d_max_y))
+		if m == d_min_x:
+			return Vector2(rect.position.x, p.y)
+		elif m == d_max_x:
+			return Vector2(rect.end.x, p.y)
+		elif m == d_min_y:
+			return Vector2(p.x, rect.position.y)
+		else:
+			return Vector2(p.x, rect.end.y)
+	return p
 
 
 func _build_tube_mesh(mi: MeshInstance3D, curve_points: Array[Vector3], radius: float, radial_segments: int) -> void:

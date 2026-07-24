@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://e6y7z8a9b0c1d"]
+
+[ext_resource type="Script" path="res://tests/test_rope_corner_tube_overshoot.gd" id="1_tube"]
+
+[node name="TestRopeCornerTubeOvershoot" type="Node"]
+script = ExtResource("1_tube")
