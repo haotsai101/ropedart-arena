@@ -2692,18 +2692,92 @@ func _clamp_to_rope_leash() -> void:
 	## triangle inequality, satisfying this clamp always also satisfies the
 	## old plain anchor-circle bound, so the fallback below never fights it;
 	## it only ever adds a stricter, wrap-aware bound on top.
+	##
+	## TRANSIENT-SNAP FIX, TWO ROUNDS (real user report, direct quote: "the
+	## throwing pushed me southeast and walking west pushed me north west" --
+	## confirmed via direct instrumentation, not guessing: a temporary
+	## per-tick probe, tests/test_movement_direction_skew.gd, drove a throw
+	## with ZERO movement input held and logged get_pos_2d() every tick.
+	## Movement itself (Phase 1, pure west hold, no dart) came back perfectly
+	## clean -- zero Z drift, exact -X-only motion -- so the core "movement is
+	## a pure Vector2 on X/Z" invariant was never actually violated anywhere.
+	## But Phase 2 (throw, zero movement held) showed a REAL, un-input-driven
+	## position displacement of ~0.5 units, arriving over many ticks right
+	## at/after the FLYING->ANCHORED transition, with a direction unrelated to
+	## aim/facing/movement -- exactly matching "got pushed" with no apparent
+	## cause. Also logged rest_len/max_from_first/offset0_len every tick to
+	## pin down the mechanism:
+	##
+	## ROUND 1 (partial fix, kept as the first of two gates below): right at
+	## the anchor transition, `_rope_chain_rest_length_2d()` -- the live
+	## chain's own segment-to-segment path length from the first dynamic
+	## segment to the tip -- legitimately and momentarily exceeded
+	## DART_ROPE_LENGTH (measured 8.22-8.33 vs. the chain's own 8.0 capacity,
+	## before the still-bunched-near-the-hand chain had caught up to the tip
+	## anchor's newly-landed position). That's the same kind of transient
+	## overshoot this codebase already tolerates elsewhere (see
+	## tests/test_rope_leash_corner_wrap.gd's own MAX_ACCEPTABLE_OVERSHOOT =
+	## 0.75), but here `maxf(DART_ROPE_LENGTH - rest_len, 0.0)` floored the
+	## result to a literal ZERO-radius budget, snapping the player's
+	## canonical root position onto the first segment's current (still
+	## unsettled) location. Gating on `rest_len < DART_ROPE_LENGTH` (skip the
+	## pivot clamp entirely when there's no positive budget at all) removed
+	## that single worst zero-radius tick -- but re-measuring the SAME probe
+	## after this fix alone showed the total drift only dropped from ~0.53 to
+	## ~0.47, still clearly visible: for many ticks afterward (rest_len
+	## already back under 8.0, so the gate above no longer applies)
+	## offset0_len kept exceeding a real but still-small max_from_first,
+	## because the "first segment" itself was still actively being dragged
+	## across ~1+ units by the joint solver as the whole chain settled from
+	## its bunched-near-hand spawn layout toward the far anchor -- i.e. even
+	## with a mathematically positive budget, pivoting on a segment that
+	## hasn't settled yet is fundamentally unreliable, independent of whether
+	## rest_len happens to be above or below capacity.
+	##
+	## ROUND 2 (the fix that actually closes it): the pivot-on-first-segment
+	## bound only makes physical sense while the chain is genuinely wrapped
+	## around a real obstacle corner -- its own doc comment above says so
+	## explicitly ("a segment resting against real obstacle contact is
+	## exactly where the solver actually put it"). An open-air anchor (no
+	## obstacle involved at all -- including every anchor reached by hitting
+	## max ROPE_LENGTH with nothing in the way, now the common case since
+	## rope_dart.gd anchors there instead of auto-recalling) was never what
+	## this clamp was meant to constrain beyond the plain fallback bound
+	## below, which this same probe confirmed never itself misfires (offset_len
+	## sat safely under DART_ROPE_LENGTH throughout every logged tick of both
+	## rounds' test runs). Gate the whole pivot clamp on
+	## `_debug_last_has_contact` (rope_segment_body.gd's existing, already-
+	## verified-unambiguous "resting against real obstacle geometry, not a
+	## player/ground/another segment" signal, added for the ROUND 5 CLIPPING
+	## FIX and already read the same way there) being true for at least one
+	## segment in the chain -- i.e. only trust "pivot on the first segment"
+	## once there's an actual corner being wrapped for it to legitimately
+	## rest against. Purely open-air anchors (this bug's whole reproduction)
+	## and the ordinary mid-settle window right after any throw now never
+	## engage this stricter bound at all, falling through to the plain
+	## fallback circle, which is exactly correct for them. Genuine corner-wrap
+	## scenarios (tests/test_rope_leash_corner_wrap.gd) are unaffected -- by
+	## definition they involve a segment in real contact with the pillar, so
+	## the gate is open exactly when the fix it protects is supposed to apply.
 	if _physics_rope_active and not _physics_rope_segments.is_empty():
-		var first_seg_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
-		var first_2d := Vector2(first_seg_pos.x, first_seg_pos.z)
-		var rest_len: float = _rope_chain_rest_length_2d(anchor)
-		var max_from_first: float = maxf(DART_ROPE_LENGTH - rest_len, 0.0)
-		var offset0: Vector2 = pos - first_2d
-		if offset0.length() > max_from_first:
-			var dir0: Vector2 = offset0.normalized() if offset0.length() > 0.0001 else Vector2.ZERO
-			var clamped0: Vector2 = first_2d + dir0 * max_from_first
-			global_position.x = clamped0.x
-			global_position.z = clamped0.y
-			pos = clamped0
+		var any_obstacle_contact: bool = false
+		for seg in _physics_rope_segments:
+			if bool((seg as RigidBody3D).get("_debug_last_has_contact")):
+				any_obstacle_contact = true
+				break
+		if any_obstacle_contact:
+			var first_seg_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
+			var first_2d := Vector2(first_seg_pos.x, first_seg_pos.z)
+			var rest_len: float = _rope_chain_rest_length_2d(anchor)
+			if rest_len < DART_ROPE_LENGTH:
+				var max_from_first: float = DART_ROPE_LENGTH - rest_len
+				var offset0: Vector2 = pos - first_2d
+				if offset0.length() > max_from_first:
+					var dir0: Vector2 = offset0.normalized() if offset0.length() > 0.0001 else Vector2.ZERO
+					var clamped0: Vector2 = first_2d + dir0 * max_from_first
+					global_position.x = clamped0.x
+					global_position.z = clamped0.y
+					pos = clamped0
 
 	## Fallback safety net: never let the player exceed a plain straight-line
 	## DART_ROPE_LENGTH from the anchor either -- covers the tick(s) before
