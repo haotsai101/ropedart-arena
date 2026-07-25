@@ -1584,18 +1584,80 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	return body
 
 
-## UNVERIFIED, IN-PROGRESS (fixed-segment-length round, blocked mid-session by
-## Godot MCP connection instability -- see CLAUDE.md's dated entry). Left at
-## PhysicsServer3D's own documented defaults (0.3 / 1.0) -- functionally a
-## NO-OP vs. the previously-uncalled default, verified to reproduce the exact
-## same baseline joint-gap numbers as before this const/API call existed.
-## Bias 0.6/damping 1.5 was tried and measured to NOT meaningfully reduce
-## peak joint gap (11.68 vs 11.17 baseline max_seg_reach); a damping-only
-## trial (damping 4.0, bias unchanged) was started but its result was never
-## retrieved before the session's Godot MCP connection dropped -- do not
-## assume it works OR fails, re-run and measure before trusting it.
+## STILL UNFIXED as of ROUND 14 -- both of ROUND 13's own untried leads were
+## run to completion this round (ROUND 13 itself was blocked mid-session by
+## Godot MCP connection instability, not by running out of approaches). Left
+## at PhysicsServer3D's own documented defaults (0.3 / 1.0) -- functionally a
+## NO-OP vs. the previously-uncalled default, re-verified this round to still
+## reproduce the exact same baseline joint-gap numbers (max_joint_gap=1.8345
+## @ joint 28, tick 0, on a full-charge throw) as before this const/API call
+## existed.
+##
+## ROUND 14 LEAD 1 (damping tuning, isolated from bias) -- RUN TO COMPLETION,
+## CONCLUSIVELY FAILED, in the WORSE direction, not just "didn't help":
+## damping=2.0 (bias left at default 0.3) measured max_joint_gap=6.6527 --
+## 3.6x WORSE than the 1.0-baseline's 1.8345, not an improvement. damping=4.0
+## went further and caused a full numerical explosion within the first few
+## ticks (segment positions/reach going to NaN, matching the exact failure
+## signature ROUND 1 already found for bias=0.9/damping=2.0). Both measured
+## via the same per-tick _joint_gaps() probe, tests/test_rope_physics_chain_
+## settle.gd. Damping tuning on the pin joint is not a viable lever at any
+## value tried above the existing default -- do not retry without a
+## fundamentally different starting point than "just raise damping further."
 const ROPE_JOINT_BIAS: float = 0.3
 const ROPE_JOINT_DAMPING: float = 1.0
+
+## ROUND 14 LEAD 2 -- RUN TO COMPLETION, CONCLUSIVELY FAILED. Swaps
+## _join_rope_pin() for _join_rope_6dof() (PhysicsServer3D.joint_make_
+## generic_6dof(), near-zero linear limits on all 3 axes, angular left fully
+## free to match a pin joint's own free rotation) -- kept in the codebase,
+## DISABLED, as a permanent "already tried, don't retry blindly" record, per
+## this project's own standing convention (see e.g. ROUND 1's rejected
+## PIN_JOINT_IMPULSE_CLAMP/lower-bias notes). Do not flip this back to true
+## without a genuinely new idea, not just a different tuning of the same
+## three params already swept below.
+##
+## Real API confirmed against Godot 4.3's servers/physics_server_3d.h (not
+## assumed -- the task's own suggested method name,
+## joint_set_generic_6dof_axis_param, does not exist; the real methods are
+## generic_6dof_joint_set_param()/generic_6dof_joint_set_flag()).
+##
+## THREE STIFFNESS LEVELS MEASURED, all via the same _joint_gaps() probe on
+## the same full-charge-throw scenario the pin-joint baseline used:
+##   1. Engine defaults (softness=0.7, damping=1.0, restitution=0.5, per
+##      servers/physics_3d/joints/godot_generic_6dof_joint_3d.h's own struct
+##      init) with only the linear limit range set to +-0.02: max_joint_gap
+##      =9.6505 -- already ~5x WORSE than the pin joint's 1.8345 baseline,
+##      before any deliberate stiffening.
+##   2. Moderate (softness=1.0, restitution=1.0, damping=1.0, a mild bump off
+##      default): max_joint_gap=8.9473 -- still ~5x worse than baseline, only
+##      a marginal improvement over the engine defaults above.
+##   3. Aggressive (softness=4.0, restitution=4.0, damping=2.0): catastrophic,
+##      immediate explosion -- max_joint_gap=276121696.0 (276 MILLION units)
+##      already by tick 0, growing to ~1.68e18 by the fold phase, with 8602
+##      real "Object went too far away" engine errors logged. The dart never
+##      even returned within the test's own 240-tick timeout.
+##
+## ROOT CAUSE for why this joint type underperforms a pin joint at ANY
+## setting tried, confirmed by reading the engine's own C++ source (servers/
+## physics_3d/joints/godot_generic_6dof_joint_3d.cpp), not assumed from the
+## numbers alone: line 59 of that file is a hardcoded compile-time macro,
+## `#define GENERIC_D6_DISABLE_WARMSTARTING 1` -- Godot's generic 6DOF joint
+## has warm-starting (carrying the previous step's accumulated impulse
+## forward as a head start for the next step's iterative solve, standard
+## practice for fast constraint convergence) explicitly DISABLED in this
+## engine version, unlike whatever internal path PIN_JOINT uses. This isn't
+## adjustable from script/PhysicsServer3D at all -- it's baked into the
+## engine binary this project runs against. Separately, its own linear-limit
+## correction formula (solveLinearAxis(), line 202) uses `restitution` as the
+## de-facto positional-error-correction term (`limitSoftness * (restitution *
+## depth / timeStep - damping * rel_vel)`) since there is no dedicated linear
+## ERP parameter exposed at all (only angular axes have
+## G6DOF_JOINT_ANGULAR_ERP) -- a structurally different, and per the measured
+## numbers above, less effective correction path than whatever the pin
+## joint's own PIN_JOINT_BIAS/PIN_JOINT_DAMPING drive internally.
+const ROPE_USE_6DOF_JOINT: bool = false
+const ROPE_6DOF_LINEAR_SLACK: float = 0.02
 
 
 func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: Vector3) -> void:
@@ -1609,10 +1671,52 @@ func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: V
 	## at all -- the joint exists purely as a RID on the physics server, so
 	## _free_physics_rope() must explicitly free it (see
 	## _physics_rope_joint_rids' own comment).
+	if ROPE_USE_6DOF_JOINT:
+		_join_rope_6dof(a, local_a, b, local_b)
+		return
 	var joint_rid: RID = PhysicsServer3D.joint_create()
 	PhysicsServer3D.joint_make_pin(joint_rid, a.get_rid(), local_a, b.get_rid(), local_b)
 	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_BIAS, ROPE_JOINT_BIAS)
 	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_DAMPING, ROPE_JOINT_DAMPING)
+	_physics_rope_joint_rids.append(joint_rid)
+
+
+func _join_rope_6dof(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: Vector3) -> void:
+	## ROUND 14 lead 2: same "each body's local anchor point declared
+	## independently" principle as _join_rope_pin(), but via
+	## PhysicsServer3D.joint_make_generic_6dof() (real API confirmed against
+	## Godot 4.3's servers/physics_server_3d.h, not assumed) instead of
+	## joint_make_pin() -- stays inside Godot's own iterative constraint
+	## solver (collision-aware, unlike a from-scratch position correction),
+	## but exposes a per-axis linear limit RANGE instead of a single
+	## bias/damping pair. Each axis is given a tiny (not exactly zero) linear
+	## limit range around 0 (ROPE_6DOF_LINEAR_SLACK) with
+	## G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT on -- angular flags are left OFF
+	## (their default), so rotation stays fully free at every joint, same as
+	## a pin joint. local_frame_a/b use Basis.IDENTITY (aligned with each
+	## body's OWN local axes, which is where local_a/local_b -- e.g.
+	## Vector3(0, +-HALF_LEN, 0) -- already live) so the joint's axes track
+	## each capsule's own orientation as it rotates, not a world-fixed frame.
+	var joint_rid: RID = PhysicsServer3D.joint_create()
+	var frame_a := Transform3D(Basis.IDENTITY, local_a)
+	var frame_b := Transform3D(Basis.IDENTITY, local_b)
+	PhysicsServer3D.joint_make_generic_6dof(joint_rid, a.get_rid(), frame_a, b.get_rid(), frame_b)
+	for axis in [Vector3.AXIS_X, Vector3.AXIS_Y, Vector3.AXIS_Z]:
+		PhysicsServer3D.generic_6dof_joint_set_flag(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT, true)
+		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LOWER_LIMIT, -ROPE_6DOF_LINEAR_SLACK)
+		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_UPPER_LIMIT, ROPE_6DOF_LINEAR_SLACK)
+		# TEMP-TESTING: engine source (servers/physics_3d/joints/godot_generic_6dof_joint_3d.cpp,
+		# solveLinearAxis()) shows the position-correction term is
+		# `limitSoftness * (restitution * depth / timeStep - damping * rel_vel)` --
+		# i.e. `restitution` (NOT a dedicated ERP param -- none exists for the
+		# linear axes, only angular has G6DOF_JOINT_ANGULAR_ERP) is what scales
+		# how much of the positional error gets corrected per tick. Defaults
+		# (softness 0.7 / damping 1.0 / restitution 0.5) measured far worse than
+		# the pin joint baseline -- pushing all three well above default here to
+		# test whether it can be made competitively stiff at all.
+		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LIMIT_SOFTNESS, 1.0)
+		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_RESTITUTION, 1.0)
+		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_DAMPING, 1.0)
 	_physics_rope_joint_rids.append(joint_rid)
 
 
