@@ -278,10 +278,10 @@ func _physics_process(delta: float) -> void:
 func _advance_recalling(delta: float) -> bool:
 	## Moves head_2d toward the hand along the rope's LIVE control-point
 	## polyline (player.gd's get_rope_polyline_2d() -- hand anchor + every
-	## dynamic segment, in joint order; the same points the tube mesh and
-	## _rope_chain_current_path_length_2d() already use), instead of a
-	## straight line toward wherever the owner currently stands. Returns true
-	## once the dart is close enough to the hand to complete the pickup.
+	## dynamic segment, in joint order; the same points the tube mesh
+	## renders through), instead of a straight line toward wherever the owner
+	## currently stands. Returns true once the dart is close enough to the
+	## hand to complete the pickup.
 	##
 	## FIRST ATTEMPT (rejected, kept as a note): re-measuring "how much rope
 	## is left" from scratch every tick -- total length of [hand, ...segments,
@@ -292,16 +292,15 @@ func _advance_recalling(delta: float) -> bool:
 	## orbit near the anchor for a full 300-tick/5s run without making net
 	## progress toward the hand, and briefly clipped ~0.15 units into the
 	## pillar's own rect. Root cause: appending head_2d as the path's own tip
-	## makes the "remaining length" measurement self-referential with
-	## player.gd's TENSION CLAMP (rope_segment_body.gd's max_perp_from_line,
-	## driven every tick from _get_rope_tip_target() == this dart's own
-	## current position) -- as head_2d moves, the clamp's target hand-to-tip
-	## LINE moves with it, continuously re-centering nearby segments onto a
-	## fresh, differently-angled line rather than settling. That's fine and
-	## expected as a SHAPE change (the chain legitimately straightens as the
-	## tip nears the hand), but it means the fresh-measured "remaining length"
-	## is not a reliable monotonic progress signal on its own -- it can stay
-	## flat or even grow tick to tick while the shape churns.
+	## makes the "remaining length" measurement self-referential -- as
+	## head_2d moves, the chain's own shape (tracking _get_rope_tip_target()
+	## == this dart's own current position every tick) reshapes right along
+	## with it, continuously settling toward a fresh configuration rather
+	## than converging. That's fine and expected as a SHAPE change (the chain
+	## legitimately straightens as the tip nears the hand), but it means the
+	## fresh-measured "remaining length" is not a reliable monotonic progress
+	## signal on its own -- it can stay flat or even grow tick to tick while
+	## the shape churns.
 	##
 	## THE ACTUAL FIX: decouple "how far the dart has traveled" from "how long
 	## the live chain currently measures." `_recall_travel_dist` (reset to 0.0
@@ -353,9 +352,9 @@ func _sample_point_from_tip_2d(path: Array[Vector2], dist_from_tip: float) -> Ve
 	## live shape -- including any obstacle wrap -- rather than cutting a
 	## straight line toward wherever the owner currently stands. In the
 	## common unobstructed case `path` is already close to a straight line
-	## (bounded by player.gd's ROPE_TAUT_PERP_RADIUS tension clamp), so this
-	## reduces to essentially the old straight-line-to-owner behavior there --
-	## not expected to change that case's feel.
+	## (the real physics chain naturally settles close to taut when nothing's
+	## in the way), so this reduces to essentially the old straight-line-to-
+	## owner behavior there -- not expected to change that case's feel.
 	var remaining: float = dist_from_tip
 	var i: int = path.size() - 1
 	while i > 0:

@@ -19,15 +19,29 @@ extends Node
 ## Measures TWO separate things every sampled tick, to distinguish a real
 ## physics-chain regression from a render-only artifact:
 ##   - max_pen_raw: real RigidBody3D segment positions vs PillarA's own
-##     get_rect_2d() -- the ROUND 5 regression metric, should stay ~0.
-##   - max_pen_curve: the exact same Catmull-Rom curve
-##     _update_rope_tube_mesh()/_build_tube_mesh() samples through
-##     [hand, ...segments, tip] (duplicated here point-for-point, same
-##     ROPE_TUBE_CURVE_SAMPLES=48 step count) vs the same rect -- if this is
-##     meaningfully worse than max_pen_raw, the raw physics chain is already
-##     correct and the bug is in the render-side spline overshooting past its
-##     own real control points at a sharp corner bend, not a physics
-##     regression.
+##     get_rect_2d() -- the PRIMARY pass/fail signal, should stay ~0. This is
+##     what the full architecture reset (see CLAUDE.md's dated entry /
+##     player.gd's ROPE_PHYSICS_* doc comment) makes the ONLY thing that can
+##     legitimately gate this test: with every render-side obstacle
+##     correction layer deleted, the render is nothing but a Catmull-Rom
+##     curve traced through these exact points, so if the raw points are
+##     clean, that's the real, physically-simulated, non-negotiable
+##     guarantee this game now has.
+##   - max_pen_curve: the same Catmull-Rom curve
+##     _compute_rope_tube_curve_points() (the REAL shipped function, called
+##     directly) samples through [hand, ...segments, tip] vs the same rect --
+##     reported INFORMATIONALLY only (does not fail the test on its own). A
+##     smooth interpolating spline through a real, obstacle-clear polyline can
+##     still mathematically overshoot slightly at a sharp convex bend (a
+##     textbook Catmull-Rom property, not a bug) -- per the user's explicit
+##     mandate, this is no longer "corrected" in the render, so a small,
+##     bounded curve-only overshoot is an accepted, disclosed characteristic
+##     of tracing real physics directly rather than a defect to chase. With
+##     4x the segment density of the old 8-segment chain (see
+##     ROPE_PHYSICS_SEGMENTS), any given corner is bracketed by much closer
+##     real control points, so this number is expected to be substantially
+##     smaller than the pre-reset baseline even with no correction at all --
+##     this test's own RESULT line reports the measured value for the record.
 ##
 ## Run this scene directly (F6 in the editor, or via the Godot MCP
 ## run_project tool with scene=res://tests/test_rope_corner_tube_overshoot.tscn).
@@ -254,19 +268,24 @@ func _run() -> void:
 				penu = minf(penu, minf(p2u.y - rect.position.y, rect.end.y - p2u.y))
 				pen_curve_unclamped = maxf(pen_curve_unclamped, penu)
 
-		# FIXED: calls player._compute_rope_tube_curve_points() directly --
-		# the EXACT real function _update_rope_tube_mesh() itself calls every
-		# frame -- so this measures the actual shipped code path, not a
-		# second hand-written reimplementation that could silently drift
-		# from what's really running.
-		var curve_fixed_3d: Array = player._compute_rope_tube_curve_points(control_points)
-		var pen_curve_fixed: float = 0.0
-		for p3f in curve_fixed_3d:
+		# REAL SHIPPED CURVE: calls player._compute_rope_tube_curve_points()
+		# directly -- the EXACT real function _update_rope_tube_mesh() itself
+		# calls every frame -- so this measures the actual shipped code path,
+		# not a second hand-written reimplementation that could silently
+		# drift from what's really running. Per the full architecture reset
+		# (see this file's own header comment), this function is now a PLAIN
+		# Catmull-Rom sampler with no obstacle correction at all -- so this
+		# should numerically match pen_curve_unclamped above (both are the
+		# same math now); kept as a separate measurement anyway so a future
+		# accidental divergence between the two is still visible here.
+		var curve_real_3d: Array = player._compute_rope_tube_curve_points(control_points)
+		var pen_curve_real: float = 0.0
+		for p3f in curve_real_3d:
 			var p2f := Vector2((p3f as Vector3).x, (p3f as Vector3).z)
 			if rect.has_point(p2f):
 				var penf: float = minf(p2f.x - rect.position.x, rect.end.x - p2f.x)
 				penf = minf(penf, minf(p2f.y - rect.position.y, rect.end.y - p2f.y))
-				pen_curve_fixed = maxf(pen_curve_fixed, penf)
+				pen_curve_real = maxf(pen_curve_real, penf)
 
 		if pen_raw > max_pen_raw:
 			max_pen_raw = pen_raw
@@ -274,25 +293,28 @@ func _run() -> void:
 		if pen_curve_unclamped > max_pen_curve:
 			max_pen_curve = pen_curve_unclamped
 			worst_curve_tick = tick
-		max_pen_curve_fixed = maxf(max_pen_curve_fixed, pen_curve_fixed)
+		max_pen_curve_fixed = maxf(max_pen_curve_fixed, pen_curve_real)
 
-		print("[TEST] tick=%d player=%s pen_raw=%.3f pen_curve_unclamped=%.3f pen_curve_fixed=%.3f" % [
-			tick, player.get_pos_2d(), pen_raw, pen_curve_unclamped, pen_curve_fixed])
+		print("[TEST] tick=%d player=%s pen_raw=%.3f pen_curve_unclamped=%.3f pen_curve_real=%.3f" % [
+			tick, player.get_pos_2d(), pen_raw, pen_curve_unclamped, pen_curve_real])
 
-	print("[TEST] RESULT max_pen_raw=%.4f (tick=%d) max_pen_curve_unclamped=%.4f (tick=%d) max_pen_curve_fixed=%.4f" % [
+	print("[TEST] RESULT max_pen_raw=%.4f (tick=%d) max_pen_curve_unclamped=%.4f (tick=%d) max_pen_curve_real=%.4f" % [
 		max_pen_raw, worst_raw_tick, max_pen_curve, worst_curve_tick, max_pen_curve_fixed])
+	# PRIMARY (pass/fail) signal, per the full architecture reset: only the
+	# REAL physics chain's own segment positions are a correctness guarantee
+	# now -- see this file's own header comment.
 	if max_pen_raw > 0.01:
-		print("[TEST] raw physics chain DID penetrate the pillar -- real physics-level regression, not render-only")
+		print("[TEST] FAIL: raw physics chain DID penetrate the pillar -- a real physics/collision-level regression")
 	else:
-		print("[TEST] raw physics chain stayed clear of the pillar (as expected per ROUND 5)")
-	if max_pen_curve > max_pen_raw + 0.05:
-		print("[TEST] UNCLAMPED curve penetrates meaningfully more than raw control points -- confirms the render-side Catmull-Rom overshoot bug")
-	else:
-		print("[TEST] UNCLAMPED curve tracked raw control points closely -- did not reproduce the overshoot this run")
+		print("[TEST] PASS: raw physics chain stayed clear of the pillar")
+	# INFORMATIONAL ONLY below -- does not affect pass/fail. A bounded
+	# Catmull-Rom overshoot at a sharp corner, with no correction applied, is
+	# an accepted/disclosed rendering characteristic of this round's reset,
+	# not a defect (see this file's own header comment).
 	if max_pen_curve_fixed > 0.01:
-		print("[TEST] FAIL: FIXED curve still penetrates the pillar (max=%.4f) -- corner-cutting fix did not close the gap" % [max_pen_curve_fixed])
+		print("[TEST] INFO: rendered curve shows a small, uncorrected overshoot past the real pillar footprint (max=%.4f) -- expected/disclosed given no render-side correction; not a fail condition" % [max_pen_curve_fixed])
 	else:
-		print("[TEST] PASS: FIXED curve never penetrates the pillar")
+		print("[TEST] INFO: rendered curve never penetrated the pillar this run either, despite no correction being applied")
 	print("CORNER_TUBE_OVERSHOOT_TEST_DONE")
 
 

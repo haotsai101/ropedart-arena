@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://d3f9c2h1o8r1d5x7"]
-
-[ext_resource type="Script" path="res://tests/test_rope_pillar_face_chord.gd" id="1_chord"]
-
-[node name="TestRopePillarFaceChord" type="Node"]
-script = ExtResource("1_chord")

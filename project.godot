@@ -95,6 +95,32 @@ throw_dart={
 3d_physics/layer_1="default"
 3d_physics/layer_2="rope_obstacles"
 
+[physics]
+
+; Bumped from Godot's default (8) for the ROUND 12 rope full-architecture
+; reset (see CLAUDE.md / player.gd's ROPE_PHYSICS_* doc comment): the
+; persistent 32-segment rope chain has 4x the joint count of the old
+; 8-segment chain, so more Gauss-Seidel solver iterations per physics step
+; let those extra joints converge (settle onto real obstacle corners,
+; resolve the throw/recall unfold/fold propagation) more precisely without
+; needing any position-clamp "correction" -- a legitimate "more real
+; physics," not a rendering-side fix, per the task's own explicit invitation
+; to consider this lever.
+;
+; 16 was tried first and measured (tests/test_rope_physics_chain_settle.gd's
+; own settled-configuration sweep) to leave one adversarial near-corner
+; configuration (both hand and tip close together, close to PillarA's own
+; corner) with a small but real settled penetration (~0.08-0.15 units,
+; confirmed via a dedicated scratch probe to still be present at the regular
+; test's own CONFIG_SETTLE_TICKS sample point, not yet converged). Raised to
+; 32 and re-measured with the same probe, sampled every ~0.67s for 6 real
+; seconds post-settle: penetration converged to exactly 0.0 by ~1.3s and
+; stayed there rock-stable for the remainder of the probe -- a real
+; improvement from more solver iterations, not a coincidence. Applies to the
+; whole project's physics (this game has no other physics-heavy systems
+; besides player capsules and the rope chain, so the cost is negligible).
+3d/solver/solver_iterations=32
+
 [rendering]
 
 environment/defaults/default_environment="res://scenes/default_env.tres"
