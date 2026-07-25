@@ -111,9 +111,16 @@ func _run() -> void:
 	var rect: Rect2 = pillar.get_rect_2d()
 	print("[TEST] PillarA rect=%s (world XZ)" % [rect])
 
+	# TEMP-TESTING: fast-iteration flag to skip the two slower tests while
+	# tuning joint bias/damping -- MUST be false before any real verification
+	# run / before committing (zero net diff required, same convention as
+	# game_manager.gd's lobby_mode TEMP-TESTING toggle).
+	const QUICK_PROBE_ONLY: bool = false
+
 	var overall_ok := true
-	overall_ok = await _test_idle_collapse() and overall_ok
-	overall_ok = await _test_settled_configurations(rect) and overall_ok
+	if not QUICK_PROBE_ONLY:
+		overall_ok = await _test_idle_collapse() and overall_ok
+		overall_ok = await _test_settled_configurations(rect) and overall_ok
 	overall_ok = await _test_throw_unfold_and_retrieve_fold(rect) and overall_ok
 
 	print("[TEST] OVERALL %s" % ("PASS" if overall_ok else "FAIL"))
@@ -145,6 +152,17 @@ func _test_idle_collapse() -> bool:
 		max_dist = maxf(max_dist, d)
 	print("[TEST] idle: %d segments, max_dist_from_hand=%.4f (tolerance=%.2f)" % [
 		player._physics_rope_segments.size(), max_dist, IDLE_COLLAPSE_RADIUS])
+	# DIAGNOSTIC (fixed-segment-length round): is there a chronic per-joint
+	# gap even at settled idle rest, independent of any throw transient?
+	var idle_gaps: Array[float] = _joint_gaps(player)
+	var idle_max_gap: float = 0.0
+	var idle_max_gap_idx: int = -1
+	for gi in range(idle_gaps.size()):
+		if idle_gaps[gi] > idle_max_gap:
+			idle_max_gap = idle_gaps[gi]
+			idle_max_gap_idx = gi
+	print("[TEST] idle diagnostic: max_joint_gap=%.4f @ joint %d (settled, no throw ever fired)" % [
+		idle_max_gap, idle_max_gap_idx])
 
 	var ok: bool = max_dist <= IDLE_COLLAPSE_RADIUS
 	print("[TEST] %s: idle chain %s collapsed at the hand" % [
@@ -236,6 +254,36 @@ func _test_settled_configurations(rect: Rect2) -> bool:
 	return all_ok
 
 
+func _joint_gaps(player: Node) -> Array[float]:
+	## Per-joint separation (XZ) between consecutive bodies' OWN declared
+	## local anchor points, in chain order [hand_anchor, seg0..seg31,
+	## tip_anchor]. A perfectly satisfied pin joint has its two local anchor
+	## points COINCIDE in world space -- so each entry here is the real
+	## "how much has this joint stretched" measurement, not a proxy (distance
+	## from the fixed hand point, which is what the pre-existing max_dist
+	## checks below measure -- that's total chain reach, not per-joint
+	## rigidity). gaps[i] is joint i, between body i and body i+1 in the
+	## [hand_anchor, seg0..seg31, tip_anchor] list.
+	var half: float = player.ROPE_PHYSICS_SEGMENT_HALF_LENGTH
+	var segs: Array = player._physics_rope_segments
+	var hand_body: RigidBody3D = player._physics_rope_hand_anchor
+	var tip_body: RigidBody3D = player._physics_rope_tip_anchor
+	var gaps: Array[float] = []
+	var prev_far2 := Vector2(hand_body.global_position.x, hand_body.global_position.z)
+	for i in range(segs.size()):
+		var seg: RigidBody3D = segs[i]
+		var xform: Transform3D = seg.global_transform
+		var near_pt: Vector3 = xform * Vector3(0.0, -half, 0.0)
+		var far_pt: Vector3 = xform * Vector3(0.0, half, 0.0)
+		var near2 := Vector2(near_pt.x, near_pt.z)
+		var far2 := Vector2(far_pt.x, far_pt.z)
+		gaps.append(prev_far2.distance_to(near2))
+		prev_far2 = far2
+	var tip2 := Vector2(tip_body.global_position.x, tip_body.global_position.z)
+	gaps.append(prev_far2.distance_to(tip2))
+	return gaps
+
+
 func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
 	print("[TEST] --- 3+4. THROW UNFOLD / RETRIEVE FOLD (open air, no obstacle) ---")
 	var start_pos := Vector3(-10.0, 0.7, -10.0)
@@ -255,8 +303,17 @@ func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
 	var hand2d_fixed := Vector2(hand_pos0.x, hand_pos0.z)
 	var unfold_trace: Array[float] = []
 	var max_reach_unfold: float = 0.0
+	var max_joint_gap_unfold: float = 0.0
+	var max_joint_gap_idx: int = -1
+	var max_joint_gap_tick: int = -1
 	for tick in range(THROW_LOG_TICKS):
 		await get_tree().physics_frame
+		var gaps: Array[float] = _joint_gaps(player)
+		for gi in range(gaps.size()):
+			if gaps[gi] > max_joint_gap_unfold:
+				max_joint_gap_unfold = gaps[gi]
+				max_joint_gap_idx = gi
+				max_joint_gap_tick = tick
 		if tick % THROW_LOG_EVERY != 0:
 			continue
 		var max_dist: float = 0.0
@@ -266,14 +323,34 @@ func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
 		max_reach_unfold = maxf(max_reach_unfold, max_dist)
 		var real_dist: float = hand2d_fixed.distance_to(player.dart.head_2d) if is_instance_valid(player.dart) else -1.0
 		unfold_trace.append(max_dist)
-		print("[TEST] unfold tick=%d max_seg_reach=%.3f real_hand_to_dart=%.3f" % [tick, max_dist, real_dist])
+		var tick_max_gap: float = 0.0
+		var tick_max_gap_idx: int = -1
+		for gi2 in range(gaps.size()):
+			if gaps[gi2] > tick_max_gap:
+				tick_max_gap = gaps[gi2]
+				tick_max_gap_idx = gi2
+		print("[TEST] unfold tick=%d max_seg_reach=%.3f real_hand_to_dart=%.3f tick_max_joint_gap=%.4f@joint%d" % [
+			tick, max_dist, real_dist, tick_max_gap, tick_max_gap_idx])
 
-	# Bounded-divergence check: the chain's own max reach should never run
-	# away far past its own physical capacity (DART_ROPE_LENGTH) -- a real
-	# "crack the whip" resonance (see rope_segment_body.gd's MAX_SEGMENT_SPEED
-	# doc comment) would show this multiplying to several times that.
+	# Per-joint rigidity check: EACH joint's own separation (the direct
+	# measurement of "did this bar segment stretch") must stay small at all
+	# times, not just the aggregate chain reach -- see this file's own header
+	# comment / CLAUDE.md's dated entry for why the OLD max_reach_unfold-only
+	# check (tolerance dart_rope_length * 1.5 = 12.0) passed even at a real,
+	# measured ~10.8 unit reach against an 8.0 unit true capacity: it only
+	# ever caught total-chain divergence to infinity, never "did any single
+	# joint separate by a meaningful fraction of its own segment length."
+	# JOINT_GAP_TOLERANCE is a small ABSOLUTE tolerance (not scaled to total
+	# rope length) since it represents genuine per-joint stretch, which a
+	# truly rigid bar should not exhibit regardless of how many segments make
+	# up the whole chain.
+	const JOINT_GAP_TOLERANCE: float = 0.15
 	var dart_rope_length: float = player.DART_ROPE_LENGTH
-	var unfold_ok: bool = max_reach_unfold <= dart_rope_length * 1.5
+	var joint_gap_ok: bool = max_joint_gap_unfold <= JOINT_GAP_TOLERANCE
+	print("[TEST] unfold: max_joint_gap=%.4f (joint %d, tick %d) vs tolerance=%.2f -> %s" % [
+		max_joint_gap_unfold, max_joint_gap_idx, max_joint_gap_tick, JOINT_GAP_TOLERANCE,
+		"PASS" if joint_gap_ok else "FAIL"])
+	var unfold_ok: bool = max_reach_unfold <= dart_rope_length * 1.1 and joint_gap_ok
 	print("[TEST] unfold: max_reach_unfold=%.3f vs DART_ROPE_LENGTH=%.1f -> %s" % [
 		max_reach_unfold, dart_rope_length, "PASS" if unfold_ok else "FAIL"])
 

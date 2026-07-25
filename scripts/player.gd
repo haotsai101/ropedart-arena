@@ -1584,6 +1584,20 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	return body
 
 
+## UNVERIFIED, IN-PROGRESS (fixed-segment-length round, blocked mid-session by
+## Godot MCP connection instability -- see CLAUDE.md's dated entry). Left at
+## PhysicsServer3D's own documented defaults (0.3 / 1.0) -- functionally a
+## NO-OP vs. the previously-uncalled default, verified to reproduce the exact
+## same baseline joint-gap numbers as before this const/API call existed.
+## Bias 0.6/damping 1.5 was tried and measured to NOT meaningfully reduce
+## peak joint gap (11.68 vs 11.17 baseline max_seg_reach); a damping-only
+## trial (damping 4.0, bias unchanged) was started but its result was never
+## retrieved before the session's Godot MCP connection dropped -- do not
+## assume it works OR fails, re-run and measure before trusting it.
+const ROPE_JOINT_BIAS: float = 0.3
+const ROPE_JOINT_DAMPING: float = 1.0
+
+
 func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: Vector3) -> void:
 	## Creates one PinJoint3D-equivalent constraint via the low-level
 	## PhysicsServer3D API directly, instead of a PinJoint3D node -- lets each
@@ -1594,13 +1608,11 @@ func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: V
 	## root-cause history on why that matters). No Node3D is created for this
 	## at all -- the joint exists purely as a RID on the physics server, so
 	## _free_physics_rope() must explicitly free it (see
-	## _physics_rope_joint_rids' own comment). Bias/damping are deliberately
-	## left unset (PhysicsServer3D's own defaults apply) -- stiffening these
-	## was tried in an earlier round and measured to make the chain explode
-	## (per-joint gap growing exponentially); this remains untouched by the
-	## 32-segment reset.
+	## _physics_rope_joint_rids' own comment).
 	var joint_rid: RID = PhysicsServer3D.joint_create()
 	PhysicsServer3D.joint_make_pin(joint_rid, a.get_rid(), local_a, b.get_rid(), local_b)
+	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_BIAS, ROPE_JOINT_BIAS)
+	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_DAMPING, ROPE_JOINT_DAMPING)
 	_physics_rope_joint_rids.append(joint_rid)
 
 
