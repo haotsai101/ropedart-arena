@@ -70,13 +70,31 @@ const SPAWN_INVINCIBLE_DURATION: float = 0.75
 @export var show_hitbox_debug: bool = true
 const HITBOX_DEBUG_RADIUS: float = 0.6
 
-## Mirrors rope_dart.gd's State.ANCHORED ordinal and ROPE_LENGTH — no shared
-## constant between the two scripts (see HITBOX_DEBUG_RADIUS's comment
-## above), so keep these in sync by hand if either changes. Used by
-## _clamp_to_rope_leash() to keep the owner from wandering past the tether's
-## reach once the dart is anchored.
+## Mirrors rope_dart.gd's State.ANCHORED ordinal — no shared constant between
+## the two scripts (see HITBOX_DEBUG_RADIUS's comment above), so keep this in
+## sync by hand if it changes. Used by _clamp_to_rope_leash() to keep the
+## owner from wandering past the tether's reach once the dart is anchored.
 const DART_STATE_ANCHORED: int = 1
-const DART_ROPE_LENGTH: float = 8.0
+
+## ROUND 15 (2026-07-25) RESIZE, per explicit user direction: "The rope is
+## supposed to be 6 times the character's height." Character height is
+## derived from GameManager.PLAYER_HALF_HEIGHT (0.7 -> 1.4 full height), NOT
+## the raw scenes/player.tscn CapsuleShape3D.height (1.2) — verified by
+## checking every other real consumer of "character height" in this codebase
+## before picking one, not assumed: (a) GameManager.PLAYER_HALF_HEIGHT is
+## already the value spawn positioning treats as authoritative (added to
+## every spawn marker's Y, and confirmed by this file's own
+## _mesh_ground_offset comment above to be exactly the offset that puts the
+## character's real rendered feet at the floor); (b) rope_dart.gd's own
+## capsule_height export — ALREADY 1.4, independently, for real per-frame
+## gameplay math (the head-hit vs. body-hit capsule top used by
+## _check_hits()) — agrees with PLAYER_HALF_HEIGHT*2 exactly. Two independent
+## real gameplay systems already treat 1.4 as "the" character height; only
+## the raw physics collision shape's own (different, 1.2) value disagrees,
+## and nothing else in the codebase reads that shape's height as a
+## general-purpose size figure. Referenced directly (not a magic literal) so
+## this stays correct if the character's size is ever retuned.
+const DART_ROPE_LENGTH: float = 6.0 * (GameManager.PLAYER_HALF_HEIGHT * 2.0)
 
 ## Rope visual radius -- the physics segments' own capsule collision radius
 ## AND the rendered tube mesh's radius (see _build_tube_mesh()) share this
@@ -157,7 +175,9 @@ const ROPE_RADIUS: float = 0.035
 ## a genuine collision bug to fix at the physics/collision level (segment
 ## count, capsule radius, collision margins, joint config), never something
 ## to paper over in the render.
-const ROPE_PHYSICS_SEGMENTS: int = 32
+## ROUND 15 (2026-07-25): 32 -> 24, per explicit user direction ("Let's try
+## 24 joints"), alongside the DART_ROPE_LENGTH resize above.
+const ROPE_PHYSICS_SEGMENTS: int = 24
 ## Total simulated chain length always equals DART_ROPE_LENGTH (the dart's
 ## own fixed max range) regardless of the CURRENT hand-to-dart distance.
 const ROPE_PHYSICS_SEGMENT_LENGTH: float = DART_ROPE_LENGTH / float(ROPE_PHYSICS_SEGMENTS)
@@ -171,11 +191,13 @@ const ROPE_PHYSICS_SEGMENT_HALF_LENGTH: float = ROPE_PHYSICS_SEGMENT_LENGTH * 0.
 ## hand" (per the user's literal spec) regardless of segment count, rather
 ## than sitting exactly on top of the hand anchor's own point.
 const ROPE_BUNCH_SPACING: float = 0.4
-## Per-segment mass, scaled down from the old 8-segment chain's 0.03 by the
-## same 8/32 ratio the segment count grew by, so the chain's TOTAL mass (and
-## therefore its overall inertia/behavior under the same joint bias/damping)
-## stays roughly the same as before rather than becoming 4x heavier overall.
-const ROPE_SEGMENT_MASS: float = 0.03 * 8.0 / 32.0
+## Per-segment mass, redistributed proportionally across the current segment
+## count from the original 8-segment chain's own 0.03-per-segment / 0.24-total
+## baseline (0.03 * 8.0), so the chain's TOTAL mass (and therefore its overall
+## inertia/behavior under the same joint bias/damping) stays roughly constant
+## regardless of how many segments it's currently split across. ROUND 15
+## (2026-07-25): denominator updated 32 -> 24 alongside ROPE_PHYSICS_SEGMENTS.
+const ROPE_SEGMENT_MASS: float = 0.03 * 8.0 / 24.0
 const ROPE_LINEAR_DAMP: float = 1.6
 const ROPE_ANGULAR_DAMP: float = 2.2
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's

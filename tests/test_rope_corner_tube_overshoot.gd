@@ -127,7 +127,7 @@ func _run() -> void:
 		print("[TEST] FAIL: throw produced no dart")
 		return
 
-	# Force ANCHORED on the far side, well within DART_ROPE_LENGTH (8.0) of
+	# Force ANCHORED on the far side, well within DART_ROPE_LENGTH of
 	# the player's starting position -- unlike test_rope_leash_corner_wrap.gd,
 	# this test deliberately does NOT stress max leash range; the anchor sits
 	# comfortably inside reach the whole sweep, isolating the tight-corner
@@ -135,8 +135,8 @@ func _run() -> void:
 	player.dart.state = 1  # State.ANCHORED (see rope_dart.gd's enum)
 	var anchor: Vector2 = far_corner + Vector2(1.0, 1.0)
 	player.dart.head_2d = anchor
-	print("[TEST] hand=%s anchor=%s beeline_dist=%.2f (DART_ROPE_LENGTH=8.0)" % [
-		player.get_pos_2d(), anchor, player.get_pos_2d().distance_to(anchor)])
+	print("[TEST] hand=%s anchor=%s beeline_dist=%.2f (DART_ROPE_LENGTH=%.1f)" % [
+		player.get_pos_2d(), anchor, player.get_pos_2d().distance_to(anchor), player.DART_ROPE_LENGTH])
 
 	for tick in range(SETTLE_WAIT_TICKS):
 		player.velocity = Vector3.ZERO

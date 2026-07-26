@@ -76,9 +76,18 @@ enum State { FLYING, ANCHORED, RECALLING }
 @export var recall_speed: float = 24.0
 
 const BASE_SPEED: float = 18.0
-## A KayKit character reads at ~2.0 units tall on screen (see player.gd's
-## _ready() comment on the 0.85 mesh scale) -- 4x that.
-const ROPE_LENGTH: float = 8.0
+## ROUND 15 (2026-07-25) RESIZE, per explicit user direction ("The rope is
+## supposed to be 6 times the character's height"): mirrors player.gd's own
+## DART_ROPE_LENGTH by hand (no shared constant between the two scripts, same
+## convention as capsule_height below) -- both now derive from the same
+## authoritative source, GameManager.PLAYER_HALF_HEIGHT, instead of each
+## carrying an independently-hardcoded literal. See player.gd's DART_ROPE_
+## LENGTH doc comment for why PLAYER_HALF_HEIGHT (implying a 1.4 full
+## character height) was chosen over the raw player.tscn CapsuleShape3D's own
+## (different, 1.2) height value. Old value was 8.0, derived from an
+## unrelated "4x a ~2.0-unit on-screen character read" heuristic -- superseded
+## entirely by this round's "6x the real character height" spec.
+const ROPE_LENGTH: float = 6.0 * (GameManager.PLAYER_HALF_HEIGHT * 2.0)
 
 ## Obstacle collision boxes (pillars in main.tscn, trees/cacti added by
 ## nature_scatter.gd's _add_obstacle_collision) all uniformly span world Y
