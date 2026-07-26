@@ -209,8 +209,67 @@ const ROPE_BUNCH_SPACING: float = 0.4
 ## 0.216) rather than holding it artificially fixed.
 const ROPE_SEGMENT_LINEAR_MASS_DENSITY: float = 0.03
 const ROPE_SEGMENT_MASS: float = ROPE_SEGMENT_LINEAR_MASS_DENSITY * ROPE_PHYSICS_SEGMENT_LENGTH
-const ROPE_LINEAR_DAMP: float = 1.6
-const ROPE_ANGULAR_DAMP: float = 2.2
+## ROUND 17 (2026-07-26) -- raised from 1.6/2.2 (present since the very first
+## physics-chain commit, 2026-07-22, and never previously singled out as its
+## own lever) per direct user report ("why is the rope shaking without the
+## character moving") of a genuinely different configuration than any prior
+## round measured: a dart that has been ANCHORED and stationary for several
+## seconds, not mid-throw/mid-retrieve. See tests/test_rope_physics_chain_
+## settle.gd's own new "5. ANCHORED STEADY-STATE JITTER" section for the
+## measurement this was tuned against. Real numbers, not assumed: at the OLD
+## 1.6/2.2 damping, three of four realistic settled-anchor configs (open-air
+## slack, corner-wrap, a REAL throw-to-anchor at a pillar) already measured
+## tiny (seg_max_step 0.0007-0.006 units/tick over a 6s window, several
+## seconds after the anchor transition) -- i.e. even the OLD damping was
+## nowhere near the scale of a bug that would read as "visibly, measurably
+## changes shape" on screen. Raising damping to 3.0/4.0 still measurably
+## helped those three configs further (seg_max_step down to ~0.0002-0.002,
+## amplification vs. the hand's own tiny animated-idle motion often dropping
+## BELOW 1.0, i.e. the chain now damps out noise faster than the driving
+## hand bone introduces it) with zero measured regression: the full
+## regression suite (idle collapse, 8-config settled-obstacle sweep, throw
+## unfold/retrieve fold) and a 50-second 4-hard-bot soak were re-run at the
+## new damping and showed the same pass/fail pattern (including the same
+## already-documented ROUND 9/11/12/15/16 settled-config-sweep flakiness --
+## which config flakes shifts run to run, but the flake RATE did not
+## increase) as an identical run at the old damping via git-stash A/B.
+## HONEST, DISCLOSED LIMITATION -- the fourth config, "open_air_taut" (a
+## dart anchored at/near max ROPE_LENGTH range in open air, i.e. ZERO slack
+## -- the common real case per rope_dart.gd's own "anchor at max range if
+## nothing was hit" behavior), was NOT fixed by this change: it showed the
+## same bimodal ~0.0002-0.03 seg_max_step / ~0.004-0.04 joint_gap_max range
+## at BOTH 1.6/2.2 and 3.0/4.0 damping, across repeated runs. Root cause,
+## reasoned from the numbers (a fully-taut, zero-slack chain sitting exactly
+## at its own total physical capacity has no slack left to silently absorb
+## any tiny per-joint numerical residual -- unlike every other config, which
+## has real spare capacity to fold into): this reads as a genuine solver
+## degenerate-case sensitivity specific to zero slack, not a "too much
+## kinetic energy" problem body damping (which drains existing motion, not
+## a geometric constraint at its limit) can address -- consistent with
+## ROUND 13/14's separate finding that JOINT-level (not body-level) stiffness
+## tuning is the dangerous, already-rejected lever for problems in this
+## family. Left as an open, disclosed item, not attempted further this round
+## (out of scope for "try body damping" specifically).
+## SEPARATE, DIRECTLY-MEASURED FINDING FROM THIS SAME ROUND, kept here since
+## it changes where to look next if the user's NEXT report is still "the
+## rope shakes": arena_camera.gd's own _process() recomputes camera position
+## AND orthographic size every frame from the AABB of ALL alive players plus
+## ALL active darts -- not just the one player/dart on screen. A scratch
+## probe (2-player real match, one player force-anchored and never touched
+## again, one hard bot left to roam) measured the camera's own per-frame
+## position/size step (~0.019 / ~0.025 units/frame, driven purely by the
+## OTHER bot moving elsewhere) as COMPARABLE TO OR LARGER than this file's
+## own worst-case rope-chain jitter number above -- i.e. in any real match
+## with more than one active player (the normal case), continuous camera
+## re-centering/re-zooming is a real, measured, competing explanation for
+## "things on screen visibly reshape even though nothing near them moved,"
+## entirely independent of the rope's own physics and NOT addressed by this
+## round's damping change. Flagged for the user's own judgment, not fixed
+## here (out of this round's explicit scope) -- if reported again with
+## confirmation that OTHER players/bots were active/moving in the same clip,
+## this is the first place to look, not the rope chain again.
+const ROPE_LINEAR_DAMP: float = 3.0
+const ROPE_ANGULAR_DAMP: float = 4.0
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing

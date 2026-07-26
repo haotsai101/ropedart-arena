@@ -96,6 +96,26 @@ const RETRIEVE_MAX_TICKS: int = 240
 ## headroom above the observed range.
 const POST_RETRIEVE_COLLAPSE_RADIUS: float = 4.5
 
+## 5. ANCHORED STEADY-STATE JITTER (2026-07-26 -- real user report, direct
+## frame-by-frame video review by the coordinator: "the rope's rendered curve
+## visibly, measurably changes shape near the anchor point from frame to
+## frame" while the character stands completely still and the dart has
+## already been ANCHORED for several seconds -- a genuinely different
+## configuration from every prior probe on this file, which only ever
+## measured (a) idle-at-hand collapse (dart == null) or (b) the first ~40
+## ticks right after a throw. See this function's own doc comment below for
+## the measurement design and the real root-cause finding.
+const STEADY_PRE_SETTLE_TICKS: int = 300  ## 5s -- let the forced-anchor's own
+## initial settle transient (same one CONFIG_SETTLE_TICKS above already
+## exists to wait out) fully decay before the jitter measurement window
+## starts, so residual unfold motion is never mistaken for steady-state
+## jitter.
+const STEADY_SAMPLE_TICKS: int = 360  ## 6s -- inside the task's own
+## requested 5-10s / 300-600 tick sampling window.
+const STEADY_LOG_EVERY: int = 60  ## ~1s -- periodic running-max line, so a
+## decaying-vs-sustained trend is visible in the raw log, not just one final
+## aggregate number.
+
 
 func _ready() -> void:
 	call_deferred("_run")
@@ -111,17 +131,18 @@ func _run() -> void:
 	var rect: Rect2 = pillar.get_rect_2d()
 	print("[TEST] PillarA rect=%s (world XZ)" % [rect])
 
-	# TEMP-TESTING: fast-iteration flag to skip the two slower tests while
-	# tuning joint bias/damping -- MUST be false before any real verification
-	# run / before committing (zero net diff required, same convention as
-	# game_manager.gd's lobby_mode TEMP-TESTING toggle).
+	# TEMP-TESTING: fast-iteration flag to skip the slower tests while tuning
+	# damping -- MUST be false before any real verification run / before
+	# committing (zero net diff required, same convention as game_manager.gd's
+	# lobby_mode TEMP-TESTING toggle).
 	const QUICK_PROBE_ONLY: bool = false
 
 	var overall_ok := true
 	if not QUICK_PROBE_ONLY:
 		overall_ok = await _test_idle_collapse() and overall_ok
 		overall_ok = await _test_settled_configurations(rect) and overall_ok
-	overall_ok = await _test_throw_unfold_and_retrieve_fold(rect) and overall_ok
+		overall_ok = await _test_throw_unfold_and_retrieve_fold(rect) and overall_ok
+	overall_ok = await _test_anchored_steady_state_jitter(rect) and overall_ok
 
 	print("[TEST] OVERALL %s" % ("PASS" if overall_ok else "FAIL"))
 	print("ROPE_PHYSICS_CHAIN_SETTLE_TEST_DONE")
@@ -282,6 +303,200 @@ func _joint_gaps(player: Node) -> Array[float]:
 	var tip2 := Vector2(tip_body.global_position.x, tip_body.global_position.z)
 	gaps.append(prev_far2.distance_to(tip2))
 	return gaps
+
+
+func _sample_chain_points_2d(player: Node) -> Array[Vector2]:
+	## [hand_anchor, seg0..segN-1, tip_anchor], the SAME chain order and the
+	## SAME exact points _joint_gaps() and _update_rope_tube_mesh()'s own
+	## control-point list use -- i.e. this is precisely what could show up as
+	## a reshaping curve on screen, not a proxy for it.
+	var pts: Array[Vector2] = []
+	var hand_pos: Vector3 = (player._physics_rope_hand_anchor as RigidBody3D).global_position
+	pts.append(Vector2(hand_pos.x, hand_pos.z))
+	for seg in player._physics_rope_segments:
+		var p3: Vector3 = (seg as RigidBody3D).global_position
+		pts.append(Vector2(p3.x, p3.z))
+	var tip_pos: Vector3 = (player._physics_rope_tip_anchor as RigidBody3D).global_position
+	pts.append(Vector2(tip_pos.x, tip_pos.z))
+	return pts
+
+
+func _test_anchored_steady_state_jitter(rect: Rect2) -> bool:
+	print("[TEST] --- 5. ANCHORED STEADY-STATE JITTER (player stationary, dart settled several seconds, zero new input) ---")
+	## THREE configs, all at PHYSICALLY ACHIEVABLE hand-to-tip distances (<=
+	## DART_ROPE_LENGTH -- unlike the penetration sweep's own "open_air_far"
+	## config above, whose hand/tip are ~22.6 units apart against a chain
+	## that can only ever span 7.2: that config is fine for a pure
+	## final-position penetration check, since it never claims the chain
+	## reaches a real equilibrium, but it is NOT a valid steady-state-jitter
+	## probe -- an unsolvable, permanently-overstretched kinematic tip target
+	## forces the solver to fight an impossible constraint every single tick
+	## forever, which was directly confirmed, not assumed: an earlier version
+	## of this test that reused "open_air_far" verbatim measured a real
+	## amplification(seg/hand) of ~2031x and a sustained (not decaying)
+	## ~0.78-unit mean joint gap -- a genuine artifact of the invalid,
+	## physically-impossible test config, not a reproduction of the reported
+	## bug). "open_air_taut" (max-range anchor, ~zero slack -- the common
+	## real case per rope_dart.gd's own "anchor at max range if nothing was
+	## hit" behavior) and "open_air_slack" (a shorter, real anchor with
+	## visible slack) both stay within real capacity; "corner_wrap_anchor"
+	## (real obstacle contact, matching the user's own reported "near a
+	## pillar" scenario) is unchanged from the original probe. This 3-way
+	## split lets this test tell apart a general chain-level jitter from one
+	## specific to tautness or to the wrap/leash-pivot interaction.
+	var jitter_configs: Array = [
+		["open_air_taut", Vector2(-8.0, -8.0), Vector2(-8.0, -8.0) + Vector2(1.0, 0.0) * 7.0],
+		["open_air_slack", Vector2(-8.0, -8.0), Vector2(-8.0, -8.0) + Vector2(1.0, 0.0) * 5.5],
+		["corner_wrap_anchor", rect.position + Vector2(-1.2, -1.2), rect.end + Vector2(1.2, 1.2)],
+	]
+
+	var all_ok := true
+	for cfg in jitter_configs:
+		var cfg_name: String = cfg[0]
+		var hand2: Vector2 = cfg[1]
+		var tip2: Vector2 = cfg[2]
+
+		var player = _spawn_player(Vector3(hand2.x, 0.7, hand2.y), (tip2 - hand2).normalized())
+		for i in 5:
+			await get_tree().physics_frame
+		player._throw(0.0)
+		for i in 5:
+			await get_tree().physics_frame
+		if player.dart == null:
+			print("[TEST] config=%s FAIL: throw produced no dart" % cfg_name)
+			all_ok = false
+			player.queue_free()
+			continue
+		player.dart.state = 1  # State.ANCHORED
+		player.dart.head_2d = tip2  # fixed forever below -- the tip anchor's
+		## own driven target is a literal constant for the rest of this test,
+		## so ANY tip-anchor motion measured below is either genuine physics
+		## settle or a bug, never a moving target.
+
+		await _measure_steady_state_jitter(player, cfg_name)
+		player.queue_free()
+		for i in 3:
+			await get_tree().physics_frame
+
+	## FOURTH config: a REAL throw (full charge, aimed straight at PillarA),
+	## left to fly and anchor NATURALLY via rope_dart.gd's own real physics
+	## raycast (_raycast_obstacle()) -- unlike the three configs above, which
+	## shortcut straight to a hand-picked ANCHORED state/head_2d. A real
+	## throw's own flight dynamics (acceleration, the FLYING->ANCHORED
+	## transition's own settle -- see _clamp_to_rope_leash()'s own
+	## "TRANSIENT-SNAP" doc comment for a documented example of transition-
+	## specific behavior that a synthetic force-anchor would never exercise)
+	## could plausibly leave the chain in a different, possibly less-settled
+	## equilibrium than an instantly-teleported anchor -- this config checks
+	## that directly rather than assuming the first three configs' own
+	## instant-anchor shortcut is representative of what a real player
+	## actually sees.
+	var pillar_center: Vector2 = rect.get_center()
+	var throw_start := Vector3(pillar_center.x, 0.7, pillar_center.y - 4.0)
+	var real_player = _spawn_player(throw_start, Vector2(0.0, 1.0))
+	for i in 5:
+		await get_tree().physics_frame
+	real_player._throw(1.0)  # full charge -- fastest, longest flight
+	var anchored: bool = false
+	for i in 120:
+		await get_tree().physics_frame
+		if not is_instance_valid(real_player.dart):
+			break
+		if real_player.dart.state != 0:  # not FLYING any more
+			anchored = true
+			break
+	if not anchored:
+		print("[TEST] config=real_throw_at_pillar FAIL: dart never left FLYING within 120 ticks")
+		all_ok = false
+	else:
+		await _measure_steady_state_jitter(real_player, "real_throw_at_pillar")
+	real_player.queue_free()
+	for i in 3:
+		await get_tree().physics_frame
+
+	print("[TEST] steady-state jitter diagnostic complete (see per-config SUMMARY lines above)")
+	return all_ok
+
+
+func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
+	## Shared measurement core for every config in
+	## _test_anchored_steady_state_jitter() above -- assumes the caller has
+	## already gotten `player` into a real ANCHORED state (however it got
+	## there) and left it completely alone (no more movement/throw/recall
+	## calls) from this point on.
+
+	# Let any initial anchor-transition settle transient fully decay -- this
+	# is NOT what's under test here (see CONFIG_SETTLE_TICKS above, already
+	# an established-sufficient settle window for shape; doubled for extra
+	# safety since this test specifically cares about TRUE rest, several
+	# seconds in, not just "clear of the pillar").
+	for i in STEADY_PRE_SETTLE_TICKS:
+		await get_tree().physics_frame
+
+	var prev_pts: Array[Vector2] = _sample_chain_points_2d(player)
+	var hand_max_step: float = 0.0
+	var hand_min: Vector2 = prev_pts[0]
+	var hand_max: Vector2 = prev_pts[0]
+	var seg_max_step: float = 0.0
+	var seg_sum_step: float = 0.0
+	var seg_sample_count: int = 0
+	var joint_gap_max: float = 0.0
+	var joint_gap_sum: float = 0.0
+	var joint_gap_samples: int = 0
+	var window_ticks: int = 0
+
+	for tick in range(STEADY_SAMPLE_TICKS):
+		await get_tree().physics_frame
+		window_ticks += 1
+		var cur_pts: Array[Vector2] = _sample_chain_points_2d(player)
+
+		# The hand anchor's own tick-to-tick motion (index 0) is the DRIVEN
+		# boundary condition here, not a free physics body --
+		# get_hand_world_position()'s own doc comment says its X/Z come from
+		# "the real, animated, bobbing hand bone." A non-zero value here is
+		# a candidate real driver (an Idle_A-driven hand bone never truly
+		# stops moving), not itself a chain-instability bug -- logged
+		# separately from seg_* below specifically so the two can be told
+		# apart.
+		var hand_step: float = prev_pts[0].distance_to(cur_pts[0])
+		hand_max_step = maxf(hand_max_step, hand_step)
+		hand_min.x = minf(hand_min.x, cur_pts[0].x)
+		hand_min.y = minf(hand_min.y, cur_pts[0].y)
+		hand_max.x = maxf(hand_max.x, cur_pts[0].x)
+		hand_max.y = maxf(hand_max.y, cur_pts[0].y)
+
+		# Every DYNAMIC segment's own tick-to-tick motion -- indices
+		# [1, size-2] (index 0 is the hand anchor, the last index is the tip
+		# anchor, both kinematic/driven, not free bodies).
+		for i in range(1, cur_pts.size() - 1):
+			var step: float = prev_pts[i].distance_to(cur_pts[i])
+			seg_max_step = maxf(seg_max_step, step)
+			seg_sum_step += step
+			seg_sample_count += 1
+
+		var gaps: Array[float] = _joint_gaps(player)
+		for g in gaps:
+			joint_gap_max = maxf(joint_gap_max, g)
+			joint_gap_sum += g
+			joint_gap_samples += 1
+
+		prev_pts = cur_pts
+		if (tick + 1) % STEADY_LOG_EVERY == 0:
+			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f" % [
+				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max])
+
+	var hand_bbox_diag: float = hand_min.distance_to(hand_max)
+	var seg_mean_step: float = seg_sum_step / float(maxi(seg_sample_count, 1))
+	var joint_gap_mean: float = joint_gap_sum / float(maxi(joint_gap_samples, 1))
+	# amplification > 1 means the free dynamic segments are moving MORE, tick
+	# to tick, than the driven hand boundary they're attached to -- i.e. real
+	# resonance/instability on top of just following the hand. amplification
+	# <= ~1 means the chain is doing the physically correct thing (passively
+	# following a slightly-alive hand boundary).
+	var amplification: float = seg_max_step / maxf(hand_max_step, 0.00001)
+	print("[TEST] %s STEADY-STATE SUMMARY over %d ticks (~%.1fs): hand_max_step=%.5f hand_bbox_diag=%.5f seg_max_step=%.5f seg_mean_step=%.5f amplification(seg/hand)=%.3f joint_gap_max=%.5f joint_gap_mean=%.5f" % [
+		cfg_name, window_ticks, float(window_ticks) / 60.0, hand_max_step, hand_bbox_diag,
+		seg_max_step, seg_mean_step, amplification, joint_gap_max, joint_gap_mean])
 
 
 func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
