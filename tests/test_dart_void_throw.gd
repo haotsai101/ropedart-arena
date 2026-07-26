@@ -14,9 +14,10 @@ extends Node
 ## exists there), which is itself part of what this test confirms.
 
 const OLD_ARENA_HALF: float = 14.5
-## Mirrors rope_dart.gd's own ROPE_LENGTH by hand (ROUND 15, 2026-07-25 resize)
+## Mirrors rope_dart.gd's own ROPE_LENGTH by hand (ROUND 16, 2026-07-25
+## correction: derives from PLAYER_CAPSULE_HEIGHT, not PLAYER_HALF_HEIGHT*2.0)
 ## -- same derivation, same "no shared constant between scripts" convention.
-const ROPE_LENGTH: float = 6.0 * (GameManager.PLAYER_HALF_HEIGHT * 2.0)
+const ROPE_LENGTH: float = 6.0 * GameManager.PLAYER_CAPSULE_HEIGHT
 const DT: float = 0.016
 
 var any_failure := false

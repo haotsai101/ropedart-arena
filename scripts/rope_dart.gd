@@ -79,15 +79,15 @@ const BASE_SPEED: float = 18.0
 ## ROUND 15 (2026-07-25) RESIZE, per explicit user direction ("The rope is
 ## supposed to be 6 times the character's height"): mirrors player.gd's own
 ## DART_ROPE_LENGTH by hand (no shared constant between the two scripts, same
-## convention as capsule_height below) -- both now derive from the same
-## authoritative source, GameManager.PLAYER_HALF_HEIGHT, instead of each
-## carrying an independently-hardcoded literal. See player.gd's DART_ROPE_
-## LENGTH doc comment for why PLAYER_HALF_HEIGHT (implying a 1.4 full
-## character height) was chosen over the raw player.tscn CapsuleShape3D's own
-## (different, 1.2) height value. Old value was 8.0, derived from an
-## unrelated "4x a ~2.0-unit on-screen character read" heuristic -- superseded
-## entirely by this round's "6x the real character height" spec.
-const ROPE_LENGTH: float = 6.0 * (GameManager.PLAYER_HALF_HEIGHT * 2.0)
+## convention as capsule_height below).
+## ROUND 16 (2026-07-25) CORRECTION: now derives from
+## GameManager.PLAYER_CAPSULE_HEIGHT (the raw physics capsule height, 1.2) --
+## not PLAYER_HALF_HEIGHT*2.0 (1.4) -- per direct user instruction after the
+## ROUND 15 pick was found to make the rope LONGER (8.4) than its
+## pre-ROUND-15 value (8.0), contradicting that round's own stated goal of
+## making it shorter. See player.gd's DART_ROPE_LENGTH doc comment for the
+## full writeup; both scripts now agree on 6.0 * PLAYER_CAPSULE_HEIGHT = 7.2.
+const ROPE_LENGTH: float = 6.0 * GameManager.PLAYER_CAPSULE_HEIGHT
 
 ## Obstacle collision boxes (pillars in main.tscn, trees/cacti added by
 ## nature_scatter.gd's _add_obstacle_collision) all uniformly span world Y

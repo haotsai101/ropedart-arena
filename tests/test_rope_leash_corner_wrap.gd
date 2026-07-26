@@ -33,8 +33,9 @@ extends Node
 
 const SETTLE_TICKS: int = 300  ## ~5s at 60Hz -- long enough to sweep well past max leash
 const MOVE_SPEED: float = 6.0  ## matches player.gd's own default move_speed
-## must match player.gd's own DART_ROPE_LENGTH (ROUND 15, 2026-07-25 resize)
-const DART_ROPE_LENGTH: float = 6.0 * (GameManager.PLAYER_HALF_HEIGHT * 2.0)
+## must match player.gd's own DART_ROPE_LENGTH (ROUND 16, 2026-07-25
+## correction: derives from PLAYER_CAPSULE_HEIGHT, not PLAYER_HALF_HEIGHT*2.0)
+const DART_ROPE_LENGTH: float = 6.0 * GameManager.PLAYER_CAPSULE_HEIGHT
 ## A single-tick position jump bigger than this, immediately followed by a
 ## comparable jump back the OTHER way, is what "zigzag/hook fold" looks like
 ## numerically.

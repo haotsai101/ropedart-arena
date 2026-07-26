@@ -77,24 +77,26 @@ const HITBOX_DEBUG_RADIUS: float = 0.6
 const DART_STATE_ANCHORED: int = 1
 
 ## ROUND 15 (2026-07-25) RESIZE, per explicit user direction: "The rope is
-## supposed to be 6 times the character's height." Character height is
-## derived from GameManager.PLAYER_HALF_HEIGHT (0.7 -> 1.4 full height), NOT
-## the raw scenes/player.tscn CapsuleShape3D.height (1.2) — verified by
-## checking every other real consumer of "character height" in this codebase
-## before picking one, not assumed: (a) GameManager.PLAYER_HALF_HEIGHT is
-## already the value spawn positioning treats as authoritative (added to
-## every spawn marker's Y, and confirmed by this file's own
-## _mesh_ground_offset comment above to be exactly the offset that puts the
-## character's real rendered feet at the floor); (b) rope_dart.gd's own
-## capsule_height export — ALREADY 1.4, independently, for real per-frame
-## gameplay math (the head-hit vs. body-hit capsule top used by
-## _check_hits()) — agrees with PLAYER_HALF_HEIGHT*2 exactly. Two independent
-## real gameplay systems already treat 1.4 as "the" character height; only
-## the raw physics collision shape's own (different, 1.2) value disagrees,
-## and nothing else in the codebase reads that shape's height as a
-## general-purpose size figure. Referenced directly (not a magic literal) so
-## this stays correct if the character's size is ever retuned.
-const DART_ROPE_LENGTH: float = 6.0 * (GameManager.PLAYER_HALF_HEIGHT * 2.0)
+## supposed to be 6 times the character's height." Character height was
+## originally derived from GameManager.PLAYER_HALF_HEIGHT (0.7 -> 1.4 full
+## height) rather than the raw scenes/player.tscn CapsuleShape3D.height (1.2),
+## on the reasoning that two other real gameplay systems (spawn positioning's
+## ground-offset math and rope_dart.gd's own capsule_height export) already
+## agreed on 1.4.
+##
+## ROUND 16 (2026-07-25) CORRECTION, per direct user instruction: ROUND 15's
+## own pick of 1.4 actually made the rope LONGER (6x1.4=8.4) than its
+## pre-ROUND-15 value (8.0) -- which contradicted the user's actual stated
+## goal that round, "the rope is currently too long." Flagged this
+## contradiction and asked whether the raw physics capsule height (1.2,
+## giving 6x1.2=7.2 -- genuinely shorter, as the user wanted) was intended
+## instead. User's reply, verbatim: "Change to 1.2." Now derived from
+## GameManager.PLAYER_CAPSULE_HEIGHT (see that constant's own comment for why
+## it has to be a hand-mirrored value rather than read from the .tscn
+## directly) instead of PLAYER_HALF_HEIGHT*2.0 -- referenced directly, not a
+## bare magic literal, so this stays correct if the character's size is ever
+## retuned again.
+const DART_ROPE_LENGTH: float = 6.0 * GameManager.PLAYER_CAPSULE_HEIGHT
 
 ## Rope visual radius -- the physics segments' own capsule collision radius
 ## AND the rendered tube mesh's radius (see _build_tube_mesh()) share this
@@ -191,13 +193,22 @@ const ROPE_PHYSICS_SEGMENT_HALF_LENGTH: float = ROPE_PHYSICS_SEGMENT_LENGTH * 0.
 ## hand" (per the user's literal spec) regardless of segment count, rather
 ## than sitting exactly on top of the hand anchor's own point.
 const ROPE_BUNCH_SPACING: float = 0.4
-## Per-segment mass, redistributed proportionally across the current segment
-## count from the original 8-segment chain's own 0.03-per-segment / 0.24-total
-## baseline (0.03 * 8.0), so the chain's TOTAL mass (and therefore its overall
-## inertia/behavior under the same joint bias/damping) stays roughly constant
-## regardless of how many segments it's currently split across. ROUND 15
-## (2026-07-25): denominator updated 32 -> 24 alongside ROPE_PHYSICS_SEGMENTS.
-const ROPE_SEGMENT_MASS: float = 0.03 * 8.0 / 24.0
+## Mass per unit of segment length (a linear density), not a bare per-segment
+## mass -- this is what actually stayed constant across every prior
+## segment-count resize (ROUND 12: 8 segments @ 1.0 length-per-segment @ 0.03
+## mass; ROUND 12->15: 32 segments @ 0.25 length-per-segment @ 0.0075 mass;
+## every one of those ratios is 0.03/1.0=0.03). ROUND 15 itself only
+## re-derived mass for a segment-COUNT change (32->24) at a fixed total
+## length (8.4), so it approximated this via "keep the whole chain's total
+## mass at the original 0.24" -- equivalent to this density only because the
+## length didn't change that round. ROUND 16 (2026-07-25) changes the LENGTH
+## too (8.4 -> 7.2, see DART_ROPE_LENGTH above), so per the task's own
+## instruction to re-derive mass proportionally to the new total length, this
+## is now expressed directly as density * current segment length, which
+## automatically scales total chain mass down with a shorter rope (0.24 ->
+## 0.216) rather than holding it artificially fixed.
+const ROPE_SEGMENT_LINEAR_MASS_DENSITY: float = 0.03
+const ROPE_SEGMENT_MASS: float = ROPE_SEGMENT_LINEAR_MASS_DENSITY * ROPE_PHYSICS_SEGMENT_LENGTH
 const ROPE_LINEAR_DAMP: float = 1.6
 const ROPE_ANGULAR_DAMP: float = 2.2
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's

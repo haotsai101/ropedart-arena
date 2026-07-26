@@ -129,6 +129,22 @@ func resolve_cloth_id(base_char_id: String, choice: String) -> String:
 
 const PLAYER_HALF_HEIGHT := 0.7  # half-height of the player capsule; added to spawn marker Y
 
+## ROUND 16 (2026-07-25): the RAW scenes/player.tscn CapsuleShape3D.height
+## value, mirrored here by hand (no way to read a .tscn sub-resource from a
+## const expression at compile time) -- same hand-sync convention this
+## codebase already uses for e.g. player.gd's HITBOX_DEBUG_RADIUS. Added per
+## explicit user correction of ROUND 15's own pick: ROUND 15 deliberately
+## chose PLAYER_HALF_HEIGHT*2.0 (1.4) over this raw capsule height (1.2) for
+## DART_ROPE_LENGTH's "6x character height" derivation, reasoning that two
+## other real gameplay systems already agreed on 1.4 -- but the user's actual
+## goal that round was "the rope is currently too long," and 6x1.4=8.4 is
+## LONGER than the pre-ROUND-15 8.0, which contradicted that goal. Directly
+## asked whether the raw capsule height (1.2, giving 6x1.2=7.2, genuinely
+## shorter) was intended instead; user's reply: "Change to 1.2." This
+## constant now exists so DART_ROPE_LENGTH/ROPE_LENGTH reference a named
+## value instead of a bare literal, per that same request.
+const PLAYER_CAPSULE_HEIGHT := 1.2
+
 const _FALLBACK_SPAWNS := [
 	Vector3(-10.0, 0.7, -10.0),
 	Vector3( 10.0, 0.7, -10.0),

@@ -21,8 +21,9 @@ extends Node
 ## PHASE 2: with zero movement input held, call _throw() directly (bypassing
 ## the charge-hold UI path, matching the same call other regression tests in
 ## this suite already use) and track get_pos_2d() every tick through the
-## dart's full FLYING -> ANCHORED lifetime (well past max range, ROPE_LENGTH=8
-## at travel_speed=18 takes under half a second). Confirms zero position
+## dart's full FLYING -> ANCHORED lifetime (well past max range, ROPE_LENGTH
+## at travel_speed=18 takes under half a second regardless of the exact
+## length). Confirms zero position
 ## drift from the throw action itself, including through the window right
 ## after _spawn_physics_rope() when the chain is still bunched/settling and
 ## _clamp_to_rope_leash() first starts trying to fire (once the dart
