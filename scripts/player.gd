@@ -143,52 +143,18 @@ const ROPE_RADIUS: float = 0.035
 ## ROPE_PHYSICS_SEGMENTS' own comment below for why the old growing-leash
 ## max_reach_from_hand position clamp was deleted, not reused, for this).
 ##
-## GRAVITY / COLLISION-LAYER EXPERIMENT (2026-07-25, feature/melee-slash-v2):
-## every earlier round through this point treated the Y-PLANE LOCK (every
-## segment hard-locked to the dart's plane_y, gravity_scale = 0.0) and the
-## one-directional ROPE_OBSTACLE_LAYER_BIT collision scheme as non-negotiable
-## -- per the user's own then-verbatim requirement, "I want the rope to
-## disregard gravity and live on a plane." This round is a direct, explicit
-## REVERSAL of that requirement, per new direct instruction: "Let's try
-## dropping the special collision logic all together. The ropedart doesn't
-## need to be on a special plane. Use the default collision engine." Both
-## mechanisms are now REMOVED:
-##  - rope_segment_body.gd's _integrate_forces() no longer overrides Y at
-##    all -- segments fall under real gravity (gravity_scale left at
-##    RigidBody3D's own default, 1.0, not explicitly zeroed any more) and
-##    settle/collide in full 3D, same as any other dynamic body.
-##  - Segments sit on Godot's plain default collision layer/mask (1/1) --
-##    see _make_rope_segment_body() below -- the same layer players'
-##    capsules, the ground, and obstacles already use, instead of a bespoke
-##    ROPE_OBSTACLE_LAYER_BIT only obstacles opted into. This means a segment
-##    can now also meaningfully rest on the ground (gravity is back, so it
-##    needs somewhere to land) and, by default, could physically contact
-##    players too -- see _spawn_physics_rope()'s own new
-##    add_collision_exception_with(self) call for why the OWNER specifically
-##    is excluded (a rope spawned bunched at/inside its own wielder's capsule
-##    must not fight its own body in constant, degenerate contact), and
-##    CLAUDE.md's dated entry / this session's own report for what was
-##    actually measured about colliding with OTHER players.
-## rope_segment_body.gd's own doc comment has the fuller technical writeup of
-## what changed and why in that file specifically (the MAX_SEGMENT_SPEED
-## clamp and the has_obstacle_contact signal both needed small adjustments to
-## keep meaning what they always meant once Y stopped being locked and the
-## layer stopped being exclusive to obstacles).
-##
-## SCOPE DECISION, stated explicitly per the task's own instruction not to
-## guess silently: rope_dart.gd's own `plane_y` (the dart HEAD's fixed
-## raycast/render height) is UNCHANGED by this experiment. That constant
-## governs a plain 2D raycast sample height and the dart's own render
-## position -- there is no RigidBody3D, no gravity_scale, and no collision
-## layer/mask special-casing on the dart itself to "drop"; the "special
-## collision logic" and "special plane" the user asked to remove refers to
-## THIS chain's Y-lock/gravity_scale/layer-bit trio, which has no equivalent
-## on the dart head at all (its raycast query already uses an unrestricted
-## default collision_mask, only excluding player RIDs by name). Touching
-## plane_y would not simplify anything here; it would only reintroduce a
-## previously-fixed bug (the raw animated hand-bone Y sample landing outside
-## the shared obstacle collision band and making the raycast miss real
-## geometry -- see rope_dart.gd's own MIN_PLANE_Y/MAX_PLANE_Y comment).
+## Y-PLANE LOCK (non-negotiable, unchanged from every earlier round -- per
+## explicit user requirement, "I want the rope to disregard gravity and live
+## on a plane"): every segment has gravity_scale = 0.0 AND is hard-locked to
+## the dart's fixed plane_y every physics step via rope_segment_body.gd's
+## _integrate_forces() override (Godot's own documented, solver-safe way to
+## correct a RigidBody3D's transform each step -- poking global_position from
+## outside physics processing is explicitly discouraged by Godot's docs).
+## Real collision against obstacle geometry (pillars/trees/cacti) is
+## Godot's own solver reacting to each segment's capsule CollisionShape3D on
+## ROPE_OBSTACLE_LAYER_BIT -- see arena_obstacle.gd's matching layer bit --
+## with collision_layer left at 0 so the chain can never push a player or
+## leak into any other gameplay system.
 ##
 ## WHAT WAS DELETED THIS ROUND, AND WHY: every render-side "compute where the
 ## rope SHOULD be based on geometry, then draw that" correction layer --
@@ -245,16 +211,16 @@ const ROPE_SEGMENT_LINEAR_MASS_DENSITY: float = 0.03
 const ROPE_SEGMENT_MASS: float = ROPE_SEGMENT_LINEAR_MASS_DENSITY * ROPE_PHYSICS_SEGMENT_LENGTH
 const ROPE_LINEAR_DAMP: float = 1.6
 const ROPE_ANGULAR_DAMP: float = 2.2
-## REMOVED (2026-07-25 experiment, see this file's ROPE_PHYSICS_* doc comment
-## above): the one-directional ROPE_OBSTACLE_LAYER_BIT this used to share
-## with arena_obstacle.gd's own copy of the same bit. Segments now use
-## Godot's plain default collision layer/mask (1/1) -- see
-## _make_rope_segment_body() below.
+## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
+## comment for why it's duplicated rather than shared, and for the
+## one-directional layer/mask design (chain reacts to obstacles; nothing
+## reacts to the chain) that keeps this simulated rope from ever pushing a
+## player or interfering with the dart's own already-working flight raycast.
+const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
 
 ## Preloaded once at class scope (not instantiated per-dart) -- every rope
 ## segment body shares this same script; see rope_segment_body.gd's own doc
-## comment for the gravity/speed-clamp/obstacle-contact mechanism it
-## implements (Y-plane-lock removed this round, see above).
+## comment for the plane-lock/no-gravity/speed-clamp mechanism it implements.
 const RopeSegmentBodyScript: Script = preload("res://scripts/rope_segment_body.gd")
 
 ## --- Continuous tube-mesh rendering for the rope (visual only -- traces the
@@ -1435,16 +1401,32 @@ func _get_rope_tip_target() -> Vector3:
 	return get_hand_world_position()
 
 
+func _get_rope_plane_y() -> float:
+	## The one fixed horizontal-plane height every physics-rope segment for
+	## the CURRENT dart is locked to (see rope_segment_body.gd's locked_y) --
+	## read directly from the owning rope_dart.gd instance's own plane_y
+	## (duck-typed) while a dart is out. Falls back to the current hand height
+	## while idle (dart == null) -- there is no dart.plane_y to read then, and
+	## the chain is collapsed at the hand anyway so the exact plane barely
+	## matters visually, but it still needs to be plane_y-shaped (fixed for
+	## the whole idle stretch, not recomputed every tick) once a throw
+	## eventually starts -- rope_dart.gd's launch() re-derives its own fresh
+	## plane_y from the hand at that moment regardless, so this idle fallback
+	## only affects the brief idle-collapsed look, not any real throw.
+	if dart != null and is_instance_valid(dart):
+		return dart.plane_y
+	return get_hand_world_position().y
+
+
 func _get_rope_hand_anchor_pos() -> Vector3:
-	## EXPERIMENT (2026-07-25, see this file's ROPE_PHYSICS_* doc comment for
-	## the full writeup): used to hard-clamp Y to a dedicated _get_rope_plane_y()
-	## helper (itself reading the current dart's plane_y, or the hand's own
-	## height while idle) so the kinematic hand anchor wouldn't fight the
-	## first dynamic segment's own Y-plane lock every physics step. Both the
-	## helper and the lock it existed to avoid fighting are gone now -- the
-	## hand anchor simply tracks the REAL, animated hand bone position,
-	## unflattened, same as any other kinematic joint attachment point would.
-	return get_hand_world_position()
+	## The hand end of the rope, X/Z from the real (animated, bobbing) hand
+	## bone but Y hard-clamped to _get_rope_plane_y() -- the kinematic hand
+	## anchor is JOINTED to the first dynamic segment, whose Y is hard-locked
+	## to plane_y every physics step (see rope_segment_body.gd) -- if the hand
+	## anchor's own Y were left free to follow the real hand bone's bob
+	## instead, the joint would fight a small constant Y mismatch every step.
+	var hand_pos: Vector3 = get_hand_world_position()
+	return Vector3(hand_pos.x, _get_rope_plane_y(), hand_pos.z)
 
 
 func _spawn_physics_rope() -> void:
@@ -1473,21 +1455,24 @@ func _spawn_physics_rope() -> void:
 	get_parent().add_child(root)
 	_physics_rope_root = root
 
-	# At spawn time (always right at _ready(), before any throw), the tip
-	# coincides with the hand -- see _get_rope_tip_target()'s own "idle
-	# collapse" comment -- so the chain's very first configuration IS the
-	# collapsed-at-the-hand rest state.
+	var plane_y: float = _get_rope_plane_y()
+	# Hand end is plane-locked here too (X/Z from the real hand, Y forced to
+	# plane_y) -- see _get_rope_hand_anchor_pos()'s own comment for why this
+	# matters beyond just visual consistency: it keeps the joint to the first
+	# dynamic segment (itself plane-locked) from fighting a constant Y
+	# mismatch every physics step. At spawn time (always right at _ready(),
+	# before any throw), the tip coincides with the hand -- see
+	# _get_rope_tip_target()'s own "idle collapse" comment -- so the chain's
+	# very first configuration IS the collapsed-at-the-hand rest state.
 	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
 	var tip_pos: Vector3 = _get_rope_tip_target()
 
 	# Initial layout direction: along the current hand->tip span if it's
 	# meaningful, else along the player's current aim -- purely cosmetic (a
 	# tiny fan-out for the very first render frame, see ROPE_BUNCH_SPACING).
-	# EXPERIMENT NOTE: both endpoints used to share the exact same plane-
-	# locked Y, guaranteeing this direction came out flat; now that Y is
-	# real (unflattened hand position, gravity-driven segments), span_dir
-	# can have a genuine Y component from frame one -- that's fine, this is
-	# only a cosmetic initial-orientation seed, not a constraint.
+	# Both endpoints already share the same Y (plane_y), so this direction is
+	# naturally flat (zero Y component) whenever it's derived from the real
+	# span -- the aim-direction fallback is explicitly constructed flat too.
 	var span: Vector3 = tip_pos - hand_pos
 	var span_dir: Vector3
 	if span.length() > 0.01:
@@ -1541,22 +1526,7 @@ func _spawn_physics_rope() -> void:
 	var spacing: float = ROPE_BUNCH_SPACING / denom
 	for i in range(ROPE_PHYSICS_SEGMENTS):
 		var seg_center: Vector3 = hand_pos + span_dir * (float(i) * spacing)
-		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis)
-		# EXPERIMENT (2026-07-25): segments now sit on Godot's plain default
-		# collision layer/mask (see _make_rope_segment_body()), so unlike the
-		# old one-directional ROPE_OBSTACLE_LAYER_BIT scheme (collision_layer
-		# = 0, undetectable by anything), a segment CAN now physically touch
-		# a player -- including its own owner. A rope spawns bunched right
-		# at/inside the owner's own hand, already overlapping their capsule,
-		# so without this exception the chain would be in constant,
-		# degenerate contact with its own wielder from frame one. Both
-		# directions are excepted -- Godot's collision-pair check consults
-		# either body's own exception list, so leaving only one side excepted
-		# is not reliably sufficient. Deliberately NOT excepted against other
-		# players -- see this file's ROPE_PHYSICS_* doc comment / this
-		# session's report for what that was measured to do.
-		seg.add_collision_exception_with(self)
-		add_collision_exception_with(seg)
+		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis, plane_y)
 		_physics_rope_segments.append(seg)
 		_join_rope_pin(prev, prev_local_far, seg, local_near)
 		prev = seg
@@ -1570,14 +1540,10 @@ func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> 
 	## mesh of its own -- purely a joint attachment point whose position is
 	## overwritten every physics tick (see _update_physics_rope_anchors()).
 	## collision_layer/mask both 0: it must never be detectable by, or react
-	## to, anything -- it's just a moving pin, not a physical object. This is
-	## unaffected by the 2026-07-25 default-collision-layer experiment (see
-	## _make_rope_segment_body()) -- the anchors never carried the removed
-	## ROPE_OBSTACLE_LAYER_BIT scheme in the first place, and having no
-	## CollisionShape3D of their own means layer/mask are moot for them
-	## regardless. Its own local anchor point for every joint it's part of is
-	## always exactly Vector3.ZERO (its own origin) -- see _join_rope_pin()'s
-	## callers.
+	## to, anything (including the real obstacle layer the segments below
+	## react to) -- it's just a moving pin, not a physical object. Its own
+	## local anchor point for every joint it's part of is always exactly
+	## Vector3.ZERO (its own origin) -- see _join_rope_pin()'s callers.
 	var body := RigidBody3D.new()
 	body.name = node_name
 	body.freeze = true
@@ -1592,7 +1558,7 @@ func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> 
 	return body
 
 
-func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, orient_basis: Basis) -> RigidBody3D:
+func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, orient_basis: Basis, plane_y: float) -> RigidBody3D:
 	## One real physics link: a capsule collider (smoother than a cylinder for
 	## sliding along an obstacle's edge/corner, same reasoning games commonly
 	## use capsules for chain links) -- NO mesh/visual of its own (the rope's
@@ -1605,36 +1571,35 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	## rotation error on top of position. (Named orient_basis, not basis, to
 	## avoid shadowing Node3D's own `basis` property, which GDScript warns on.)
 	##
-	## EXPERIMENT (2026-07-25, see this file's ROPE_PHYSICS_* doc comment for
-	## the full writeup): gravity_scale is left at RigidBody3D's own default
-	## (1.0) -- NOT explicitly zeroed any more -- and collision_layer/mask
-	## are left at Godot's own plain default (1/1), NOT the old
-	## collision_layer=0/collision_mask=ROPE_OBSTACLE_LAYER_BIT one-
-	## directional scheme. A segment now reacts to gravity and to real
-	## obstacle geometry, the ground, and (by default) other physics bodies
-	## on layer 1 the same way any other dynamic RigidBody3D in this project
-	## would -- see _spawn_physics_rope()'s own add_collision_exception_with()
-	## call for the one deliberate carve-out this required (the owner's own
-	## body, to avoid a rope spawned bunched at its own wielder's hand being
-	## in constant degenerate self-contact).
+	## gravity_scale = 0.0 and the attached rope_segment_body.gd script
+	## (locked_y = plane_y) are the mechanism for the user's explicit
+	## "disregard gravity and live on a plane" requirement -- see that
+	## script's own doc comment for the full writeup.
+	##
+	## collision_mask = ROPE_OBSTACLE_LAYER_BIT ONLY (not the default layer):
+	## reacts to real obstacle geometry, never to players/ground/the dart
+	## head. collision_layer = 0: nothing else's mask can ever detect this
+	## segment either -- strictly one-directional, so the chain can never
+	## push a player or otherwise leak into gameplay logic.
 	##
 	## contact_monitor / max_contacts_reported: lets rope_segment_body.gd know,
 	## per tick, whether THIS segment is actually touching real obstacle
-	## geometry right now. Under the new default layer/mask a contact could
-	## now be the ground, another player, or (absent
-	## joint_disable_collisions_between_bodies, see _join_rope_pin()) a chain
-	## neighbor -- so rope_segment_body.gd's own _has_real_obstacle_contact()
-	## now filters contacts down to ones whose collider is actually in the
-	## "obstacles" group before reporting true, keeping this signal meaning
-	## what player.gd's _clamp_to_rope_leash() (the wrap-aware leash pivot)
-	## has always assumed it means.
+	## geometry right now (state.get_contact_count() > 0) -- since this body's
+	## collision_mask only ever matches ROPE_OBSTACLE_LAYER_BIT (never another
+	## segment, a player, or the ground), any contact reported here is
+	## unambiguously "resting against a real obstacle." Consumed by
+	## player.gd's _clamp_to_rope_leash() (the wrap-aware leash pivot).
 	var body := RigidBody3D.new()
 	body.name = node_name
 	body.set_script(RopeSegmentBodyScript)
+	body.locked_y = plane_y
 	body.mass = ROPE_SEGMENT_MASS
+	body.gravity_scale = 0.0
 	body.linear_damp = ROPE_LINEAR_DAMP
 	body.angular_damp = ROPE_ANGULAR_DAMP
 	body.continuous_cd = true
+	body.collision_layer = 0
+	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
 	body.contact_monitor = true
 	body.max_contacts_reported = 4
 
@@ -1746,18 +1711,6 @@ func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: V
 	PhysicsServer3D.joint_make_pin(joint_rid, a.get_rid(), local_a, b.get_rid(), local_b)
 	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_BIAS, ROPE_JOINT_BIAS)
 	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_DAMPING, ROPE_JOINT_DAMPING)
-	# EXPERIMENT (2026-07-25): now that segments sit on Godot's plain default
-	# collision layer/mask instead of the old collision_layer=0 scheme,
-	# consecutive linked bodies -- spawned touching/overlapping by
-	# construction (each capsule's own end coincides with its neighbor's) --
-	# would otherwise generate real contact forces fighting the very joint
-	# holding them together. This is the SAME thing a plain PinJoint3D/
-	# Generic6DOFJoint3D NODE would do automatically via its own
-	# `exclude_nodes_when_colliding` property (true by default) -- not a new
-	# bespoke exception, just the low-level-API equivalent of what "the
-	# default collision engine" already does for jointed bodies out of the
-	# box.
-	PhysicsServer3D.joint_disable_collisions_between_bodies(joint_rid, true)
 	_physics_rope_joint_rids.append(joint_rid)
 
 
@@ -2168,16 +2121,11 @@ func _clamp_to_rope_leash() -> void:
 	## below, which this same probe confirmed never itself misfires (offset_len
 	## sat safely under DART_ROPE_LENGTH throughout every logged tick of both
 	## rounds' test runs). Gate the whole pivot clamp on
-	## `_debug_last_has_contact` (rope_segment_body.gd's existing,
-	## unambiguous "resting against real obstacle geometry, not a
+	## `_debug_last_has_contact` (rope_segment_body.gd's existing, already-
+	## verified-unambiguous "resting against real obstacle geometry, not a
 	## player/ground/another segment" signal, added for the ROUND 5 CLIPPING
-	## FIX and already read the same way there -- EXPERIMENT NOTE, 2026-07-25:
-	## since rope segments now sit on Godot's plain default collision
-	## layer/mask instead of a bit exclusive to obstacles, staying
-	## unambiguous required rope_segment_body.gd's own
-	## _has_real_obstacle_contact() to start filtering by the "obstacles"
-	## group explicitly -- see that script's doc comment) being true for at
-	## least one segment in the chain -- i.e. only trust "pivot on the first segment"
+	## FIX and already read the same way there) being true for at least one
+	## segment in the chain -- i.e. only trust "pivot on the first segment"
 	## once there's an actual corner being wrapped for it to legitimately
 	## rest against. Purely open-air anchors (this bug's whole reproduction)
 	## and the ordinary mid-settle window right after any throw now never

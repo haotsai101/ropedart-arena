@@ -3,26 +3,18 @@ extends StaticBody3D
 ## thrown dagger against its footprint (see get_rect_2d(), a simple 2D
 ## swept-rect test — no physics-engine query needed for that).
 
-## EXPERIMENT (2026-07-25, feature/melee-slash-v2): the dedicated
-## ROPE_OBSTACLE_LAYER_BIT ("rope_obstacles", layer 2 in project.godot's
-## [layer_names]) this node used to add on top of its own default layer 1 --
-## the one-directional bit player.gd's real physics rope chain used as its
-## collision_mask so the rope could react to real map geometry without ever
-## being detectable by/colliding with players, the ground, or the dart head
-## -- is REMOVED, per direct, explicit user instruction: "Let's try dropping
-## the special collision logic all together... Use the default collision
-## engine." This obstacle now sits on nothing but its own original default
-## layer (1, untouched, never explicitly set here) -- the same one players'
-## capsules and the ground already use -- and player.gd's rope segments
-## react to it (and everything else on layer 1) via their own newly-default
-## collision_mask, not a bespoke shared bit. See player.gd's
-## _make_rope_segment_body()/_spawn_physics_rope() for the corresponding
-## removal and the new collision-exception-with-owner call it required.
-## project.godot's own layer_2="rope_obstacles" name entry is now unused dead
-## config -- left in place rather than edited, since removing a
-## [layer_names] entry has no functional effect and this experiment may be
-## reverted (see this file's own CLAUDE.md dated entry for the merge
-## decision).
+## Layer 2 (named "rope_obstacles" in project.godot's [layer_names]) is added
+## on top of whatever collision_layer this node already has (normally the
+## default layer 1, left untouched so every existing raycast/query that hits
+## obstacles via the default layer keeps working unchanged) -- this is the
+## dedicated bit player.gd's real physics rope chain (see
+## _spawn_physics_rope() there) uses as its collision_mask, so the rope reacts
+## to real map geometry (pillars, trees/cacti) without ever being able to
+## detect/collide with players, the ground, or the dart head (none of which
+## carry this bit). No shared constant between the two scripts -- see
+## player.gd's ROPE_OBSTACLE_LAYER_BIT comment for this codebase's existing
+## precedent of tolerating small hand-synced duplication like this.
+const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
 
 @export var half_size: Vector2 = Vector2(0.75, 0.75)
 
@@ -40,6 +32,7 @@ var _outline_hull: PackedVector2Array = []
 
 func _ready() -> void:
 	add_to_group("obstacles")
+	collision_layer = collision_layer | ROPE_OBSTACLE_LAYER_BIT
 	_compute_outline_hull()
 
 
