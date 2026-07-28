@@ -105,11 +105,21 @@ const POST_RETRIEVE_COLLAPSE_RADIUS: float = 4.5
 ## measured (a) idle-at-hand collapse (dart == null) or (b) the first ~40
 ## ticks right after a throw. See this function's own doc comment below for
 ## the measurement design and the real root-cause finding.
-const STEADY_PRE_SETTLE_TICKS: int = 300  ## 5s -- let the forced-anchor's own
-## initial settle transient (same one CONFIG_SETTLE_TICKS above already
-## exists to wait out) fully decay before the jitter measurement window
-## starts, so residual unfold motion is never mistaken for steady-state
-## jitter.
+const STEADY_PRE_SETTLE_TICKS: int = 600  ## 10s (was 5s/300 ticks) -- let the
+## forced-anchor's own initial settle transient (same one CONFIG_SETTLE_TICKS
+## above already exists to wait out) fully decay before the jitter
+## measurement window starts, so residual unfold motion is never mistaken for
+## steady-state jitter. Raised 300->600 (2026-07-26, direct-contact jitter
+## investigation) after the new "near_corner_slack_bunch" config (short real
+## span, ~5 units of slack that has to fold up right at a real corner
+## contact) measured a real, one-time large hand/seg step (hand_max_step
+## 0.223, seg_max_step 0.096) landing WITHIN the first ~60 ticks of the
+## sampling window at the old 300-tick pre-settle -- i.e. that config's own
+## initial-unfurl transient (a materially harder fold than the other 3
+## configs, which all measured cleanly settled well before 300 ticks) hadn't
+## fully decayed yet, not a sustained steady-state instability. Re-verified
+## at 600 ticks: see this file's own dated CLAUDE.md entry for the actual
+## before/after numbers.
 const STEADY_SAMPLE_TICKS: int = 360  ## 6s -- inside the task's own
 ## requested 5-10s / 300-600 tick sampling window.
 const STEADY_LOG_EVERY: int = 60  ## ~1s -- periodic running-max line, so a
@@ -321,6 +331,18 @@ func _sample_chain_points_2d(player: Node) -> Array[Vector2]:
 	return pts
 
 
+func _sample_chain_points_3d(player: Node) -> Array[Vector3]:
+	## Same chain order as _sample_chain_points_2d(), but full Vector3 world
+	## positions -- the exact input _update_rope_tube_mesh() itself builds
+	## for _compute_rope_tube_curve_points(), used by the render-curve
+	## jitter probe in _measure_steady_state_jitter().
+	var pts: Array[Vector3] = [(player._physics_rope_hand_anchor as RigidBody3D).global_position]
+	for seg in player._physics_rope_segments:
+		pts.append((seg as RigidBody3D).global_position)
+	pts.append((player._physics_rope_tip_anchor as RigidBody3D).global_position)
+	return pts
+
+
 func _test_anchored_steady_state_jitter(rect: Rect2) -> bool:
 	print("[TEST] --- 5. ANCHORED STEADY-STATE JITTER (player stationary, dart settled several seconds, zero new input) ---")
 	## THREE configs, all at PHYSICALLY ACHIEVABLE hand-to-tip distances (<=
@@ -344,10 +366,30 @@ func _test_anchored_steady_state_jitter(rect: Rect2) -> bool:
 	## pillar" scenario) is unchanged from the original probe. This 3-way
 	## split lets this test tell apart a general chain-level jitter from one
 	## specific to tautness or to the wrap/leash-pivot interaction.
+	## "near_corner_slack_bunch" (2026-07-26 -- direct-contact jitter
+	## investigation, added specifically because it's a materially DIFFERENT
+	## real-contact configuration from "corner_wrap_anchor" above, not a
+	## duplicate): corner_wrap_anchor's hand/tip sit far out on the diagonal
+	## (margin 1.2 past each opposite corner), so its own real hand-to-tip
+	## distance (6.22) is close to the chain's DART_ROPE_LENGTH capacity
+	## (7.2) -- only ~1 unit of slack, i.e. a near-TAUT wrap with almost no
+	## excess rope left to fold up anywhere. The user's own report described
+	## a "small hook/loop shape where the rope touches the pillar's base" --
+	## a materially different visual (a compact tangle sitting right at one
+	## corner) from a taut diagonal stretch. This config instead puts BOTH
+	## hand and tip close (0.3 margin) to the SAME single corner, on its two
+	## adjacent edges (real distance ~1.8, wrap path ~2.1) -- a SHORT real
+	## span against the same 7.2 total capacity, deliberately forcing ~5
+	## units of slack to fold up with nowhere physically reachable to go
+	## except bunched right at that one genuinely-contacting corner (the
+	## same "large local excess near a real contact point" combination
+	## corner_wrap_anchor's own near-zero-slack geometry never exercises).
+	var near_corner: Vector2 = rect.position
 	var jitter_configs: Array = [
 		["open_air_taut", Vector2(-8.0, -8.0), Vector2(-8.0, -8.0) + Vector2(1.0, 0.0) * 7.0],
 		["open_air_slack", Vector2(-8.0, -8.0), Vector2(-8.0, -8.0) + Vector2(1.0, 0.0) * 5.5],
 		["corner_wrap_anchor", rect.position + Vector2(-1.2, -1.2), rect.end + Vector2(1.2, 1.2)],
+		["near_corner_slack_bunch", near_corner + Vector2(-0.3, 1.0), near_corner + Vector2(1.0, -0.3)],
 	]
 
 	var all_ok := true
@@ -372,6 +414,47 @@ func _test_anchored_steady_state_jitter(rect: Rect2) -> bool:
 		## own driven target is a literal constant for the rest of this test,
 		## so ANY tip-anchor motion measured below is either genuine physics
 		## settle or a bug, never a moving target.
+
+		## SELF-PICKUP CONTAMINATION FIX (2026-07-28, found while investigating
+		## a reported "rope jitter near a pillar" bug): for a SHORT real
+		## hand-to-tip span (e.g. near_corner_slack_bunch's own ~1.8 units),
+		## the REAL, un-overridden throw above can travel far enough within
+		## its own 5-tick settle window to land inside rope_dart.gd's
+		## pickup_radius (0.9) of the still-standing player BEFORE this
+		## function's own state/head_2d override lands -- triggering a real,
+		## natural ANCHORED -> pickup-check -> recall() transition (see
+		## rope_dart.gd's State.ANCHORED branch) that sets _is_recalling=true
+		## via player.gd's own dart-state sync (_physics_process(), "Keep
+		## _is_recalling ... in sync with the dart's OWN state"). This
+		## function's override then stomps dart.state back to ANCHORED, but
+		## NOTHING here was clearing _is_recalling -- which is normally only
+		## ever cleared by _on_dart_returned()/kill()/reset_for_round(), none
+		## of which this shortcut calls -- leaving the character stuck
+		## displaying the recall sequence's own "Push" clip FOREVER (since
+		## _advance_recall_anim()'s HOLD phase only exits once _is_recalling
+		## goes false, which now never happens). Confirmed via a dedicated,
+		## isolated repro probe (not committed) that this, not any real
+		## physics/render bug, was the entire source of a large (~0.1-1.3
+		## unit) "periodic hand jump" measured before this fix: root_pos/
+		## root_vel/mesh_quaternion were all bit-identical every single tick
+		## (ruling out player-body/collision or facing-rotation causes), and
+		## the jump ticks lined up exactly with "Push"'s own current_animation
+		## and a ~160-tick (2.667s, "Push"'s own clip length) recurrence --
+		## i.e. the chain was innocently rendering a real hand-bone pose from
+		## a real (if stuck-looping) animation clip, not exhibiting any rope-
+		## physics or obstacle-contact instability. A separate, clean probe
+		## (fresh spawn, no throw, no rope, 500 ticks/~8.3s at Idle_A) found
+		## NO comparable jump anywhere -- ruling out a general Idle_A loop-
+		## seam artifact as well. Fix: explicitly clear _is_recalling and
+		## both phase/timer pairs right after the state/head_2d override, so
+		## this shortcut always produces a clean forced-ANCHORED state
+		## regardless of how far the real pre-override throw happened to
+		## travel -- matching kill()'s own established reset pattern.
+		player._is_recalling = false
+		player._recall_anim_phase = 0  # ThrowAnimPhase.NONE
+		player._recall_anim_timer = 0.0
+		player._throw_anim_phase = 0  # ThrowAnimPhase.NONE
+		player._throw_anim_timer = 0.0
 
 		await _measure_steady_state_jitter(player, cfg_name)
 		player.queue_free()
@@ -445,10 +528,63 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 	var joint_gap_samples: int = 0
 	var window_ticks: int = 0
 
+	# RENDER-CURVE jitter (2026-07-28 -- direct-contact jitter investigation,
+	# after ruling out contact-flicker and animation-clip artifacts as the
+	# dominant driver): calls the REAL, shipped _compute_rope_tube_curve_
+	# points() every tick on the same real control points _update_rope_tube_
+	# mesh() itself uses -- i.e. this measures exactly what gets drawn on
+	# screen, not a proxy for it. Tests whether the Catmull-Rom spline
+	# AMPLIFIES the tiny raw-segment jitter already measured above into
+	# something bigger near a sharp corner (a materially different question
+	# from ROUND 8/9/10's own STATIC penetration-overshoot checks -- this is
+	# about DYNAMIC frame-to-frame curve motion, never directly measured
+	# before).
+	var curve_max_step: float = 0.0
+	var curve_sum_step: float = 0.0
+	var curve_sample_count: int = 0
+	var prev_curve_pts: Array[Vector3] = player._compute_rope_tube_curve_points(_sample_chain_points_3d(player))
+
+	# CONTACT-STATE instrumentation (2026-07-26 -- direct-contact jitter
+	# investigation): reads rope_segment_body.gd's own `_debug_last_has_
+	# contact` per segment, per tick, to test the specific hypothesis that
+	# jitter localizes AT genuine obstacle contact points (contact-state
+	# flicker: a segment repeatedly gaining/losing contact tick to tick)
+	# rather than being uniform across the whole chain. `contact_step_max`/
+	# `noncontact_step_max` split seg_max_step by whether THAT segment was in
+	# contact onEITHER endpoint of the step (current or previous tick) --
+	# this is deliberately inclusive (OR, not AND) so a step that happens
+	# exactly on a contact/no-contact transition is counted as a contact-
+	# adjacent step, not silently dropped from either bucket.
+	var segs: Array = player._physics_rope_segments
+	var prev_contact: Array[bool] = []
+	for seg in segs:
+		prev_contact.append(bool(seg.get("_debug_last_has_contact")))
+	var flicker_events: int = 0  # total contact<->no-contact transitions, all segments, all ticks
+	var contact_ticks: int = 0  # ticks where >=1 segment reports contact
+	var contact_step_max: float = 0.0
+	var contact_step_sum: float = 0.0
+	var contact_step_count: int = 0
+	var noncontact_step_max: float = 0.0
+	var max_contact_segs_any_tick: int = 0
+
 	for tick in range(STEADY_SAMPLE_TICKS):
 		await get_tree().physics_frame
 		window_ticks += 1
 		var cur_pts: Array[Vector2] = _sample_chain_points_2d(player)
+
+		var cur_contact: Array[bool] = []
+		var contact_count_this_tick: int = 0
+		for seg in segs:
+			var c: bool = bool(seg.get("_debug_last_has_contact"))
+			cur_contact.append(c)
+			if c:
+				contact_count_this_tick += 1
+		max_contact_segs_any_tick = maxi(max_contact_segs_any_tick, contact_count_this_tick)
+		if contact_count_this_tick > 0:
+			contact_ticks += 1
+		for si in range(cur_contact.size()):
+			if cur_contact[si] != prev_contact[si]:
+				flicker_events += 1
 
 		# The hand anchor's own tick-to-tick motion (index 0) is the DRIVEN
 		# boundary condition here, not a free physics body --
@@ -467,12 +603,21 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 
 		# Every DYNAMIC segment's own tick-to-tick motion -- indices
 		# [1, size-2] (index 0 is the hand anchor, the last index is the tip
-		# anchor, both kinematic/driven, not free bodies).
+		# anchor, both kinematic/driven, not free bodies). cur_pts/segs share
+		# the same index offset by 1 (segs has no hand/tip entries).
 		for i in range(1, cur_pts.size() - 1):
 			var step: float = prev_pts[i].distance_to(cur_pts[i])
 			seg_max_step = maxf(seg_max_step, step)
 			seg_sum_step += step
 			seg_sample_count += 1
+			var seg_idx: int = i - 1
+			var in_contact: bool = cur_contact[seg_idx] or prev_contact[seg_idx]
+			if in_contact:
+				contact_step_max = maxf(contact_step_max, step)
+				contact_step_sum += step
+				contact_step_count += 1
+			else:
+				noncontact_step_max = maxf(noncontact_step_max, step)
 
 		var gaps: Array[float] = _joint_gaps(player)
 		for g in gaps:
@@ -480,10 +625,23 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 			joint_gap_sum += g
 			joint_gap_samples += 1
 
+		# RENDER-CURVE jitter: same real function, same real control points,
+		# called fresh every tick -- see this function's own var declarations
+		# above for why.
+		var cur_curve_pts: Array[Vector3] = player._compute_rope_tube_curve_points(_sample_chain_points_3d(player))
+		if cur_curve_pts.size() == prev_curve_pts.size():
+			for ci in range(cur_curve_pts.size()):
+				var cstep: float = prev_curve_pts[ci].distance_to(cur_curve_pts[ci])
+				curve_max_step = maxf(curve_max_step, cstep)
+				curve_sum_step += cstep
+				curve_sample_count += 1
+		prev_curve_pts = cur_curve_pts
+
 		prev_pts = cur_pts
+		prev_contact = cur_contact
 		if (tick + 1) % STEADY_LOG_EVERY == 0:
-			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f" % [
-				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max])
+			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f contact_segs_now=%d flicker_events_running=%d curve_step_running_max=%.5f" % [
+				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max, contact_count_this_tick, flicker_events, curve_max_step])
 
 	var hand_bbox_diag: float = hand_min.distance_to(hand_max)
 	var seg_mean_step: float = seg_sum_step / float(maxi(seg_sample_count, 1))
@@ -497,6 +655,18 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 	print("[TEST] %s STEADY-STATE SUMMARY over %d ticks (~%.1fs): hand_max_step=%.5f hand_bbox_diag=%.5f seg_max_step=%.5f seg_mean_step=%.5f amplification(seg/hand)=%.3f joint_gap_max=%.5f joint_gap_mean=%.5f" % [
 		cfg_name, window_ticks, float(window_ticks) / 60.0, hand_max_step, hand_bbox_diag,
 		seg_max_step, seg_mean_step, amplification, joint_gap_max, joint_gap_mean])
+	var contact_step_mean: float = contact_step_sum / float(maxi(contact_step_count, 1))
+	print("[TEST] %s CONTACT-STATE SUMMARY: contact_ticks=%d/%d (%.1f%%) max_contact_segs_any_tick=%d flicker_events=%d contact_step_max=%.5f contact_step_mean=%.5f noncontact_step_max=%.5f" % [
+		cfg_name, contact_ticks, window_ticks, 100.0 * float(contact_ticks) / float(maxi(window_ticks, 1)),
+		max_contact_segs_any_tick, flicker_events, contact_step_max, contact_step_mean, noncontact_step_max])
+	var curve_mean_step: float = curve_sum_step / float(maxi(curve_sample_count, 1))
+	# curve_amplification > 1 means the RENDERED spline moves MORE, tick to
+	# tick, than the raw physics segments it's drawn through -- i.e. the
+	# Catmull-Rom fit is itself injecting extra visible motion beyond what
+	# the real simulated chain is doing.
+	var curve_amplification: float = curve_max_step / maxf(seg_max_step, 0.00001)
+	print("[TEST] %s RENDER-CURVE SUMMARY: curve_max_step=%.5f curve_mean_step=%.5f curve_amplification(curve/seg)=%.3f" % [
+		cfg_name, curve_max_step, curve_mean_step, curve_amplification])
 
 
 func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
