@@ -105,8 +105,12 @@ func _run() -> void:
 	for tick in range(SETTLE_WAIT_TICKS):
 		player.velocity = Vector3.ZERO
 		player._update_physics_rope_anchors()
+		# TELEPORT-FREE LEASH REDESIGN (2026-07-28): the leash is now enforced
+		# as a velocity clamp applied BEFORE move_and_slide(), not a position
+		# snap applied after -- see player.gd's _apply_rope_leash_velocity_
+		# clamp() doc comment. Matches the real _physics_process() call order.
+		player._apply_rope_leash_velocity_clamp(get_physics_process_delta_time())
 		player.move_and_slide()
-		player._clamp_to_rope_leash()
 		await get_tree().physics_frame
 	var settle_hand: Vector3 = player._get_rope_hand_anchor_pos()
 	var settle_tip: Vector3 = player._get_rope_tip_target()
@@ -137,8 +141,8 @@ func _run() -> void:
 		player.velocity = Vector3(move_dir.x, 0.0, move_dir.y) * MOVE_SPEED
 
 		player._update_physics_rope_anchors()
+		player._apply_rope_leash_velocity_clamp(get_physics_process_delta_time())
 		player.move_and_slide()
-		player._clamp_to_rope_leash()
 		await get_tree().physics_frame
 
 		if tick % 5 != 0:

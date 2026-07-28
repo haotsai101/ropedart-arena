@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://c8f3k2n5x9q1w"]
+
+[ext_resource type="Script" path="res://tests/test_rope_leash_velocity_clamp.gd" id="1_vclamp"]
+
+[node name="TestRopeLeashVelocityClamp" type="Node"]
+script = ExtResource("1_vclamp")

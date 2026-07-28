@@ -141,8 +141,11 @@ func _run() -> void:
 	for tick in range(SETTLE_WAIT_TICKS):
 		player.velocity = Vector3.ZERO
 		player._update_physics_rope_anchors()
+		# TELEPORT-FREE LEASH REDESIGN (2026-07-28): velocity clamp before
+		# move_and_slide(), not a position snap after -- see player.gd's
+		# _apply_rope_leash_velocity_clamp() doc comment.
+		player._apply_rope_leash_velocity_clamp(get_physics_process_delta_time())
 		player.move_and_slide()
-		player._clamp_to_rope_leash()
 		await get_tree().physics_frame
 
 	# _clamp_to_rope_leash()'s wrap-aware bound (see player.gd, ROUND 6) reads
@@ -223,8 +226,8 @@ func _run() -> void:
 		player.velocity = Vector3(tangent.x, 0.0, tangent.y) * MOVE_SPEED
 
 		player._update_physics_rope_anchors()
+		player._apply_rope_leash_velocity_clamp(get_physics_process_delta_time())
 		player.move_and_slide()
-		player._clamp_to_rope_leash()
 		await get_tree().physics_frame
 
 		var cur_angle: float = (player.get_pos_2d() - near_corner).angle()

@@ -1265,8 +1265,13 @@ func _physics_process(delta: float) -> void:
 		if move_input.length() > 1.0:
 			move_input = move_input.normalized()
 		velocity = Vector3(move_input.x, 0.0, move_input.y) * effective_speed
+	# TELEPORT-FREE LEASH REDESIGN (2026-07-28, see _apply_rope_leash_velocity_
+	# clamp()'s own doc comment): the leash is now enforced by projecting
+	# VELOCITY before move_and_slide() runs, not by snapping global_position
+	# afterward -- must run before move_and_slide(), not after (the old
+	# _clamp_to_rope_leash() ran post-hoc and directly wrote global_position).
+	_apply_rope_leash_velocity_clamp(delta)
 	move_and_slide()
-	_clamp_to_rope_leash()
 	_check_boundary_fall()
 	if is_falling:
 		return
@@ -2089,110 +2094,35 @@ func _perform_slash() -> void:
 			p.trip()
 
 
-func _clamp_to_rope_leash() -> void:
-	## Once the rope dart is anchored, its rope is a fixed-length physical
-	## tether (see rope_dart.gd's class doc comment) -- the owner shouldn't be
-	## able to walk further from the anchor point than the rope allows.
-	## Pulls the player back instead of blocking movement outright, so running
-	## at an angle slides along the tether's edge rather than just stopping
-	## dead.
+func _rope_leash_pivot_and_radius() -> Array:
+	## Returns [pivot: Vector2, radius: float] describing the current tether
+	## boundary circle, or [] if no leash constraint applies this tick (no
+	## dart, or not ANCHORED). Pure read -- computes but never applies
+	## anything; see _apply_rope_leash_velocity_clamp() for the caller that
+	## actually acts on this.
+	##
+	## Two possible bounds, same as this codebase's prior (now superseded --
+	## see that function's own doc comment) position-clamp design:
+	## 1. WRAP-AWARE: while at least one segment is genuinely resting against
+	##    real obstacle contact (rope_segment_body.gd's own
+	##    `_debug_last_has_contact`, an unambiguous "the solver actually put
+	##    this segment here" signal -- see ROUND 5's clipping fix), pivot on
+	##    the chain's own first dynamic segment (always topologically nearest
+	##    the hand) with the radius shrunk by _rope_chain_rest_length_2d() --
+	##    the REAL, already-simulated remaining chain length from that
+	##    segment to the tip, wrap included. This reads real physics state,
+	##    not a computed corner/route: a segment resting against real contact
+	##    is exactly where the solver put it.
+	## 2. FALLBACK: a plain circle of radius DART_ROPE_LENGTH around the
+	##    anchor itself -- covers the tick(s) before the physics chain
+	##    exists/settles, and by the triangle inequality is always at least
+	##    as permissive as bound 1, so returning bound 1 alone (when it
+	##    applies) is always the stricter, correct choice -- no need to
+	##    intersect both.
 	if dart == null or dart.state != DART_STATE_ANCHORED:
-		return
+		return []
 	var anchor: Vector2 = dart.head_2d
-	var pos: Vector2 = get_pos_2d()
 
-	## CORNER-WRAP FIX (see this session's CLAUDE.md entry -- real user screen
-	## recording: wrapping around a pillar corner read clean until the player
-	## reached max leash range and kept pushing further/around, at which
-	## point the rope visibly folded/hooked right at the corner). Root cause:
-	## this used to clamp the player onto a plain circle of radius
-	## DART_ROPE_LENGTH around the ANCHOR -- a straight-line (beeline) bound.
-	## When a real obstacle corner sits between the player and the anchor,
-	## the TRUE physical tether has to travel further than that beeline to
-	## reach around the corner, so the beeline circle is strictly too
-	## permissive: it let the player keep walking outward well past the
-	## point where the real, already-wrapped chain had used up its entire
-	## fixed length, forcing the physics solver to fight an impossible
-	## stretch right at the corner contact -- exactly the reported fold.
-	##
-	## Fix: pivot the clamp on the chain's own FIRST dynamic segment (the
-	## link nearest the hand, always topologically adjacent to it regardless
-	## of how many corners are involved) instead of the anchor, with the
-	## clamp radius shrunk by _rope_chain_rest_length_2d() -- the REAL,
-	## already-simulated remaining chain length from that first segment to
-	## the tip, wrap included. This reads real physics state (not a computed
-	## corner/route) -- a segment resting against real obstacle contact is
-	## exactly where the solver actually put it. By the
-	## triangle inequality, satisfying this clamp always also satisfies the
-	## old plain anchor-circle bound, so the fallback below never fights it;
-	## it only ever adds a stricter, wrap-aware bound on top.
-	##
-	## TRANSIENT-SNAP FIX, TWO ROUNDS (real user report, direct quote: "the
-	## throwing pushed me southeast and walking west pushed me north west" --
-	## confirmed via direct instrumentation, not guessing: a temporary
-	## per-tick probe, tests/test_movement_direction_skew.gd, drove a throw
-	## with ZERO movement input held and logged get_pos_2d() every tick.
-	## Movement itself (Phase 1, pure west hold, no dart) came back perfectly
-	## clean -- zero Z drift, exact -X-only motion -- so the core "movement is
-	## a pure Vector2 on X/Z" invariant was never actually violated anywhere.
-	## But Phase 2 (throw, zero movement held) showed a REAL, un-input-driven
-	## position displacement of ~0.5 units, arriving over many ticks right
-	## at/after the FLYING->ANCHORED transition, with a direction unrelated to
-	## aim/facing/movement -- exactly matching "got pushed" with no apparent
-	## cause. Also logged rest_len/max_from_first/offset0_len every tick to
-	## pin down the mechanism:
-	##
-	## ROUND 1 (partial fix, kept as the first of two gates below): right at
-	## the anchor transition, `_rope_chain_rest_length_2d()` -- the live
-	## chain's own segment-to-segment path length from the first dynamic
-	## segment to the tip -- legitimately and momentarily exceeded
-	## DART_ROPE_LENGTH (measured 8.22-8.33 vs. the chain's own 8.0 capacity,
-	## before the still-bunched-near-the-hand chain had caught up to the tip
-	## anchor's newly-landed position). That's the same kind of transient
-	## overshoot this codebase already tolerates elsewhere (see
-	## tests/test_rope_leash_corner_wrap.gd's own MAX_ACCEPTABLE_OVERSHOOT =
-	## 0.75), but here `maxf(DART_ROPE_LENGTH - rest_len, 0.0)` floored the
-	## result to a literal ZERO-radius budget, snapping the player's
-	## canonical root position onto the first segment's current (still
-	## unsettled) location. Gating on `rest_len < DART_ROPE_LENGTH` (skip the
-	## pivot clamp entirely when there's no positive budget at all) removed
-	## that single worst zero-radius tick -- but re-measuring the SAME probe
-	## after this fix alone showed the total drift only dropped from ~0.53 to
-	## ~0.47, still clearly visible: for many ticks afterward (rest_len
-	## already back under 8.0, so the gate above no longer applies)
-	## offset0_len kept exceeding a real but still-small max_from_first,
-	## because the "first segment" itself was still actively being dragged
-	## across ~1+ units by the joint solver as the whole chain settled from
-	## its bunched-near-hand spawn layout toward the far anchor -- i.e. even
-	## with a mathematically positive budget, pivoting on a segment that
-	## hasn't settled yet is fundamentally unreliable, independent of whether
-	## rest_len happens to be above or below capacity.
-	##
-	## ROUND 2 (the fix that actually closes it): the pivot-on-first-segment
-	## bound only makes physical sense while the chain is genuinely wrapped
-	## around a real obstacle corner -- its own doc comment above says so
-	## explicitly ("a segment resting against real obstacle contact is
-	## exactly where the solver actually put it"). An open-air anchor (no
-	## obstacle involved at all -- including every anchor reached by hitting
-	## max ROPE_LENGTH with nothing in the way, now the common case since
-	## rope_dart.gd anchors there instead of auto-recalling) was never what
-	## this clamp was meant to constrain beyond the plain fallback bound
-	## below, which this same probe confirmed never itself misfires (offset_len
-	## sat safely under DART_ROPE_LENGTH throughout every logged tick of both
-	## rounds' test runs). Gate the whole pivot clamp on
-	## `_debug_last_has_contact` (rope_segment_body.gd's existing, already-
-	## verified-unambiguous "resting against real obstacle geometry, not a
-	## player/ground/another segment" signal, added for the ROUND 5 CLIPPING
-	## FIX and already read the same way there) being true for at least one
-	## segment in the chain -- i.e. only trust "pivot on the first segment"
-	## once there's an actual corner being wrapped for it to legitimately
-	## rest against. Purely open-air anchors (this bug's whole reproduction)
-	## and the ordinary mid-settle window right after any throw now never
-	## engage this stricter bound at all, falling through to the plain
-	## fallback circle, which is exactly correct for them. Genuine corner-wrap
-	## scenarios (tests/test_rope_leash_corner_wrap.gd) are unaffected -- by
-	## definition they involve a segment in real contact with the pillar, so
-	## the gate is open exactly when the fix it protects is supposed to apply.
 	if _physics_rope_active and not _physics_rope_segments.is_empty():
 		var any_obstacle_contact: bool = false
 		for seg in _physics_rope_segments:
@@ -2204,27 +2134,110 @@ func _clamp_to_rope_leash() -> void:
 			var first_2d := Vector2(first_seg_pos.x, first_seg_pos.z)
 			var rest_len: float = _rope_chain_rest_length_2d(anchor)
 			if rest_len < DART_ROPE_LENGTH:
-				var max_from_first: float = DART_ROPE_LENGTH - rest_len
-				var offset0: Vector2 = pos - first_2d
-				if offset0.length() > max_from_first:
-					var dir0: Vector2 = offset0.normalized() if offset0.length() > 0.0001 else Vector2.ZERO
-					var clamped0: Vector2 = first_2d + dir0 * max_from_first
-					global_position.x = clamped0.x
-					global_position.z = clamped0.y
-					pos = clamped0
+				return [first_2d, DART_ROPE_LENGTH - rest_len]
 
-	## Fallback safety net: never let the player exceed a plain straight-line
-	## DART_ROPE_LENGTH from the anchor either -- covers the tick(s) before
-	## the physics chain exists/settles (e.g. right at throw-instant), and
-	## acts as a hard backstop. Always at least as permissive as the
-	## wrap-aware clamp above (see its own comment), so this never overrides
-	## a position that clamp already committed to.
-	var offset: Vector2 = pos - anchor
-	if offset.length() <= DART_ROPE_LENGTH:
+	return [anchor, DART_ROPE_LENGTH]
+
+
+func _apply_rope_leash_velocity_clamp(delta: float) -> void:
+	## TELEPORT-FREE LEASH REDESIGN (2026-07-28, direct, explicit user
+	## requirement: "The max length of the rope shouldn't be computed between
+	## the dart and the character" -- confirmed via clarifying question to
+	## mean this function's PREDECESSOR, the old _clamp_to_rope_leash(), which
+	## every round from ROUND 6 onward (see git history/CLAUDE.md) had
+	## computed a pivot+radius exactly as _rope_leash_pivot_and_radius() above
+	## still does, then SNAPPED global_position onto that circle's boundary
+	## whenever the player's real position was found to be outside it --
+	## instant, discontinuous, once per violating tick). The user's own
+	## standing, repeated preference across this whole rope saga (going back
+	## to the very first "I want it to be a physics object" round) is no
+	## computed-formula-then-force-it correction of anything the real
+	## simulation is supposed to be authoritative over -- and unlike the
+	## rope's OWN rendering/shape (already fully real-physics-driven since the
+	## ROUND 12 architecture reset), the player's canonical position was still
+	## being teleported by a plain distance formula every time it happened to
+	## be found on the wrong side of a computed boundary.
+	##
+	## HYPOTHESIS TESTED FIRST, DIRECTLY, BEFORE CHANGING ANYTHING (per this
+	## round's own explicit verification protocol): does the old position-snap
+	## itself explain the still-unsolved ROUND 17/18 anchored steady-state
+	## jitter (rope visibly reshaping while the player stands still near a
+	## pillar)? A new instrumented run of
+	## tests/test_rope_physics_chain_settle.gd's own steady-state jitter probe
+	## (see that file's own "LEASH-CLAMP-FIRING" instrumentation, added this
+	## round) -- with GameManager.current_state ALSO corrected to PLAYING for
+	## the first time in that test file's history (previously LOBBY the whole
+	## run, which meant the old clamp's own call site in _physics_process()
+	## was UNREACHABLE the entire time ROUND 17/18 were measuring "steady-
+	## state jitter," a genuine methodology gap this round found and fixed) --
+	## measured `player_pos_fire_events = 0/360` in EVERY one of the 5 real
+	## configs, including `corner_wrap_anchor` (100% real obstacle contact the
+	## whole window) and `open_air_taut` (zero-slack, right at the boundary),
+	## even while those same two configs' own segment jitter stayed at their
+	## already-known-and-still-unexplained ~0.06-0.075 units/tick. **The old
+	## clamp never fired even once during this specific stationary-near-a-
+	## pillar reproduction** -- a stationary player who starts within their
+	## own tether radius stays there forever with zero input, so there was
+	## nothing for a position-snap to correct in that scenario. HYPOTHESIS
+	## REFUTED for the passive-standing-still bug report specifically -- the
+	## still-open ROUND 17/18 jitter has some other, still-unknown cause. (A
+	## DIFFERENT, still-real scenario where the old clamp WAS proven to fire
+	## repeatedly: tests/test_rope_leash_corner_wrap.gd's own adversarial
+	## sweep, where a player actively pushes outward against the tether every
+	## tick -- that test's own historical fold-jump numbers are exactly what a
+	## repeatedly-firing position snap looks like. This redesign still fixes
+	## that mechanism even though it wasn't the passive-jitter bug's own
+	## cause -- see the re-measurement in this round's own final report.)
+	##
+	## THE REDESIGN: instead of correcting POSITION after move_and_slide(),
+	## this projects VELOCITY before it -- called from _physics_process()
+	## right before move_and_slide(), never after. Decomposes the player's
+	## already-computed velocity into a radial component (along the line from
+	## the tether pivot to the player's CURRENT, real position) and a
+	## tangential component; only the OUTWARD radial component is ever
+	## reduced, and only down to the exact amount of remaining budget this
+	## tick (`(radius - cur_dist) / delta`), never below zero and never touching
+	## the tangential component at all -- so pushing straight out against a
+	## taut tether smoothly decelerates to a dead stop exactly at the
+	## boundary (never overshoots, never needs correcting after the fact,
+	## because it was never allowed to move past the boundary to begin with),
+	## while pushing at an angle keeps sliding freely along the boundary, the
+	## same "run at an angle along the tether's edge" feel the old function's
+	## own doc comment described -- just achieved by never letting the
+	## over-limit motion happen, instead of happening then being undone.
+	## Inward motion (radial_component <= 0) is never touched at all.
+	##
+	## Known, disclosed limitation: this clamps velocity based on the
+	## PREDICTED tick, but move_and_slide() can itself still reduce the
+	## actual travel distance below that prediction (sliding against an
+	## obstacle collision elsewhere) -- in principle a tick could therefore
+	## still end up compounding with the next tick's own fresh radial budget
+	## in a way that's not bit-for-bit identical to a perfect continuous
+	## constraint. This is the same class of small, bounded, per-tick
+	## tolerance this codebase already accepts elsewhere (e.g. the corner-wrap
+	## fix's own MAX_ACCEPTABLE_OVERSHOOT), not a new category of risk, and
+	## unlike the old design it can never manifest as a discontinuous jump --
+	## only, at most, a few extra ticks to fully settle at the boundary.
+	var bound: Array = _rope_leash_pivot_and_radius()
+	if bound.is_empty():
 		return
-	var clamped: Vector2 = anchor + offset.normalized() * DART_ROPE_LENGTH
-	global_position.x = clamped.x
-	global_position.z = clamped.y
+	var pivot: Vector2 = bound[0]
+	var radius: float = bound[1]
+	var pos: Vector2 = get_pos_2d()
+	var cur_offset: Vector2 = pos - pivot
+	var cur_dist: float = cur_offset.length()
+	if cur_dist < 0.0001 or delta <= 0.0:
+		return  # degenerate (at the pivot, or a zero/negative delta) -- nothing to project
+	var radial_dir: Vector2 = cur_offset / cur_dist
+	var vel_2d: Vector2 = Vector2(velocity.x, velocity.z)
+	var radial_component: float = vel_2d.dot(radial_dir)
+	if radial_component <= 0.0:
+		return  # moving inward or purely tangential -- never restricted
+	var max_radial_component: float = maxf((radius - cur_dist) / delta, 0.0)
+	if radial_component > max_radial_component:
+		vel_2d -= radial_dir * (radial_component - max_radial_component)
+		velocity.x = vel_2d.x
+		velocity.z = vel_2d.y
 
 
 func _check_boundary_fall() -> void:

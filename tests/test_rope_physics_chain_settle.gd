@@ -141,6 +141,24 @@ func _run() -> void:
 	var rect: Rect2 = pillar.get_rect_2d()
 	print("[TEST] PillarA rect=%s (world XZ)" % [rect])
 
+	# LEASH-CLAMP-FIRING INVESTIGATION (2026-07-28): GameManager.current_state
+	# was NEVER set to PLAYING anywhere in this file before this line -- every
+	# spawned test player's own real _physics_process() early-returns at its
+	# "if GameManager.current_state != PLAYING: velocity = ZERO; move_and_slide();
+	# return" gate, BEFORE ever reaching the leash clamp (called further down
+	# the same function -- _apply_rope_leash_velocity_clamp() as of this
+	# round's redesign, previously _clamp_to_rope_leash()). That means every
+	# steady-state jitter number this file has ever reported (ROUND 17/18)
+	# was measured with the real leash clamp completely inert -- a genuine,
+	# disclosed methodology gap, not something previously investigated. Real
+	# gameplay always has
+	# current_state == PLAYING while a dart is anchored and a player can move,
+	# so this line makes the test match reality; every player spawned below is
+	# player_index 0 (keyboard) with zero real input in this headless run, so
+	# velocity stays 0 from input alone -- any player-position motion measured
+	# below is therefore attributable to the leash clamp itself, not movement.
+	GameManager.current_state = GameManager.RoundState.PLAYING
+
 	# TEMP-TESTING: fast-iteration flag to skip the slower tests while tuning
 	# damping -- MUST be false before any real verification run / before
 	# committing (zero net diff required, same convention as game_manager.gd's
@@ -259,7 +277,29 @@ func _test_settled_configurations(rect: Rect2) -> bool:
 		player.dart.state = 1  # State.ANCHORED
 		player.dart.head_2d = tip2
 
+		# TEST-HARNESS FIX (2026-07-28, found while A/B-verifying the leash
+		# redesign): this settle loop used to rely, silently and by accident,
+		# on the OLD _clamp_to_rope_leash()'s own position-teleport side
+		# effect to keep player.global_position (and therefore the chain's
+		# real hand anchor, read from get_hand_world_position()) somewhere
+		# near the anchor -- for configs like open_air_far, whose hand2/tip2
+		# pair (~22.6 units apart) FAR exceeds DART_ROPE_LENGTH (7.2), the old
+		# clamp would immediately snap the player from hand2 to within 7.2 of
+		# tip2 on literally the first tick, silently shrinking the real span
+		# the chain ever had to bridge. This config's own stated purpose (see
+		# this function's header comment) is "does the chain avoid tunneling
+		# through a pillar between hand and tip," independent of whatever the
+		# player's own movement/leash mechanics do -- so explicitly pin
+		# player.global_position at hand2 every tick here, matching the
+		# printed "hand=%s" value below and decoupling this measurement from
+		# whichever leash mechanism happens to be in effect (a real, disclosed
+		# behavior difference the new teleport-free leash redesign surfaced:
+		# without a discontinuous position snap, a stationary player with zero
+		# input genuinely never moves on their own, which is the whole point
+		# of removing the old snap -- see player.gd's own doc comment).
 		for i in CONFIG_SETTLE_TICKS:
+			player.velocity = Vector3.ZERO
+			player.global_position = Vector3(hand2.x, 0.7, hand2.y)
 			await get_tree().physics_frame
 
 		var max_pen: float = 0.0
@@ -544,6 +584,28 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 	var curve_sample_count: int = 0
 	var prev_curve_pts: Array[Vector3] = player._compute_rope_tube_curve_points(_sample_chain_points_3d(player))
 
+	# LEASH-CLAMP-FIRING instrumentation (2026-07-28, "should the max leash
+	# length be computed between the dart and character" investigation): with
+	# GameManager.current_state now PLAYING (see _run()'s own doc comment) and
+	# zero real input on this headless player, ANY tick-to-tick motion of
+	# player.get_pos_2d() itself during this stationary sampling window is
+	# attributable to the leash clamp's own effect on the player's position
+	# (originally _clamp_to_rope_leash()'s direct position write; as of this
+	# round's redesign, _apply_rope_leash_velocity_clamp()'s velocity
+	# projection feeding into move_and_slide()), not to movement input or
+	# unrelated move_and_slide() collision response (velocity is 0 every tick
+	# from input alone, before the leash clamp runs). This instrumentation is
+	# kept permanently, not reverted after the one-time baseline measurement
+	# it was added for -- a real, reusable regression signal for any future
+	# leash-mechanism change. player_pos_fire_events counts ticks where the
+	# step exceeds a small float-noise threshold (0.0005) -- i.e. the leash
+	# mechanism actually moved the player that tick, not just floating-point
+	# jitter in the read.
+	var player_pos_max_step: float = 0.0
+	var player_pos_step_sum: float = 0.0
+	var player_pos_fire_events: int = 0
+	var prev_player_pos: Vector2 = player.get_pos_2d()
+
 	# CONTACT-STATE instrumentation (2026-07-26 -- direct-contact jitter
 	# investigation): reads rope_segment_body.gd's own `_debug_last_has_
 	# contact` per segment, per tick, to test the specific hypothesis that
@@ -637,11 +699,19 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 				curve_sample_count += 1
 		prev_curve_pts = cur_curve_pts
 
+		var cur_player_pos: Vector2 = player.get_pos_2d()
+		var player_step: float = prev_player_pos.distance_to(cur_player_pos)
+		player_pos_max_step = maxf(player_pos_max_step, player_step)
+		player_pos_step_sum += player_step
+		if player_step > 0.0005:
+			player_pos_fire_events += 1
+		prev_player_pos = cur_player_pos
+
 		prev_pts = cur_pts
 		prev_contact = cur_contact
 		if (tick + 1) % STEADY_LOG_EVERY == 0:
-			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f contact_segs_now=%d flicker_events_running=%d curve_step_running_max=%.5f" % [
-				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max, contact_count_this_tick, flicker_events, curve_max_step])
+			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f contact_segs_now=%d flicker_events_running=%d curve_step_running_max=%.5f player_pos_step_running_max=%.5f player_pos_fire_events_running=%d" % [
+				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max, contact_count_this_tick, flicker_events, curve_max_step, player_pos_max_step, player_pos_fire_events])
 
 	var hand_bbox_diag: float = hand_min.distance_to(hand_max)
 	var seg_mean_step: float = seg_sum_step / float(maxi(seg_sample_count, 1))
@@ -667,6 +737,10 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 	var curve_amplification: float = curve_max_step / maxf(seg_max_step, 0.00001)
 	print("[TEST] %s RENDER-CURVE SUMMARY: curve_max_step=%.5f curve_mean_step=%.5f curve_amplification(curve/seg)=%.3f" % [
 		cfg_name, curve_max_step, curve_mean_step, curve_amplification])
+	var player_pos_mean_step: float = player_pos_step_sum / float(maxi(window_ticks, 1))
+	print("[TEST] %s LEASH-CLAMP-FIRING SUMMARY: player_pos_max_step=%.5f player_pos_mean_step=%.5f player_pos_fire_events=%d/%d (%.1f%%)" % [
+		cfg_name, player_pos_max_step, player_pos_mean_step, player_pos_fire_events, window_ticks,
+		100.0 * float(player_pos_fire_events) / float(maxi(window_ticks, 1))])
 
 
 func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
