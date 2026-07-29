@@ -115,15 +115,14 @@ func _run() -> void:
 			var dart_state: Variant = player.dart.state if player.dart != null and is_instance_valid(player.dart) else null
 			var diag := ""
 			if player.dart != null and is_instance_valid(player.dart) and dart_state == 1 and not player._physics_rope_segments.is_empty():
+				# 2026-07-29: leash bound is now always flat [anchor, DART_ROPE_LENGTH] --
+				# _rope_chain_rest_length_2d() was removed along with the wrap-aware
+				# radius formula it existed to serve. Diag now just reports the real,
+				# current (flat) bound directly from _rope_leash_pivot_and_radius().
 				var anchor: Vector2 = player.dart.head_2d
-				var first_seg: Vector3 = (player._physics_rope_segments[0] as RigidBody3D).global_position
-				var first_2d := Vector2(first_seg.x, first_seg.z)
-				var rest_len: float = player._rope_chain_rest_length_2d(anchor)
-				var max_from_first: float = maxf(player.DART_ROPE_LENGTH - rest_len, 0.0)
-				var offset0_len: float = (pos - first_2d).length()
 				var offset_len: float = (pos - anchor).length()
-				diag = " anchor=%s first_seg=%s rest_len=%.4f max_from_first=%.4f offset0_len=%.4f (violates=%s) offset_len=%.4f (violates_fallback=%s)" % [
-					anchor, first_2d, rest_len, max_from_first, offset0_len, offset0_len > max_from_first, offset_len, offset_len > player.DART_ROPE_LENGTH]
+				diag = " anchor=%s offset_len=%.4f (violates=%s)" % [
+					anchor, offset_len, offset_len > player.DART_ROPE_LENGTH]
 			print("[TEST] tick=%d pos=%s drift_from_pre_throw=%s dart_state=%s%s" % [tick, pos, drift, dart_state, diag])
 
 	print("[TEST] PHASE 2 RESULT: max_drift=%.5f at tick=%d drift_vec=%s (pre_throw_pos=%s)" % [
