@@ -1868,6 +1868,31 @@ func get_rope_polyline_2d() -> Array[Vector2]:
 	return points
 
 
+func _rope_chain_rest_length_2d(tip_2d: Vector2) -> float:
+	## RESTORED ROUND 21 (2026-07-29) -- see _rope_leash_pivot_and_radius()'s
+	## own doc comment for the full history (added ROUND 6, deleted ROUND 20,
+	## restored here). Used by _rope_leash_pivot_and_radius(): the real
+	## chain's own already-committed length from its FIRST dynamic segment
+	## (the link nearest the hand) through every remaining segment to the
+	## tip/anchor -- i.e. how much of the chain's fixed DART_ROPE_LENGTH
+	## capacity is already spent on whatever's happening between the first
+	## segment and the dart (a corner wrap, typically), leaving the rest as
+	## budget for the hand-to-first-segment span specifically. Deliberately
+	## excludes the hand->seg[0] leg (the caller supplies its own live hand
+	## position for that part). Returns 0.0 if there's no chain yet.
+	if _physics_rope_segments.is_empty():
+		return 0.0
+	var total: float = 0.0
+	var prev_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
+	for i in range(1, _physics_rope_segments.size()):
+		var p3: Vector3 = (_physics_rope_segments[i] as RigidBody3D).global_position
+		total += Vector2(prev_pos.x, prev_pos.z).distance_to(Vector2(p3.x, p3.z))
+		prev_pos = p3
+	var prev_2d := Vector2(prev_pos.x, prev_pos.z)
+	total += prev_2d.distance_to(tip_2d)
+	return total
+
+
 func _free_physics_rope() -> void:
 	## Only ever called from _exit_tree() now -- the chain is persistent for
 	## the whole lifetime of a player node (see this file's ROPE_PHYSICS_*
@@ -2078,37 +2103,89 @@ func _rope_leash_pivot_and_radius() -> Array:
 	## anything; see _apply_rope_leash_velocity_clamp() for the caller that
 	## actually acts on this.
 	##
-	## 2026-07-29, direct explicit user requirement: "The max rope length
-	## should be total rope length instead of the distance between dart and
-	## character." This removes the WRAP-AWARE bound this function used to
-	## return (pivot on the chain's first dynamic segment, radius shrunk by
-	## _rope_chain_rest_length_2d() -- a value LIVE-COMPUTED each tick from
-	## the chain/dart's current real positions). That is exactly the
-	## "computed from the distance between the dart and the character"
-	## pattern the user is now rejecting -- same standing preference as the
-	## immediately preceding round (57ffb32), which already removed the
-	## position-teleport half of this system; this round removes the radius
-	## FORMULA itself, not just how it was applied. The bound is now always a
-	## flat circle of radius DART_ROPE_LENGTH around the anchor -- "total rope
-	## length," literally and unconditionally, never a value derived by
-	## measuring the current dart/chain configuration.
-	##
-	## KNOWN, DISCLOSED TRADEOFF (do not silently reintroduce the old
-	## formula to paper over this): this is very likely to partially
-	## reintroduce the failure mode ROUND 6 (dd8c600) was written to fix -- a
-	## player wrapped around a corner can now be allowed to walk further
-	## outward than the real, already-partly-spent-on-the-wrap chain can
-	## physically reach, since the constant no longer accounts for length
-	## used up going around the corner. See this round's own test re-run
-	## (tests/test_rope_leash_corner_wrap.gd) in CLAUDE.md / agent memory for
-	## the measured before/after numbers on that tradeoff.
+	## ROUND 21 (2026-07-29) -- WRAP-AWARE BOUND RESTORED, per direct user
+	## report: "The rope is too long when it's wrapped around the map object.
+	## Even when the rope is not straight the max length shouldn't change. It
+	## should always be fixed." ROUND 20 (55348f7) made this function
+	## unconditionally return [anchor, DART_ROPE_LENGTH] -- a flat circle
+	## around the anchor regardless of how much of the rope's real length was
+	## already spent wrapping a corner. That is what let a player stand at a
+	## position where the STRAIGHT-LINE distance to the anchor reads as
+	## exactly DART_ROPE_LENGTH while the REAL wrapped path (hand -> around
+	## the corner -> dart) is longer than DART_ROPE_LENGTH -- i.e. the rope's
+	## fixed physical budget being asked to stretch past its own capacity,
+	## which is precisely "the rope is too long when wrapped." Restoring the
+	## wrap-aware branch is NOT a reversal of ROUND 19/20's own standing
+	## preference -- it addresses a DIFFERENT axis of the same mechanic:
+	##   - ROUND 19's requirement (still in full effect, untouched by this
+	##     round): the boundary must be ENFORCED without teleporting the
+	##     player's canonical position -- _apply_rope_leash_velocity_clamp()'s
+	##     velocity-projection mechanism stays exactly as ROUND 19 built it.
+	##   - ROUND 20's requirement, re-read correctly: "the max length should
+	##     be total rope length" means the TOTAL REAL ROPE BUDGET
+	##     (DART_ROPE_LENGTH) must never be exceeded, wrapped or not -- it was
+	##     never a request to pretend a wrap doesn't consume real rope. A flat
+	##     circle around the anchor, ignoring wrap geometry entirely, actually
+	##     VIOLATES "max length is always fixed" the moment a wrap is
+	##     involved, since it lets the real total path (hand -> wrap -> dart)
+	##     run past DART_ROPE_LENGTH while still reporting the boundary as
+	##     satisfied.
+	## Two possible bounds, restored to their exact ROUND 6/7 form (verified
+	## still correct against this round's own re-run -- see
+	## tests/test_rope_leash_corner_wrap.gd's numbers in CLAUDE.md):
+	## 1. WRAP-AWARE: while at least one segment is genuinely resting against
+	##    real obstacle contact (rope_segment_body.gd's own
+	##    `_debug_last_has_contact`, an unambiguous "the solver actually put
+	##    this segment here" signal -- see ROUND 5's clipping fix), pivot on
+	##    the chain's own first dynamic segment (always topologically nearest
+	##    the hand) with the radius shrunk by _rope_chain_rest_length_2d() --
+	##    the REAL, already-simulated remaining chain length from that
+	##    segment to the tip, wrap included. This reads real physics state,
+	##    not a computed corner/route: a segment resting against real contact
+	##    is exactly where the solver put it -- NOT synthetic/invented
+	##    geometry, which is what ROUND 19/20's own objection was actually
+	##    about (see doc comment on _apply_rope_leash_velocity_clamp()).
+	## 2. FALLBACK: a plain circle of radius DART_ROPE_LENGTH around the
+	##    anchor itself -- covers the tick(s) before the physics chain
+	##    exists/settles, and by the triangle inequality is always at least
+	##    as permissive as bound 1, so returning bound 1 alone (when it
+	##    applies) is always the stricter, correct choice -- no need to
+	##    intersect both.
 	if dart == null or dart.state != DART_STATE_ANCHORED:
 		return []
 	var anchor: Vector2 = dart.head_2d
+
+	if _physics_rope_active and not _physics_rope_segments.is_empty():
+		var any_obstacle_contact: bool = false
+		for seg in _physics_rope_segments:
+			if bool((seg as RigidBody3D).get("_debug_last_has_contact")):
+				any_obstacle_contact = true
+				break
+		if any_obstacle_contact:
+			var first_seg_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
+			var first_2d := Vector2(first_seg_pos.x, first_seg_pos.z)
+			var rest_len: float = _rope_chain_rest_length_2d(anchor)
+			if rest_len < DART_ROPE_LENGTH:
+				return [first_2d, DART_ROPE_LENGTH - rest_len]
+
 	return [anchor, DART_ROPE_LENGTH]
 
 
 func _apply_rope_leash_velocity_clamp(delta: float) -> void:
+	## ROUND 21 (2026-07-29) note: _rope_leash_pivot_and_radius() above had
+	## its wrap-aware bound restored this round (see that function's own doc
+	## comment). This function -- the ENFORCEMENT mechanism -- is completely
+	## untouched: it still only ever projects velocity before move_and_slide()
+	## and never teleports global_position, exactly as ROUND 19 built it. The
+	## user's ROUND 19/20 objection was about the teleport and, per ROUND 20's
+	## own framing, about not wanting a computed formula standing in for real
+	## physics state -- restoring wrap-awareness here doesn't reintroduce
+	## either: the bound is read from the chain's own real, already-simulated
+	## positions (_rope_chain_rest_length_2d(), gated on real obstacle
+	## contact), not invented geometry, and however that bound moves tick to
+	## tick, it is still only ever enforced via this same velocity projection,
+	## never a position snap.
+	##
 	## TELEPORT-FREE LEASH REDESIGN (2026-07-28, direct, explicit user
 	## requirement: "The max length of the rope shouldn't be computed between
 	## the dart and the character" -- confirmed via clarifying question to
