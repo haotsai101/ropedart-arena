@@ -606,6 +606,32 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 	var player_pos_fire_events: int = 0
 	var prev_player_pos: Vector2 = player.get_pos_2d()
 
+	# LEASH-BOUND-NOISE instrumentation (2026-07-30, "is the wrap-aware
+	# _rope_leash_pivot_and_radius() bound itself noisy tick-to-tick, and does
+	# that noise leak into the player's own velocity" investigation): calls
+	# the REAL, shipped _rope_leash_pivot_and_radius() every tick (same
+	# function _apply_rope_leash_velocity_clamp() itself calls every physics
+	# tick) and tracks how much its own returned pivot/radius move step to
+	# step, independent of whether a velocity correction actually fires (see
+	# player_pos_fire_events above for that separate question). bound_active_
+	# ticks / bound_wrap_ticks distinguish "no dart/not anchored" (bound
+	# empty) from "flat DART_ROPE_LENGTH fallback" from "wrap-aware, pivoted
+	# on the chain's own first segment" (the specific case the hypothesis
+	# names), since only the wrap-aware branch reads live, potentially-noisy
+	# physics-chain state at all -- the flat fallback is a pure constant.
+	var bound_pivot_max_step: float = 0.0
+	var bound_pivot_step_sum: float = 0.0
+	var bound_radius_max_step: float = 0.0
+	var bound_radius_step_sum: float = 0.0
+	var bound_sample_count: int = 0
+	var bound_active_ticks: int = 0
+	var bound_wrap_ticks: int = 0
+	var prev_bound: Array = player._rope_leash_pivot_and_radius()
+	var prev_bound_is_wrap: bool = false
+	if not prev_bound.is_empty():
+		var prev_first_seg: Vector3 = (player._physics_rope_segments[0] as RigidBody3D).global_position
+		prev_bound_is_wrap = Vector2(prev_first_seg.x, prev_first_seg.z).distance_to(prev_bound[0]) < 0.01
+
 	# CONTACT-STATE instrumentation (2026-07-26 -- direct-contact jitter
 	# investigation): reads rope_segment_body.gd's own `_debug_last_has_
 	# contact` per segment, per tick, to test the specific hypothesis that
@@ -707,11 +733,32 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 			player_pos_fire_events += 1
 		prev_player_pos = cur_player_pos
 
+		# LEASH-BOUND-NOISE sampling (see var declarations above).
+		var cur_bound: Array = player._rope_leash_pivot_and_radius()
+		if not cur_bound.is_empty():
+			bound_active_ticks += 1
+			var cur_first_seg: Vector3 = (player._physics_rope_segments[0] as RigidBody3D).global_position
+			var cur_bound_is_wrap: bool = Vector2(cur_first_seg.x, cur_first_seg.z).distance_to(cur_bound[0]) < 0.01
+			if cur_bound_is_wrap:
+				bound_wrap_ticks += 1
+			if not prev_bound.is_empty() and prev_bound_is_wrap and cur_bound_is_wrap:
+				var pivot_step: float = (prev_bound[0] as Vector2).distance_to(cur_bound[0])
+				var radius_step: float = absf(float(cur_bound[1]) - float(prev_bound[1]))
+				bound_pivot_max_step = maxf(bound_pivot_max_step, pivot_step)
+				bound_pivot_step_sum += pivot_step
+				bound_radius_max_step = maxf(bound_radius_max_step, radius_step)
+				bound_radius_step_sum += radius_step
+				bound_sample_count += 1
+			prev_bound_is_wrap = cur_bound_is_wrap
+		else:
+			prev_bound_is_wrap = false
+		prev_bound = cur_bound
+
 		prev_pts = cur_pts
 		prev_contact = cur_contact
 		if (tick + 1) % STEADY_LOG_EVERY == 0:
-			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f contact_segs_now=%d flicker_events_running=%d curve_step_running_max=%.5f player_pos_step_running_max=%.5f player_pos_fire_events_running=%d" % [
-				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max, contact_count_this_tick, flicker_events, curve_max_step, player_pos_max_step, player_pos_fire_events])
+			print("[TEST] %s steady tick=%d hand_step_running_max=%.5f seg_step_running_max=%.5f joint_gap_running_max=%.5f contact_segs_now=%d flicker_events_running=%d curve_step_running_max=%.5f player_pos_step_running_max=%.5f player_pos_fire_events_running=%d bound_pivot_step_running_max=%.5f bound_radius_step_running_max=%.5f" % [
+				cfg_name, tick + 1, hand_max_step, seg_max_step, joint_gap_max, contact_count_this_tick, flicker_events, curve_max_step, player_pos_max_step, player_pos_fire_events, bound_pivot_max_step, bound_radius_max_step])
 
 	var hand_bbox_diag: float = hand_min.distance_to(hand_max)
 	var seg_mean_step: float = seg_sum_step / float(maxi(seg_sample_count, 1))
@@ -741,6 +788,11 @@ func _measure_steady_state_jitter(player: Node, cfg_name: String) -> void:
 	print("[TEST] %s LEASH-CLAMP-FIRING SUMMARY: player_pos_max_step=%.5f player_pos_mean_step=%.5f player_pos_fire_events=%d/%d (%.1f%%)" % [
 		cfg_name, player_pos_max_step, player_pos_mean_step, player_pos_fire_events, window_ticks,
 		100.0 * float(player_pos_fire_events) / float(maxi(window_ticks, 1))])
+	var bound_pivot_mean_step: float = bound_pivot_step_sum / float(maxi(bound_sample_count, 1))
+	var bound_radius_mean_step: float = bound_radius_step_sum / float(maxi(bound_sample_count, 1))
+	print("[TEST] %s LEASH-BOUND-NOISE SUMMARY: bound_active_ticks=%d/%d bound_wrap_ticks=%d/%d wrap_to_wrap_samples=%d bound_pivot_max_step=%.5f bound_pivot_mean_step=%.5f bound_radius_max_step=%.5f bound_radius_mean_step=%.5f" % [
+		cfg_name, bound_active_ticks, window_ticks, bound_wrap_ticks, window_ticks, bound_sample_count,
+		bound_pivot_max_step, bound_pivot_mean_step, bound_radius_max_step, bound_radius_mean_step])
 
 
 func _test_throw_unfold_and_retrieve_fold(_rect: Rect2) -> bool:
