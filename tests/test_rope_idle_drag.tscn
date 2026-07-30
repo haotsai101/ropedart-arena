@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://d7e8f9a0b1c2"]
+
+[ext_resource type="Script" path="res://tests/test_rope_idle_drag.gd" id="1_drag"]
+
+[node name="TestRopeIdleDrag" type="Node"]
+script = ExtResource("1_drag")

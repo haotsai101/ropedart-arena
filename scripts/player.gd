@@ -209,67 +209,28 @@ const ROPE_BUNCH_SPACING: float = 0.4
 ## 0.216) rather than holding it artificially fixed.
 const ROPE_SEGMENT_LINEAR_MASS_DENSITY: float = 0.03
 const ROPE_SEGMENT_MASS: float = ROPE_SEGMENT_LINEAR_MASS_DENSITY * ROPE_PHYSICS_SEGMENT_LENGTH
-## ROUND 17 (2026-07-26) -- raised from 1.6/2.2 (present since the very first
-## physics-chain commit, 2026-07-22, and never previously singled out as its
-## own lever) per direct user report ("why is the rope shaking without the
-## character moving") of a genuinely different configuration than any prior
-## round measured: a dart that has been ANCHORED and stationary for several
-## seconds, not mid-throw/mid-retrieve. See tests/test_rope_physics_chain_
-## settle.gd's own new "5. ANCHORED STEADY-STATE JITTER" section for the
-## measurement this was tuned against. Real numbers, not assumed: at the OLD
-## 1.6/2.2 damping, three of four realistic settled-anchor configs (open-air
-## slack, corner-wrap, a REAL throw-to-anchor at a pillar) already measured
-## tiny (seg_max_step 0.0007-0.006 units/tick over a 6s window, several
-## seconds after the anchor transition) -- i.e. even the OLD damping was
-## nowhere near the scale of a bug that would read as "visibly, measurably
-## changes shape" on screen. Raising damping to 3.0/4.0 still measurably
-## helped those three configs further (seg_max_step down to ~0.0002-0.002,
-## amplification vs. the hand's own tiny animated-idle motion often dropping
-## BELOW 1.0, i.e. the chain now damps out noise faster than the driving
-## hand bone introduces it) with zero measured regression: the full
-## regression suite (idle collapse, 8-config settled-obstacle sweep, throw
-## unfold/retrieve fold) and a 50-second 4-hard-bot soak were re-run at the
-## new damping and showed the same pass/fail pattern (including the same
-## already-documented ROUND 9/11/12/15/16 settled-config-sweep flakiness --
-## which config flakes shifts run to run, but the flake RATE did not
-## increase) as an identical run at the old damping via git-stash A/B.
-## HONEST, DISCLOSED LIMITATION -- the fourth config, "open_air_taut" (a
-## dart anchored at/near max ROPE_LENGTH range in open air, i.e. ZERO slack
-## -- the common real case per rope_dart.gd's own "anchor at max range if
-## nothing was hit" behavior), was NOT fixed by this change: it showed the
-## same bimodal ~0.0002-0.03 seg_max_step / ~0.004-0.04 joint_gap_max range
-## at BOTH 1.6/2.2 and 3.0/4.0 damping, across repeated runs. Root cause,
-## reasoned from the numbers (a fully-taut, zero-slack chain sitting exactly
-## at its own total physical capacity has no slack left to silently absorb
-## any tiny per-joint numerical residual -- unlike every other config, which
-## has real spare capacity to fold into): this reads as a genuine solver
-## degenerate-case sensitivity specific to zero slack, not a "too much
-## kinetic energy" problem body damping (which drains existing motion, not
-## a geometric constraint at its limit) can address -- consistent with
-## ROUND 13/14's separate finding that JOINT-level (not body-level) stiffness
-## tuning is the dangerous, already-rejected lever for problems in this
-## family. Left as an open, disclosed item, not attempted further this round
-## (out of scope for "try body damping" specifically).
-## SEPARATE, DIRECTLY-MEASURED FINDING FROM THIS SAME ROUND, kept here since
-## it changes where to look next if the user's NEXT report is still "the
-## rope shakes": arena_camera.gd's own _process() recomputes camera position
-## AND orthographic size every frame from the AABB of ALL alive players plus
-## ALL active darts -- not just the one player/dart on screen. A scratch
-## probe (2-player real match, one player force-anchored and never touched
-## again, one hard bot left to roam) measured the camera's own per-frame
-## position/size step (~0.019 / ~0.025 units/frame, driven purely by the
-## OTHER bot moving elsewhere) as COMPARABLE TO OR LARGER than this file's
-## own worst-case rope-chain jitter number above -- i.e. in any real match
-## with more than one active player (the normal case), continuous camera
-## re-centering/re-zooming is a real, measured, competing explanation for
-## "things on screen visibly reshape even though nothing near them moved,"
-## entirely independent of the rope's own physics and NOT addressed by this
-## round's damping change. Flagged for the user's own judgment, not fixed
-## here (out of this round's explicit scope) -- if reported again with
-## confirmation that OTHER players/bots were active/moving in the same clip,
-## this is the first place to look, not the rope chain again.
-const ROPE_LINEAR_DAMP: float = 3.0
-const ROPE_ANGULAR_DAMP: float = 4.0
+## ROUND 17 (2026-07-26) raised body-level linear/angular damp 1.6/2.2 ->
+## 3.0/4.0 to address "why is the rope shaking without the character moving"
+## (see git history / this file's own prior revisions for the full ROUND 17
+## writeup and its disclosed "open_air_taut zero-slack" limitation). ROUND 22
+## (2026-07-29) REMOVES damping entirely, per direct, explicit user
+## requirement: "Let's try fixed rope length, no damping and folding or
+## coiling. let it be dragged around the character." Segments now rely on
+## Godot's own RigidBody3D default (0.0 linear/angular damp -- i.e. literally
+## no artificial drag), not a re-tuned nonzero value. This is a DELIBERATE
+## reversal of a real, measured ROUND 17 improvement, not an oversight --
+## flagged here for any future round that reconsiders it: if "the rope
+## shakes/jitters" is reported again after this change, ROUND 17's own
+## numbers (three of four settled-anchor configs dropped to ~0.0002-0.002
+## units/tick steady-state seg_max_step at 3.0/4.0 damping, versus
+## un-re-measured but presumably larger numbers at 0.0) are the first
+## comparison point -- re-run tests/test_rope_physics_chain_settle.gd's own
+## "5. ANCHORED STEADY-STATE JITTER" section rather than assuming either
+## value is fine. See this same round's own idle-tip-body doc comment further
+## below (_get_rope_tip_target() / ROPE_IDLE_TIP_DYNAMIC) for why removing
+## damping was requested alongside the fold/coil removal: a freely-dragging
+## tip body with body-level drag on it would fight/soften exactly the "real
+## momentum, no artificial resistance" trailing behavior the user asked for.
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing
@@ -1450,16 +1411,34 @@ func _update_persistent_rope() -> void:
 
 
 func _get_rope_tip_target() -> Vector3:
-	## The single point both _spawn_physics_rope() (initial layout direction)
-	## and _update_physics_rope_anchors() (every-tick tracking) treat as
-	## "where the far end of the rope should be": the dart's actual rendered
-	## pommel position while one is out, or -- critically, per the user's
-	## explicit "collapse into the hand" idle spec -- the hand's OWN position
-	## whenever dart == null. Returning the hand position here (not some
-	## other idle pose) is precisely what makes the persistent chain's idle
-	## resting configuration a real physics collapse rather than a separately
-	## authored visual: with the tip anchor pinned to the same point as the
-	## hand anchor, the chain has nowhere to go but stay bunched there.
+	## The point _spawn_physics_rope() uses for its one-time initial layout
+	## direction, and that _update_physics_rope_anchors() drives the tip
+	## anchor to KINEMATICALLY ONLY WHILE A DART IS ACTUALLY OUT (dart != null
+	## -- FLYING/ANCHORED/RECALLING): the dart's actual rendered pommel
+	## position. This is unchanged from every prior round.
+	##
+	## ROUND 22 (2026-07-29) CHANGED what happens while dart == null, per
+	## direct, explicit user requirement: "no damping and folding or coiling.
+	## let it be dragged around the character." The OLD idle spec ("When
+	## held, all segments collapse into the character's hand," ROUND 12) was
+	## implemented by returning get_hand_world_position() here even while
+	## idle, so _update_physics_rope_anchors() kinematically teleported BOTH
+	## chain endpoints to the exact same point every single tick -- which is
+	## precisely what forced the tight fold/coil the user is now rejecting
+	## (a chain with both ends pinned to one point every tick has nowhere
+	## physically real to go but bunch up there, no matter how it's simulated
+	## in between). This function's own return value while idle is no longer
+	## consulted by _update_physics_rope_anchors() at all -- see that
+	## function's own doc comment for the new mechanism (the tip anchor is
+	## UNFROZEN into a normal dynamic RigidBody3D while dart == null, so it
+	## trails/drags behind the moving hand under real joint-constraint
+	## momentum instead of being kinematically forced anywhere). The idle
+	## fallback below is kept only for _spawn_physics_rope()'s own one-time
+	## initial-layout-direction use (a player's very first frame, before
+	## _update_physics_rope_anchors() has run even once) and for
+	## _get_rope_plane_y()'s idle fallback, both of which still legitimately
+	## want "the hand" as a reasonable starting/reference point, not a
+	## per-tick forcing target.
 	if dart != null and is_instance_valid(dart) and dart.head_mesh != null:
 		return dart.head_mesh.global_transform * Vector3(0.0, 0.0, DAGGER_POMMEL_OFFSET)
 	return get_hand_world_position()
@@ -1553,7 +1532,11 @@ func _spawn_physics_rope() -> void:
 	var seg_basis := Basis(x_axis, y_axis, z_axis)
 
 	_physics_rope_hand_anchor = _make_rope_anchor_body(root, "RopeHandAnchor", hand_pos)
-	_physics_rope_tip_anchor = _make_rope_anchor_body(root, "RopeTipAnchor", tip_pos)
+	# ROUND 22 (2026-07-29): the tip anchor is now a real capsule body that can
+	# be UNFROZEN into a dynamic segment while idle (see
+	# _make_rope_tip_body()/_update_physics_rope_anchors()) -- reuses the same
+	# seg_basis initial orientation as the dynamic segments below.
+	_physics_rope_tip_anchor = _make_rope_tip_body(root, tip_pos, seg_basis, plane_y)
 
 	var local_far := Vector3(0.0, ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
 	var local_near := Vector3(0.0, -ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
@@ -1600,14 +1583,22 @@ func _spawn_physics_rope() -> void:
 
 
 func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> RigidBody3D:
-	## A driven (kinematic-frozen) endpoint with no collision shape and no
-	## mesh of its own -- purely a joint attachment point whose position is
+	## ALWAYS-KINEMATIC driven endpoint with no collision shape and no mesh of
+	## its own -- purely a joint attachment point whose position is
 	## overwritten every physics tick (see _update_physics_rope_anchors()).
 	## collision_layer/mask both 0: it must never be detectable by, or react
 	## to, anything (including the real obstacle layer the segments below
 	## react to) -- it's just a moving pin, not a physical object. Its own
 	## local anchor point for every joint it's part of is always exactly
 	## Vector3.ZERO (its own origin) -- see _join_rope_pin()'s callers.
+	##
+	## As of ROUND 22 (2026-07-29), only ever used for the HAND end of the
+	## chain -- a rope held in a hand really does need its held end to track
+	## the hand exactly, every tick, which is a legitimate use of a kinematic
+	## driven point (unlike the old tip-anchor use of this same pattern, which
+	## is what forced the now-rejected idle fold/coil -- see
+	## _make_rope_tip_body() below for the tip's own, now-different,
+	## mechanism).
 	var body := RigidBody3D.new()
 	body.name = node_name
 	body.freeze = true
@@ -1619,6 +1610,59 @@ func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> 
 	# Transform3D()") on a node that isn't inside the tree yet.
 	parent.add_child(body)
 	body.global_position = pos
+	return body
+
+
+func _make_rope_tip_body(parent: Node3D, pos: Vector3, orient_basis: Basis, plane_y: float) -> RigidBody3D:
+	## ROUND 22 (2026-07-29) NEW -- the far/tip end of the chain, per direct
+	## user requirement to remove the old "collapse into the hand" idle fold
+	## and instead have the rope "be dragged around the character." Unlike
+	## _make_rope_anchor_body() above (always kinematic, a bare massless pin),
+	## this is a REAL dynamic-capable capsule body -- effectively a 25th chain
+	## segment -- built exactly like _make_rope_segment_body()'s own dynamic
+	## links (same script, mass, gravity_scale, collision layer/mask, capsule
+	## shape) so it behaves identically to the rest of the chain once it's
+	## unfrozen.
+	##
+	## Starts FROZEN/kinematic (same as every prior round) -- while a dart is
+	## actually out (dart != null), _update_physics_rope_anchors() keeps it
+	## frozen and drives its position to the dart's own live pommel position
+	## every tick, exactly as before; this is unchanged and still needed for
+	## accurate FLYING/ANCHORED/RECALLING tracking.
+	##
+	## While dart == null (idle), _update_physics_rope_anchors() now UNFREEZES
+	## this body instead of kinematically forcing it to the hand's position
+	## every tick. Once unfrozen it's a normal dynamic RigidBody3D, subject to
+	## the exact same rope_segment_body.gd Y-plane-lock/speed-clamp mechanism
+	## as every other segment, joined to the rest of the chain by the same
+	## real PhysicsServer3D pin joints -- so as the (still-kinematically-
+	## driven) hand end moves with the character, real joint-constraint forces
+	## drag the rest of the chain along behind it, and this free tip end
+	## trails/lags under its own momentum like the loose end of a real rope
+	## being dragged, rather than being teleported into a fold every tick.
+	var body := RigidBody3D.new()
+	body.name = "RopeTipAnchor"
+	body.set_script(RopeSegmentBodyScript)
+	body.locked_y = plane_y
+	body.mass = ROPE_SEGMENT_MASS
+	body.gravity_scale = 0.0
+	body.continuous_cd = true
+	body.collision_layer = 0
+	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
+	body.contact_monitor = true
+	body.max_contacts_reported = 4
+	body.freeze = true
+	body.freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
+
+	var shape := CollisionShape3D.new()
+	var capsule := CapsuleShape3D.new()
+	capsule.radius = ROPE_RADIUS
+	capsule.height = ROPE_PHYSICS_SEGMENT_LENGTH
+	shape.shape = capsule
+	body.add_child(shape)
+
+	parent.add_child(body)
+	body.global_transform = Transform3D(orient_basis, pos)
 	return body
 
 
@@ -1659,8 +1703,13 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	body.locked_y = plane_y
 	body.mass = ROPE_SEGMENT_MASS
 	body.gravity_scale = 0.0
-	body.linear_damp = ROPE_LINEAR_DAMP
-	body.angular_damp = ROPE_ANGULAR_DAMP
+	# ROUND 22 (2026-07-29): body.linear_damp/angular_damp left UNSET, i.e. at
+	# RigidBody3D's own literal default of 0.0 -- per direct, explicit user
+	# requirement ("no damping"). Previously ROPE_LINEAR_DAMP/ROPE_ANGULAR_DAMP
+	# (3.0/4.0, raised from an original 1.6/2.2 in ROUND 17) -- see this file's
+	# own doc comment further up (where those now-deleted consts used to live)
+	# for the full history of why damping was added and what removing it is
+	# expected to trade away.
 	body.continuous_cd = true
 	body.collision_layer = 0
 	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
@@ -1818,33 +1867,58 @@ func _join_rope_6dof(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: 
 
 
 func _update_physics_rope_anchors() -> void:
-	## Drives the two kinematic endpoints every physics tick -- called from
-	## _physics_process() unconditionally. The hand end tracks
-	## _get_rope_hand_anchor_pos(); the tip end tracks _get_rope_tip_target(),
-	## whatever the dart's current state (FLYING/ANCHORED/RECALLING) or, while
-	## idle, the hand itself -- so the chain is simulated continuously for the
-	## player's entire lifetime, not just while a dart is out.
+	## Drives the chain's HAND endpoint every physics tick -- called from
+	## _physics_process() unconditionally. The hand end always tracks
+	## _get_rope_hand_anchor_pos() kinematically, whether idle or not, so the
+	## chain is simulated continuously for the player's entire lifetime.
+	##
+	## ROUND 22 (2026-07-29) CHANGED the TIP endpoint's own handling, per
+	## direct user requirement to remove idle fold/coiling and have the rope
+	## "dragged around the character" instead:
+	##  - While a dart is actually out (dart != null): UNCHANGED from every
+	##    prior round -- the tip anchor is kept/re-frozen kinematic and driven
+	##    to _get_rope_tip_target() (the dart's own live position) every tick.
+	##  - While idle (dart == null): the tip anchor is UNFROZEN into a normal
+	##    dynamic RigidBody3D exactly once (on the tick this transition is
+	##    first observed) and then left alone -- no per-tick position write at
+	##    all. From that point on it's just the last link of the chain, pulled
+	##    along by real joint forces from the (still kinematically hand-
+	##    tracking) rest of the chain, dragging/trailing under its own
+	##    momentum as the character moves. This is what makes "no folding or
+	##    coiling... dragged around the character" a real physics outcome
+	##    rather than a scripted idle pose -- see _make_rope_tip_body()'s own
+	##    doc comment for the body-level mechanism.
 	##
 	## No separate pacing/clamp mechanism drives how fast the chain unfolds or
 	## folds any more (the old ROPE_UNSPOOL_SLACK growing-leash sphere clamp
 	## and ROPE_TAUT_PERP_RADIUS taut-line tube clamp, both in
-	## rope_segment_body.gd, were deleted this round -- see this file's
-	## ROPE_PHYSICS_* consts' doc comment for why: they were exactly the kind
-	## of "compute where the rope should be, then force it there" correction
-	## the user's full architecture reset explicitly rejected). The chain's
-	## unfold/fold rate is now purely emergent from real joint-constraint
-	## propagation as the tip anchor moves; rope_segment_body.gd's
-	## MAX_SEGMENT_SPEED clamp (a per-body XZ speed cap, a legitimate
-	## physical-damping-style limit, not a position/path clamp) is the only
-	## remaining stability mechanism beyond the Y-plane lock.
+	## rope_segment_body.gd, were deleted in the ROUND 12 architecture reset --
+	## see this file's ROPE_PHYSICS_* consts' doc comment for why). The
+	## chain's unfold/fold rate (while thrown) and its idle drag behavior are
+	## both purely emergent from real joint-constraint propagation;
+	## rope_segment_body.gd's MAX_SEGMENT_SPEED clamp (a per-body XZ speed
+	## cap, a legitimate physical-damping-style limit, not a position/path
+	## clamp) is the only remaining stability mechanism beyond the Y-plane
+	## lock, and now applies to the tip body too while it's dynamic.
 	if not _physics_rope_active:
 		return
 	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
 	if _physics_rope_hand_anchor != null:
 		_physics_rope_hand_anchor.global_position = hand_pos
-	var tip_pos: Vector3 = _get_rope_tip_target()
-	if _physics_rope_tip_anchor != null:
-		_physics_rope_tip_anchor.global_position = tip_pos
+
+	if _physics_rope_tip_anchor == null:
+		return
+	var is_thrown: bool = dart != null and is_instance_valid(dart)
+	if is_thrown:
+		if not _physics_rope_tip_anchor.freeze:
+			_physics_rope_tip_anchor.freeze = true
+		_physics_rope_tip_anchor.global_position = _get_rope_tip_target()
+	elif _physics_rope_tip_anchor.freeze:
+		# Transition to idle: unfreeze once and stop touching its position --
+		# it stays exactly where the dart left it (typically at/near the hand,
+		# since a normal recall/pickup brings the dart back there) and starts
+		# dragging under real physics from here, no teleport involved.
+		_physics_rope_tip_anchor.freeze = false
 
 
 func get_rope_polyline_2d() -> Array[Vector2]:
