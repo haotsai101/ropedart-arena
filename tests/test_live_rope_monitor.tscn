@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://b3f7k2m9x1n4p6q8"]
+
+[ext_resource type="Script" path="res://tests/test_live_rope_monitor.gd" id="1_livemon"]
+
+[node name="TestLiveRopeMonitor" type="Node"]
+script = ExtResource("1_livemon")

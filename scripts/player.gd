@@ -348,6 +348,15 @@ var _physics_rope_active: bool = false
 ## _update_rope_tube_mesh() can cheaply build its curve control-point list
 ## every _process() frame.
 var _physics_rope_segments: Array[RigidBody3D] = []
+## Off by default -- never flipped by any committed default, only ever set at
+## runtime by a test/instrumentation script (same "toggle-and-revert, never
+## edit the file's own default" convention as GameManager.lobby_mode). When
+## true, forces _rope_leash_pivot_and_radius() to always use the FALLBACK
+## flat [anchor, DART_ROPE_LENGTH] circle, skipping the wrap-aware branch
+## entirely, so live-monitoring A/B tests can compare real per-tick chain
+## jitter/penetration with vs. without the wrap-aware leash computation live,
+## on the exact same real gameplay run, without editing this file per run.
+var debug_disable_wrap_leash: bool = false
 ## Raw PhysicsServer3D joint RIDs (see _join_rope_pin()) -- these are NOT
 ## Node3D-owned, so unlike _physics_rope_root's children they are not freed
 ## automatically when the root is queue_free()'d; _free_physics_rope() must
@@ -2345,7 +2354,7 @@ func _rope_leash_pivot_and_radius() -> Array:
 		return []
 	var anchor: Vector2 = dart.head_2d
 
-	if _physics_rope_active and not _physics_rope_segments.is_empty():
+	if not debug_disable_wrap_leash and _physics_rope_active and not _physics_rope_segments.is_empty():
 		var any_obstacle_contact: bool = false
 		for seg in _physics_rope_segments:
 			if bool((seg as RigidBody3D).get("_debug_last_has_contact")):
