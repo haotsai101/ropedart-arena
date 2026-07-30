@@ -1989,6 +1989,191 @@ func _free_physics_rope() -> void:
 		_physics_rope_tube_mesh.visible = false
 
 
+func _reset_rope_chain_to_hand() -> void:
+	## ROUND 24 (2026-07-29) FIX -- see CLAUDE.md's own dated entry (and ROUND
+	## 23's audit immediately above it) for the full root-cause writeup. Must
+	## be called from EVERY real discrete player teleport -- confirmed to be
+	## exactly two production call sites, reset_for_round() and _respawn()
+	## (ring-outs/_start_fall() already funnel into kill()->_respawn(), and
+	## game_manager.gd's start_round() is the only caller of reset_for_round()
+	## in both local and online flow, so there is no third path).
+	##
+	## Without this, the chain's ROPE_PHYSICS_SEGMENTS dynamic segments (and,
+	## while idle, the dynamic tip body -- see _make_rope_tip_body()) are real,
+	## independent RigidBody3D physics bodies that stay exactly wherever they
+	## physically were at the moment of the teleport (built once in _ready(),
+	## never rebuilt -- see _spawn_physics_rope()'s own doc comment, "the
+	## chain is persistent for the whole lifetime of a player node"). Only the
+	## chain's kinematic HAND anchor gets corrected every tick (see
+	## _update_physics_rope_anchors()); the dynamic segments get violently
+	## "reeled in" toward the new hand position over the following 1-5+ real
+	## seconds, sweeping straight through whatever real obstacle geometry
+	## happens to lie on the path between the stale pre-teleport position and
+	## the new one. ROUND 23's own isolated reproduction
+	## (tests/test_teleport_chain_drag_penetration.gd) measured this at
+	## max_pillar_pen=0.9752 sustained across 157 ticks (~2.6s), chain reach
+	## spiking to 22.5 units (>3x DART_ROPE_LENGTH) before settling.
+	##
+	## This is a genuine, one-time, discrete physics-state reset via
+	## PhysicsServer3D.body_set_state() -- NOT a per-frame "compute where it
+	## should be and force it" correction (that whole class of fix was already
+	## tried and explicitly rejected by the user for the rope's SHAPE -- see
+	## ROUND 4's entry above -- this is a different thing: a one-time snap at
+	## a well-defined discrete game-state transition, exactly the same
+	## category of operation as _spawn_physics_rope()'s own one-time initial
+	## layout, just re-triggered at every teleport instead of only once at
+	## _ready()). Zeroes each body's linear AND angular velocity in the same
+	## call so no residual momentum from the old position carries over into
+	## the new one.
+	##
+	## Collapses the chain into the exact same "small bunch near the hand,
+	## laid out along the current hand->tip span direction" configuration
+	## _spawn_physics_rope() already uses for a brand new chain -- this is the
+	## chain's own natural idle-collapsed rest shape, not a newly-invented
+	## pose.
+	##
+	## ROUND 24 FOLLOW-UP (same round, found via this round's own new
+	## multi-cycle regression test, tests/test_repeated_respawn_soak.gd --
+	## NOT caught by the single-teleport reproduction above, which only ever
+	## exercises ONE reset from a freshly-_ready()-built chain): repositioning
+	## bodies alone is NOT sufficient for every REPEATED reset. Measured
+	## directly: a soak of 24 back-to-back reset_for_round()/kill()-
+	## >_respawn() cycles (alternating two spawn points on opposite sides of
+	## PillarA) showed a real, large (up to 0.92), near-instant (tick 1 after
+	## the reset) penetration specifically whenever the NEW spawn point
+	## happened to land close to a DIFFERENT real obstacle (PillarB, ~2.8
+	## units from one of the two test spawn points) -- 100% reproducible on
+	## every cycle landing near PillarB, 0.0000 on every cycle landing far
+	## from every obstacle, across 12 repeated cycles each. Root cause: the
+	## raw PhysicsServer3D pin joints (_join_rope_pin()) are never recreated
+	## by a reset -- only REPOSITIONED bodies are. Godot's iterative solver
+	## keeps per-joint warm-start impulse accumulator state ACROSS physics
+	## steps for fast convergence (a real, standard, deliberate Godot
+	## optimization, not a bug in the engine) -- external
+	## PhysicsServer3D.body_set_state() calls reset each BODY's own transform/
+	## velocity, but do NOT reset the JOINT's own separate accumulated-impulse
+	## state left over from whatever large constraint violation the chain was
+	## experiencing the instant before this reset fires (e.g. mid whip-crack
+	## idle drift, or a real thrown-dart wrap -- both plausible immediately
+	## before a mid-round kill). The very first solve step after a reposition
+	## then applies that STALE impulse against the NEW (small, correct)
+	## positions, producing an erroneous one-tick "kick" large enough to
+	## tunnel a segment through nearby geometry. This is exactly why the
+	## FIRST-ever chain build (fresh joint_create() calls, zero warm-start
+	## history) already verified clean in
+	## test_teleport_chain_drag_penetration.gd, while a REPEATED reset of an
+	## already-existing, already-joint-connected chain did not, until this
+	## fix.
+	##
+	## The fix: destroy and recreate every joint in the chain as part of this
+	## same reset (mirrors _spawn_physics_rope()'s own joint-creation loop
+	## exactly, via the shared _join_rope_pin() helper) -- guarantees zero
+	## residual solver state, the same guarantee a genuinely fresh chain
+	## already has. This is still a one-time, discrete, well-defined-
+	## transition operation (freeing+recreating a handful of RIDs once per
+	## teleport), not a per-frame correction.
+	if not _physics_rope_active:
+		return
+
+	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
+	var tip_target: Vector3 = _get_rope_tip_target()
+
+	var span: Vector3 = tip_target - hand_pos
+	var span_dir: Vector3
+	if span.length() > 0.01:
+		span_dir = span.normalized()
+	else:
+		span_dir = Vector3(aim_dir.x, 0.0, aim_dir.y).normalized()
+	if span_dir.length() < 0.01:
+		span_dir = Vector3.FORWARD
+
+	var y_axis: Vector3 = span_dir
+	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
+	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
+	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
+	var seg_basis := Basis(x_axis, y_axis, z_axis)
+
+	if _physics_rope_hand_anchor != null:
+		_reset_rope_body_state(_physics_rope_hand_anchor, Transform3D(Basis.IDENTITY, hand_pos))
+
+	var denom: float = float(maxi(ROPE_PHYSICS_SEGMENTS - 1, 1))
+	var spacing: float = ROPE_BUNCH_SPACING / denom
+	for i in range(_physics_rope_segments.size()):
+		var seg: RigidBody3D = _physics_rope_segments[i]
+		var seg_center: Vector3 = hand_pos + span_dir * (float(i) * spacing)
+		_reset_rope_body_state(seg, Transform3D(seg_basis, seg_center))
+
+	if _physics_rope_tip_anchor != null:
+		var is_thrown: bool = dart != null and is_instance_valid(dart)
+		if is_thrown:
+			# Only reachable if a future caller invokes this mid-throw --
+			# neither of today's two call sites can (reset_for_round() clears
+			# dart before calling this; _respawn() only ever fires after
+			# kill() already cleared dart, synchronously, well before the
+			# respawn timer). Leave the tip anchor's own kinematic tracking
+			# alone in that case -- _update_physics_rope_anchors() keeps
+			# driving it to the dart's own (unteleported) real position next
+			# tick as usual, same as it already does every other tick.
+			pass
+		else:
+			if _physics_rope_tip_anchor.freeze:
+				# Mirrors _update_physics_rope_anchors()'s own idle-transition
+				# unfreeze -- a teleport with no dart out should leave the tip
+				# in the same free-dragging dynamic state a normal idle tick
+				# would, not stuck kinematic.
+				_physics_rope_tip_anchor.freeze = false
+			var tip_center: Vector3 = hand_pos + span_dir * (float(ROPE_PHYSICS_SEGMENTS) * spacing)
+			_reset_rope_body_state(_physics_rope_tip_anchor, Transform3D(seg_basis, tip_center))
+
+	_rebuild_rope_joints()
+
+
+func _rebuild_rope_joints() -> void:
+	## See _reset_rope_chain_to_hand()'s own "ROUND 24 FOLLOW-UP" doc comment
+	## for the full root-cause writeup on why repositioning bodies alone isn't
+	## enough for a REPEATED reset. Frees every existing joint RID (each
+	## joint's own accumulated warm-start impulse state dies with it -- there
+	## is no PhysicsServer3D API to reset that state on an existing joint in
+	## place) and recreates the exact same chain topology
+	## _spawn_physics_rope() builds, using the same _join_rope_pin() helper
+	## and the same local anchor points (each capsule's own ends,
+	## ROPE_PHYSICS_SEGMENT_HALF_LENGTH along local Y) -- every joint born
+	## here starts with zero solver history, identical to a genuinely fresh
+	## chain build.
+	for joint_rid in _physics_rope_joint_rids:
+		if joint_rid.is_valid():
+			PhysicsServer3D.free_rid(joint_rid)
+	_physics_rope_joint_rids.clear()
+
+	if _physics_rope_hand_anchor == null or _physics_rope_tip_anchor == null:
+		return
+
+	var local_far := Vector3(0.0, ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
+	var local_near := Vector3(0.0, -ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
+
+	var prev: RigidBody3D = _physics_rope_hand_anchor
+	var prev_local_far := Vector3.ZERO
+	for seg in _physics_rope_segments:
+		_join_rope_pin(prev, prev_local_far, seg as RigidBody3D, local_near)
+		prev = seg
+		prev_local_far = local_far
+	_join_rope_pin(prev, prev_local_far, _physics_rope_tip_anchor, Vector3.ZERO)
+
+
+func _reset_rope_body_state(body: RigidBody3D, xform: Transform3D) -> void:
+	## Instant, discrete physics-state reset for one rope chain body -- see
+	## _reset_rope_chain_to_hand()'s own doc comment for why body_set_state()
+	## (not global_transform/global_position, and not a per-frame correction)
+	## is the right primitive here: it hard-sets the physics server's own
+	## authoritative transform AND wipes any residual velocity in the same
+	## call, so the body can't carry stale momentum from wherever it was
+	## before the teleport into its new position.
+	var rid: RID = body.get_rid()
+	PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_TRANSFORM, xform)
+	PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
+	PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY, Vector3.ZERO)
+
+
 func _update_rope_tube_mesh() -> void:
 	## Rebuilds one continuous ArrayMesh every _process() frame, tracing a
 	## smooth Catmull-Rom curve through the REAL physics chain's own control
@@ -2466,6 +2651,11 @@ func kill() -> void:
 
 func _respawn() -> void:
 	global_position = spawn_pos
+	# ROUND 24 (2026-07-29): dart is already null here -- kill() clears it
+	# synchronously, well before this timer-deferred respawn fires -- see
+	# _reset_rope_chain_to_hand()'s own doc comment for why this teleport
+	# site needs the chain snapped to the new position too.
+	_reset_rope_chain_to_hand()
 	is_dead = false
 	_prev_throw = false
 	if player_mesh != null:
@@ -2512,6 +2702,14 @@ func reset_for_round(new_lives: int, start_pos: Vector3) -> void:
 	if dart != null:
 		dart.queue_free()
 		dart = null
+	# ROUND 24 (2026-07-29): must run AFTER dart is cleared above (so the
+	# tip-anchor branch below correctly sees dart == null) and after
+	# global_position has already been teleported to start_pos -- see
+	# _reset_rope_chain_to_hand()'s own doc comment for the full root-cause
+	# writeup this fixes (persistent chain segments left behind at the stale
+	# pre-teleport position, getting dragged through obstacles over real
+	# time).
+	_reset_rope_chain_to_hand()
 	_start_spawn_invincibility()
 
 

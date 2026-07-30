@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://d4e5f6g7h8i9j0k1"]
+
+[ext_resource type="Script" path="res://tests/test_repeated_respawn_soak.gd" id="1_rs"]
+
+[node name="TestRepeatedRespawnSoak" type="Node"]
+script = ExtResource("1_rs")

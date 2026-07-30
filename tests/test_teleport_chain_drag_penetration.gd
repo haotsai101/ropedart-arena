@@ -31,13 +31,23 @@ extends Node
 ##
 ## This test isolates the mechanism directly: spawn a player far from any
 ## obstacle, let its chain fully settle/collapse near the hand (confirmed,
-## not assumed), THEN perform a single instantaneous global_position teleport
-## (mirroring reset_for_round()'s own exact mechanism -- a bare
-## global_position write, nothing else) to a position on the OPPOSITE side of
-## PillarA from the settle point, so the straight-line hand-anchor path the
-## kinematic endpoint takes necessarily crosses straight through the pillar's
-## real rect. Measures every physics tick, no settle window, starting from
-## the instant of the teleport.
+## not assumed), THEN perform a single instantaneous teleport to a position
+## on the OPPOSITE side of PillarA from the settle point, so the
+## straight-line hand-anchor path the kinematic endpoint takes necessarily
+## crosses straight through the pillar's real rect. Measures every physics
+## tick, no settle window, starting from the instant of the teleport.
+##
+## ROUND 24 (2026-07-29) UPDATE: the teleport below now calls the REAL
+## player.reset_for_round() production primitive (previously a bare
+## player.global_position = end_pos write that only "mirrored" it) --
+## reset_for_round() is exactly one of this bug's two real fix call sites
+## (see player.gd's _reset_rope_chain_to_hand()), so calling the actual
+## function is what makes this test a genuine regression test of the real
+## fix rather than of a hand-rolled stand-in for it. A bare global_position
+## write would no longer exercise the fix at all (the fix is hooked inside
+## reset_for_round()/_respawn() themselves, not a generic "any large jump"
+## detector), so keeping the old primitive here would have silently stopped
+## testing anything real post-fix.
 
 const PRE_TELEPORT_SETTLE_TICKS: int = 360  ## 6s -- past the documented
 ## ~4-5s idle-collapse convergence window, so the PRE-teleport chain state is
@@ -84,13 +94,14 @@ func _run() -> void:
 		pre_max_reach = maxf(pre_max_reach, Vector2(hand0.x, hand0.z).distance_to(Vector2(sp.x, sp.z)))
 	print("[TELEPORT-DRAG] pre-teleport confirmed chain state: max_seg_reach_from_hand=%.4f (should be small/collapsed, matching test_rope_physics_chain_settle.gd's own ~1.35 idle-collapse finding)" % pre_max_reach)
 
-	# THE TELEPORT: exactly mirrors reset_for_round()/​_respawn()'s own real
-	# mechanism -- a bare global_position write, nothing else touched. Target
-	# is on PillarA's OPPOSITE (northeast) side -- the straight hand-anchor
-	# path from start_pos to here necessarily crosses the pillar's real rect.
+	# THE TELEPORT: calls the REAL reset_for_round() production primitive --
+	# see this file's own header comment for why this replaced a bare
+	# global_position write. Target is on PillarA's OPPOSITE (northeast)
+	# side -- the straight hand-anchor path from start_pos to here
+	# necessarily crosses the pillar's real rect.
 	var end_pos := Vector3(rect.end.x + 6.0, 0.7, rect.end.y + 6.0)
-	player.global_position = end_pos
-	print("[TELEPORT-DRAG] TELEPORT at this tick: %s -> %s (straight path crosses PillarA rect=%s)" % [start_pos, end_pos, rect])
+	player.reset_for_round(3, end_pos)
+	print("[TELEPORT-DRAG] TELEPORT (via reset_for_round()) at this tick: %s -> %s (straight path crosses PillarA rect=%s)" % [start_pos, end_pos, rect])
 
 	var max_pen: float = 0.0
 	var worst_tick: int = -1
