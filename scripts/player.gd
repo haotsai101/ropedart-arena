@@ -270,6 +270,133 @@ const ROPE_SEGMENT_MASS: float = ROPE_SEGMENT_LINEAR_MASS_DENSITY * ROPE_PHYSICS
 ## this is the first place to look, not the rope chain again.
 const ROPE_LINEAR_DAMP: float = 3.0
 const ROPE_ANGULAR_DAMP: float = 4.0
+
+## ROUND 28 (2026-07-30) -- root-caused and fixed the hand-side (segment 0)
+## severe tunneling event ROUND 27's live monitor found (rope sweeping
+## 0.74-0.96 deep into a pillar during ORDINARY MOVEMENT, no throw/teleport
+## involved). ROUND 27 checked and ruled out one candidate (the player's own
+## root CharacterBody3D speed, DASH_SPEED=20 -> ~0.33 units/tick, far too
+## small) but never checked the ACTUAL quantity that drives the kinematic
+## hand/tip anchors: _get_rope_hand_anchor_pos()/_get_rope_tip_target() read
+## the real, ANIMATED handslot.r bone position every physics tick (via
+## get_hand_world_position() -> _dagger_in_hand.global_position), not the
+## player's root transform.
+##
+## VERIFIED via two new, permanent, real-gameplay-driving probes (not a
+## synthetic/scripted scenario -- same "drive the real GameManager loop"
+## discipline as ROUND 27's own test), each run single-instance (no CPU
+## contention from parallel soaks) so results are attributable to the
+## engine's own animation/physics behavior, not this session's own
+## methodology:
+##   tests/test_hand_anchor_cadence_probe.gd -- 60s real soak, 4 real hard
+##   bots: the hand anchor's driven position is BYTE-IDENTICAL (delta <
+##   0.00001) for stretches of up to 22 CONSECUTIVE physics ticks in a row
+##   (not a render-frame-vs-physics-tick starvation artifact -- idle frames
+##   ran 2.4x MORE often than physics ticks in this same run, so the
+##   skeleton pose itself was genuinely static, not merely unsampled), then
+##   JUMPS by ~0.69 units in a SINGLE tick, dozens of times per 60s, always
+##   at the exact tick _current_anim changes (confirmed via
+##   tests/test_hand_side_tunnel_probe.gd's own per-animation breakdown: the
+##   max hand_delta recorded while EACH clip is current -- Idle_A 0.6921,
+##   Running_A 0.6436, Punch_Jab 0.6715 -- consistently far exceeds
+##   move_speed(6.0)/DASH_SPEED(20.0)'s own theoretical per-tick ceiling of
+##   0.1/0.333, and is consistent across totally different destination
+##   clips, matching a fixed rig geometry quantity -- the arm's own
+##   idle-pose-to-swing-pose excursion -- not continuous locomotion).
+## ROOT CAUSE: _play_anim() calls _anim_player.play(anim_name, -1.0, speed)
+## with NO cross-fade (-1.0 = AnimationPlayer's own default blend time,
+## 0.0 unless explicitly configured, and never has been here) -- switching
+## between Idle_A/Walking_A/Running_A/Punch_Jab/etc (which real bots do
+## constantly: every CHASE/AIM/RETREAT transition, every opportunistic
+## melee slash) hard-CUTS the skeleton pose from the old clip's arm position
+## straight to the new clip's first frame, INSTANTLY, in one tick -- fed
+## directly, unsmoothed, into the kinematic anchor's global_position every
+## single _physics_process() tick. Segment 0 (and, while idle, the LAST
+## segment via the tip anchor's own dart==null fallback to the same hand
+## position -- see _get_rope_tip_target()) is the ONLY body in the whole
+## chain jointed directly to a body that can move this way: every other
+## joint is dynamic-to-dynamic, governed continuously by the solver's own
+## incremental integration, never subject to an external, instantaneous,
+## un-interpolated position override. When a clip-switch pose-jump happens
+## to land near a sharp obstacle corner, the resulting oversized single-tick
+## joint violation is exactly what ROUND 27's own tick-by-tick profile
+## showed (pen rising 0.07->0.74 then decaying over ~10 ticks as the solver
+## resolves it) -- a real, mechanistically-confirmed match, not a guess.
+## RigidBody3D.continuous_cd (see _make_rope_segment_body(), unchanged) is
+## Godot's simplified ray-cast-only CCD mode and would not reliably catch
+## this either way -- it sweeps a body's OWN velocity-integrated motion, not
+## a neighboring KINEMATIC body's instantaneous externally-set position
+## jump propagating through a joint constraint.
+##
+## THE FIX, same "bound a legitimate physical quantity, don't invent
+## geometry" category as MAX_SEGMENT_SPEED (rope_segment_body.gd) -- NOT a
+## "compute where the rope should be" correction: ROPE_ANCHOR_MAX_SPEED caps
+## how fast _update_physics_rope_anchors() is allowed to MOVE each kinematic
+## anchor toward its real target per tick (Vector3.move_toward(), a plain
+## step-size clamp, not a new position computed from geometry). Set to 26.0
+## units/sec (0.4333 units/tick @ 60Hz) -- comfortably above DASH_SPEED's own
+## real 20.0 units/sec ceiling (so every legitimate continuous root-motion
+## case, already measured, passes through completely unclamped) but well
+## below the measured ~0.65-0.92-unit (39-55 units/sec) clip-switch jumps,
+## turning what used to be a single catastrophic joint kick into a 2-3-tick
+## ramp instead. This does not (and cannot) fix the underlying animation
+## pose-pop itself -- a real, separate, purely-visual issue (out of this
+## round's scope; would need actual blend-time tuning in _play_anim(), which
+## risks the carefully-tuned Enter/Hold/Exit throw/recall phase timing
+## documented elsewhere in this file) -- it only bounds the PHYSICAL
+## consequence of that pop on the rope chain, the same way MAX_SEGMENT_SPEED
+## already bounds (without eliminating) other solver-driven spikes.
+const ROPE_ANCHOR_MAX_SPEED: float = 26.0
+
+## ROUND 28 FOLLOW-UP -- found via this round's OWN re-verification soak
+## (never skip re-measuring after a fix, per this file's own standing
+## convention): the plain ROPE_ANCHOR_MAX_SPEED clamp above, applied
+## UNCONDITIONALLY, caused a genuine NEW regression, caught by re-running
+## tests/test_live_rope_monitor.gd for the same real soak length as
+## ROUND 27's own verification -- max_raw_pen jumped to 0.79-0.99 in EVERY
+## one of 6 fresh soaks (vs. 2-of-4 before), always within the first ~90
+## ticks of a match. Root cause, confirmed via a temporary per-tick
+## hand_target-vs-hand_actual gap probe: _spawn_physics_rope() runs from
+## _ready(), which fires BEFORE GameManager's start_round()->
+## reset_for_round() moves a freshly-instantiated player to its real spawn
+## point -- so the hand anchor's very first target is whatever temporary/
+## default position the player node happens to occupy at _ready()-time
+## (measured: a ~13.7-unit gap from the real eventual spawn point in one
+## repro). The OLD, unclamped code never cared: it snapped the anchor
+## directly to hand_pos every single tick regardless of distance, so this
+## gap was invisible (closed in one tick, before physics even started
+## meaningfully). The NEW clamp, applied uniformly, turned that same gap
+## into a genuine ~30-tick (0.5s) DRAGGED sweep of the entire chain across
+## the map from the wrong position to the right one -- exactly the same
+## failure class ROUND 23/24 already root-caused and fixed for
+## reset_for_round()/_respawn() teleports (_reset_rope_chain_to_hand()),
+## but for a THIRD transition their fix never covered (initial _ready()-time
+## placement, not one of the "confirmed... exactly two production call
+## sites" that function's own doc comment describes) -- until
+## reset_for_round() itself fires a few ticks later and its own instant
+## PhysicsServer3D.body_set_state() reset finally cleans it up, by which
+## time real damage (a real sweep through PillarA/PillarB) was already done.
+##
+## FIX: a plain distance GATE, not a new geometric correction -- if the
+## anchor's real target is farther than ROPE_ANCHOR_SNAP_THRESHOLD away,
+## SNAP instantly (matching the old, safe, pre-clamp behavior exactly, and
+## the same "large jump = discrete reset" precedent already established for
+## teleports) instead of rate-limiting; only gaps smaller than this snap
+## instantly-vs-clamp threshold go through the ROPE_ANCHOR_MAX_SPEED ramp.
+## Sized well above the largest legitimate small-scale target the round-28
+## measurements ever found (the worst measured single-tick animation
+## clip-switch pop was 0.92 units, Sword_Attack/Punch_Jab/Idle_A all in the
+## same ~0.65-0.92 band) and well below any real spawn-point-to-spawn-point
+## or mid-match teleport distance on this arena (spawn points are spread
+## across a 14.5-unit arena half-width) -- so it cleanly separates "smooth
+## out an oversized single-tick animation pop" (the actual bug this fix
+## targets) from "the anchor is nowhere near correct, just put it there"
+## (every other case, including this newly-found _ready()-vs-reset_for_
+## round() ordering gap). RE-VERIFIED after this change via the same real
+## tests/test_live_rope_monitor.gd soak methodology -- see this file's own
+## dated CLAUDE.md entry for the actual before/after numbers.
+const ROPE_ANCHOR_SNAP_THRESHOLD: float = 2.0
+
 ## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
 ## comment for why it's duplicated rather than shared, and for the
 ## one-directional layer/mask design (chain reacts to obstacles; nothing
@@ -1670,6 +1797,21 @@ func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, or
 	body.gravity_scale = 0.0
 	body.linear_damp = ROPE_LINEAR_DAMP
 	body.angular_damp = ROPE_ANGULAR_DAMP
+	## ROUND 28: confirmed via ClassDB introspection (this project's actual
+	## Godot 4.7 build) that PhysicsServer3D's default GodotPhysics3D backend
+	## exposes only a single BOOLEAN CCD toggle
+	## (body_set_enable_continuous_collision_detection) -- there is no
+	## CCD_MODE_CAST_RAY/CCD_MODE_CAST_SHAPE distinction available to switch
+	## between in this engine build/version (that enum exists in some other
+	## Godot physics backends/newer API surfaces, not this one -- do not
+	## re-attempt without first re-confirming via ClassDB, as a bare
+	## reference to a nonexistent PhysicsServer3D constant is a script
+	## PARSE ERROR that breaks this entire file, not a silent no-op). This
+	## bool (already `true` since the physics-chain's very first commit) is
+	## therefore already this engine's strongest available CCD setting --
+	## the real, measured, primary fix for the hand-side tunneling class is
+	## ROPE_ANCHOR_MAX_SPEED (see that const's own doc comment), not a CCD
+	## mode upgrade.
 	body.continuous_cd = true
 	body.collision_layer = 0
 	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
@@ -1846,14 +1988,52 @@ func _update_physics_rope_anchors() -> void:
 	## MAX_SEGMENT_SPEED clamp (a per-body XZ speed cap, a legitimate
 	## physical-damping-style limit, not a position/path clamp) is the only
 	## remaining stability mechanism beyond the Y-plane lock.
+	##
+	## ROUND 28: the HAND anchor's own per-tick step is now speed-clamped via
+	## ROPE_ANCHOR_MAX_SPEED (see that const's own doc comment for the full
+	## root-cause writeup) -- a plain Vector3.move_toward() step-size bound,
+	## same "legitimate physical quantity" category as MAX_SEGMENT_SPEED, not
+	## a geometric correction. The TIP anchor is deliberately only clamped
+	## while dart == null (idle): _get_rope_tip_target() falls back to this
+	## SAME raw animated hand-bone position while idle, so it shares the
+	## exact same clip-switch-pop vulnerability -- but while a dart is
+	## actually thrown, the tip anchor must keep tracking the dart's own
+	## real (already smooth, already fast-by-design) flight/recall position
+	## with zero added lag: rope_dart.gd's own travel_speed can legitimately
+	## reach BASE_SPEED*2.0=36 units/sec at a full-charge throw and
+	## recall_speed is 24 units/sec, both already above ROPE_ANCHOR_MAX_SPEED
+	## -- clamping those would reintroduce exactly the kind of visible
+	## throw/recall tracking lag earlier rounds' rejected growing-leash/taut-
+	## line clamps were removed for.
 	if not _physics_rope_active:
 		return
+	var anchor_delta: float = get_physics_process_delta_time()
 	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
 	if _physics_rope_hand_anchor != null:
-		_physics_rope_hand_anchor.global_position = hand_pos
+		_step_or_snap_anchor(_physics_rope_hand_anchor, hand_pos, anchor_delta)
 	var tip_pos: Vector3 = _get_rope_tip_target()
 	if _physics_rope_tip_anchor != null:
-		_physics_rope_tip_anchor.global_position = tip_pos
+		if dart == null:
+			_step_or_snap_anchor(_physics_rope_tip_anchor, tip_pos, anchor_delta)
+		else:
+			_physics_rope_tip_anchor.global_position = tip_pos
+
+
+func _step_or_snap_anchor(anchor: RigidBody3D, target: Vector3, delta: float) -> void:
+	## See ROPE_ANCHOR_MAX_SPEED/ROPE_ANCHOR_SNAP_THRESHOLD's own doc
+	## comments for the full root-cause writeup (ROUND 28, plus its own
+	## follow-up fix). Two distinct cases, not one uniform clamp: a genuinely
+	## large gap (bad/stale starting position, e.g. the _ready()-vs-
+	## reset_for_round() ordering gap, or any other future discrete
+	## reposition this function doesn't already know about) SNAPS instantly,
+	## exactly like the old unclamped code always did -- only a SMALL gap
+	## (the oversized-but-still-modest single-tick animation clip-switch pop
+	## this whole fix targets) gets rate-limited.
+	var gap: float = anchor.global_position.distance_to(target)
+	if gap > ROPE_ANCHOR_SNAP_THRESHOLD:
+		anchor.global_position = target
+	else:
+		anchor.global_position = anchor.global_position.move_toward(target, ROPE_ANCHOR_MAX_SPEED * delta)
 
 
 func get_rope_polyline_2d() -> Array[Vector2]:
