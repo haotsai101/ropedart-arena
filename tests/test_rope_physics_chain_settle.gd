@@ -14,54 +14,30 @@ extends Node
 ##
 ## FOUR things are measured, matching the task's own verification protocol:
 ##
-## 1. IDLE DRIFT (ROUND 22, 2026-07-29 -- renamed from "IDLE COLLAPSE," see
-##    below for why the old name/spec no longer applies): with no dart ever
-##    thrown and the player never moving, how far does the persistent
-##    chain's own tip end drift from the hand?
+## 1. IDLE COLLAPSE: with no dart ever thrown, does the persistent chain's
+##    own tip anchor (which coincides with the hand while dart == null --
+##    see player.gd's _get_rope_tip_target()) actually pull every one of the
+##    32 dynamic segments in close to the hand, per the user's literal spec
+##    ("When held, all segments collapse into the character's hand")?
 ##
-##    ARCHITECTURE CHANGE THIS ROUND, per direct, explicit user requirement:
-##    "no damping and folding or coiling. let it be dragged around the
-##    character." Every round before this one (see the "OLD BEHAVIOR" note
-##    below) kept the tip anchor KINEMATICALLY PINNED to the hand's own
-##    position, every tick, while dart == null -- i.e. this section used to
-##    test whether that forced pinning actually produced a tight bunch (it
-##    did, by construction: two points forced to coincide every frame have
-##    nowhere else to be). That forced pinning is exactly the "folding or
-##    coiling" the user's own words reject, so ROUND 22 removed it (see
-##    player.gd's _make_rope_tip_body()/_update_physics_rope_anchors()): the
-##    tip is now UNFROZEN into a real dynamic body while idle, so this
-##    section no longer has a "collapse" invariant to assert -- there is no
-##    longer any force pulling the tip back toward the hand at all (per
-##    ROUND 12's own already-established finding, reaffirmed here: with
-##    gravity disabled and no tension/damping source, a free rope end has no
-##    physical reason to prefer a compact shape over an extended one).
-##
-##    WHAT THIS SECTION MEASURES NOW, informationally plus a loose
-##    divergence-only bound (IDLE_DRIFT_SANE_BOUND): a real, DISCLOSED,
-##    NOT-fully-explained-by-movement finding from this round's own direct
-##    measurement -- even with ZERO player movement, the freed tip routinely
-##    drifts 4-11+ units from the hand within 1-5 real seconds of becoming
-##    idle (observed range across several runs of this test and the
-##    dedicated tests/test_rope_idle_drag.gd: 4.46-11.19), i.e. a real,
-##    reproducible "whip-crack" release the instant the tip stops being
-##    forced to the hand, not a graceful settle-in-place. This is
-##    SEPARATE from (and, per direct A/B measurement in the same round, only
-##    partially caused by) this round's removal of body damping -- see
-##    CLAUDE.md's own ROUND 22 entry for the full A/B numbers (damping
-##    restored via a temporary isolation patch still showed 5.56-8.74 in the
-##    same scenario, i.e. real but smaller). PASS/FAIL below only catches
-##    genuine unbounded divergence (NaN or absurd values), NOT this drift
-##    magnitude itself -- there is no known-correct "right" idle drift
-##    distance for this architecture, and pretending IDLE_COLLAPSE_RADIUS's
-##    old 1.6 tolerance still means something would misrepresent a real,
-##    disclosed, and honestly quite possibly undesirable-on-screen behavior
-##    as a clean pass. If the user's own next report is "the rope flings
-##    itself out for no reason when I'm not moving," THIS is the mechanism,
-##    and the fix would need to reconsider whether the tip should really be
-##    fully free (vs., e.g., some new deliberately-modest restoring force --
-##    which would itself risk re-approaching the "compute where it should
-##    be" pattern earlier rounds rejected; not attempted this round, flagged
-##    for a future round's own judgment call).
+##    TOLERANCE, derived from direct measurement, not guessed: with gravity
+##    disabled, no tension source, and no self-collision between segments
+##    (see rope_segment_body.gd's own doc comment for why -- collision_mask
+##    only ever matches real obstacle geometry, never another segment), a
+##    genuinely slack rope with both ends pinned to the SAME point has NO
+##    physical force compacting it into a single tight point -- any folded
+##    shape that satisfies every joint is an equally valid equilibrium. A
+##    dedicated convergence probe (sampling max-reach-from-hand and every
+##    segment's own speed every second for 20 real seconds, run separately
+##    during this test's own development -- not committed, scratch-only)
+##    confirmed the chain genuinely SETTLES (avg segment speed decays to
+##    ~0.001-0.002, essentially at rest) rather than drifting or diverging,
+##    reaching a STABLE steady state of max-reach-from-hand ~1.35 units by
+##    ~4-5 real seconds and holding there, rock-steady, through the full
+##    20-second probe window. IDLE_COLLAPSE_RADIUS below is set with
+##    headroom above that measured, sustained value -- this is a real,
+##    converged physics equilibrium (a loosely bunched coil resting near the
+##    hand, not stretched out), not a bug or an arbitrarily loose tolerance.
 ##
 ## 2. SETTLED-CONFIGURATION SWEEP (the direct replacement for the deleted
 ##    visibility-graph sweep): force-anchor a dart at many different
@@ -87,19 +63,12 @@ extends Node
 ## Run via the Godot MCP run_project tool with
 ## scene=res://tests/test_rope_physics_chain_settle.tscn.
 
-const IDLE_SETTLE_TICKS: int = 300  ## 5s -- unchanged tick count from every
-## prior round; no longer expected to reach a small/tight "converged"
-## configuration as of ROUND 22 (2026-07-29) -- see this file's own header
-## comment's "1. IDLE DRIFT" section for the full rewrite.
-const IDLE_DRIFT_SANE_BOUND: float = 15.0  ## ROUND 22 (2026-07-29) --
-## replaces IDLE_COLLAPSE_RADIUS (was 1.6, asserting a tight bunch near the
-## hand -- no longer a real invariant now that the tip is a freely-dragging
-## dynamic body while idle, see header comment). This is a LOOSE
-## divergence-only catch, set with headroom above the largest real value
-## observed across several runs of this exact scenario (4.46-11.19, see
-## header comment) -- it exists only to catch genuine unbounded blow-up
-## (NaN, or a value like 10x this), not to assert any particular "collapsed"
-## shape.
+const IDLE_SETTLE_TICKS: int = 300  ## 5s -- past the measured ~4-5s
+## convergence point (see this file's own header comment's probe writeup).
+const IDLE_COLLAPSE_RADIUS: float = 1.6  ## headroom above the measured,
+## sustained steady-state value of ~1.35 (see this file's own header
+## comment) -- catches genuine divergence/drift, not the real converged
+## equilibrium shape of a slack, zero-tension, zero-gravity rope.
 
 const CONFIG_SETTLE_TICKS: int = 220
 const PENETRATION_TOLERANCE: float = 0.001  ## real segments must not enter
@@ -125,16 +94,6 @@ const RETRIEVE_MAX_TICKS: int = 240
 ## just its current endpoints -- the same reason two different real ropes
 ## reeled in by hand don't always end up in an identical coil. Given generous
 ## headroom above the observed range.
-##
-## ROUND 22 (2026-07-29) UPDATE, disclosed rather than silently re-tuned: with
-## damping removed (this round's own "no damping" requirement), a direct
-## re-measurement of this exact scenario came back at 5.27 -- a real FAIL
-## against this unchanged 4.5 threshold, and during the fold phase leading up
-## to it the chain's own max reach transiently ballooned to ~14.8 (see
-## CLAUDE.md's ROUND 22 entry for the full trace) before settling back down.
-## Left UNCHANGED rather than loosened to paper over this -- a real,
-## measured regression from removing damping, not a threshold that needs
-## recalibrating to a new "correct" normal.
 const POST_RETRIEVE_COLLAPSE_RADIUS: float = 4.5
 
 ## 5. ANCHORED STEADY-STATE JITTER (2026-07-26 -- real user report, direct
@@ -228,12 +187,7 @@ func _spawn_player(pos: Vector3, aim: Vector2) -> Node:
 
 
 func _test_idle_collapse() -> bool:
-	# ROUND 22 (2026-07-29): renamed "IDLE COLLAPSE" -> "IDLE DRIFT" in every
-	# printed label -- see this file's own header comment ("1. IDLE DRIFT")
-	# for the full rewrite of what this section means and why. Function name
-	# itself left as _test_idle_collapse() to avoid an unnecessary call-site
-	# diff; it no longer asserts a collapse.
-	print("[TEST] --- 1. IDLE DRIFT (dart == null, no throw ever fired, no player movement) ---")
+	print("[TEST] --- 1. IDLE COLLAPSE (dart == null, no throw ever fired) ---")
 	var player = _spawn_player(Vector3(0.0, 0.7, 0.0), Vector2(0, 1))
 	for i in IDLE_SETTLE_TICKS:
 		await get_tree().physics_frame
@@ -245,8 +199,8 @@ func _test_idle_collapse() -> bool:
 		var p3: Vector3 = (seg as RigidBody3D).global_position
 		var d: float = hand_2d.distance_to(Vector2(p3.x, p3.z))
 		max_dist = maxf(max_dist, d)
-	print("[TEST] idle: %d segments, max_dist_from_hand=%.4f (divergence-only sane_bound=%.2f)" % [
-		player._physics_rope_segments.size(), max_dist, IDLE_DRIFT_SANE_BOUND])
+	print("[TEST] idle: %d segments, max_dist_from_hand=%.4f (tolerance=%.2f)" % [
+		player._physics_rope_segments.size(), max_dist, IDLE_COLLAPSE_RADIUS])
 	# DIAGNOSTIC (fixed-segment-length round): is there a chronic per-joint
 	# gap even at settled idle rest, independent of any throw transient?
 	var idle_gaps: Array[float] = _joint_gaps(player)
@@ -259,9 +213,9 @@ func _test_idle_collapse() -> bool:
 	print("[TEST] idle diagnostic: max_joint_gap=%.4f @ joint %d (settled, no throw ever fired)" % [
 		idle_max_gap, idle_max_gap_idx])
 
-	var ok: bool = max_dist <= IDLE_DRIFT_SANE_BOUND and is_finite(max_dist)
-	print("[TEST] %s: idle chain drift stayed within the loose divergence-only bound (max_dist=%.4f, no longer asserting a tight collapse -- see header comment)" % [
-		"PASS" if ok else "FAIL", max_dist])
+	var ok: bool = max_dist <= IDLE_COLLAPSE_RADIUS
+	print("[TEST] %s: idle chain %s collapsed at the hand" % [
+		"PASS" if ok else "FAIL", "stays" if ok else "does NOT stay"])
 	player.queue_free()
 	for i in 3:
 		await get_tree().physics_frame
