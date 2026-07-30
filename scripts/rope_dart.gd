@@ -132,6 +132,25 @@ const CAPSULE_DIR: Vector2 = Vector2(0, -1)
 ## visibly sink into there.
 const ANCHOR_EMBED_DEPTH: float = -0.1175
 
+## ROUND 30 (2026-07-30) -- "the dart's handle has a ring to connect to the
+## chain" (per direct user requirement, part of the same ring-chain rebuild
+## as player.gd's ROPE_PHYSICS_* rework). VISUAL ONLY: this dart script never
+## has collision shapes of its own (see this file's own header comment, "no
+## physics collision for kill detection" -- pure 2D math), so the handle ring
+## below is a plain TorusMesh, not a new RigidBody3D. Sizing is duplicated,
+## not shared, from player.gd's own ROPE_PHYSICS_SEGMENT_HALF_LENGTH/
+## ROPE_RADIUS (same small-constant duplication convention already used for
+## DAGGER_POMMEL_OFFSET/HITBOX_DEBUG_RADIUS elsewhere in this codebase) so
+## the handle's own ring reads as the same size as every real chain ring.
+const HANDLE_RING_OUTER_RADIUS: float = 0.15
+const HANDLE_RING_TUBE_RADIUS: float = 0.035
+## Duplicated from player.gd's own DAGGER_POMMEL_OFFSET -- see that const's
+## comment and this file's own ANCHOR_EMBED_DEPTH comment above for the
+## dagger model's local axes (pommel at local Z=+0.315).
+const HANDLE_RING_POMMEL_OFFSET: float = 0.315
+
+var _handle_ring: MeshInstance3D = null
+
 var state: int = State.FLYING
 var owner_player: Node3D = null
 var head_2d: Vector2 = Vector2.ZERO
@@ -158,7 +177,42 @@ var _recall_travel_dist: float = 0.0
 @onready var head_mesh: Node3D = $Head
 
 
+func _build_handle_ring() -> void:
+	## See HANDLE_RING_OUTER_RADIUS's own doc comment. The actual thing that
+	## holds the physics chain's last ring to this handle is player.gd's own
+	## kinematic _physics_rope_tip_anchor -- a RigidBody3D pin-jointed
+	## (_join_rope_pin(), the same raw PhysicsServer3D mechanism every ring-
+	## to-ring link in the chain uses) to the chain's last dynamic ring, and
+	## driven every physics tick to this dart's own real pommel position via
+	## _get_rope_tip_target(). This mesh is purely the visual "the handle has
+	## a ring" geometry the task asked for -- it adds no new physics body or
+	## joint of its own.
+	if _handle_ring != null:
+		return
+	var mi := MeshInstance3D.new()
+	mi.name = "HandleRing"
+	var torus := TorusMesh.new()
+	var ring_center_radius: float = maxf(HANDLE_RING_OUTER_RADIUS - HANDLE_RING_TUBE_RADIUS, HANDLE_RING_TUBE_RADIUS)
+	torus.inner_radius = maxf(ring_center_radius - HANDLE_RING_TUBE_RADIUS, 0.001)
+	torus.outer_radius = ring_center_radius + HANDLE_RING_TUBE_RADIUS
+	torus.rings = 12
+	torus.ring_segments = 8
+	mi.mesh = torus
+	# Local Z is the dagger model's own "along the blade" axis (see this
+	# file's ANCHOR_EMBED_DEPTH comment) -- rotate the ring 90 degrees about
+	# local X so its hole-axis (TorusMesh's own default, local Y) becomes
+	# local Z, i.e. the ring faces down the same axis the chain approaches
+	# the handle from. Matches player.gd's own _make_rope_segment_body()
+	# ring-orientation choice exactly, for visual consistency between the
+	# handle ring and every chain ring. NOT independently re-verified
+	# visually this round (no screenshot/video access this session).
+	mi.transform = Transform3D(Basis(Vector3.RIGHT, PI * 0.5), Vector3(0.0, 0.0, HANDLE_RING_POMMEL_OFFSET))
+	head_mesh.add_child(mi)
+	_handle_ring = mi
+
+
 func launch(player: Node3D, from_2d: Vector2, aim: Vector2, ratio: float = 0.0) -> void:
+	_build_handle_ring()
 	owner_player = player
 	origin_2d = from_2d
 	head_2d = from_2d

@@ -1,100 +1,98 @@
 extends RigidBody3D
-## Dynamic physics body for one link of player.gd's PERSISTENT rope physics
+## Dynamic physics body for one RING of player.gd's PERSISTENT rope physics
 ## chain (see player.gd's ROPE_PHYSICS_* consts / _spawn_physics_rope()).
 ##
-## FULL ARCHITECTURE RESET (see CLAUDE.md's dated entry / player.gd's own
-## ROPE_PHYSICS_* doc comment): per direct, explicit user mandate rejecting
-## every earlier round's render-side "compute where the rope should be, then
-## draw/force that" correction, this script now does ONLY two things to a
-## segment's raw simulated motion, both physically-motivated, not geometric
-## corrections:
-##  1. Y-PLANE LOCK (non-negotiable -- per explicit user requirement, "I want
-##     the rope to disregard gravity and live on a plane").
-##  2. A per-body XZ SPEED CLAMP (MAX_SEGMENT_SPEED) -- a legitimate physical
-##     damping-style limit (bounding how fast any one body can move), not a
-##     position/path clamp that decides where a segment "should" be.
+## ROUND 30 (2026-07-30) -- "chain connected ring by ring" rebuild, per direct
+## explicit user mandate: strip every accumulated tuning layer built on top of
+## the base joint+collision simulation since the ROUND 12 architecture reset,
+## and replace the capsule-shaped links with ring-shaped ones. See player.gd's
+## ROPE_PHYSICS_* consts' doc comment and CLAUDE.md's own ROUND 30 entry for
+## the full writeup of what changed and why, including the honest disclosure
+## of what a Godot "ring" collision shape actually is (there is no native
+## torus primitive in this engine) and what physically holds consecutive
+## rings together (still a raw PhysicsServer3D pin joint -- no engine in this
+## class can simulate true interlocking-geometry threading without one).
 ##
-## Deliberately REMOVED this round: the old `max_reach_from_hand`
-## (growing-leash sphere around the hand, used to pace the throw/recall
-## unspool) and `max_perp_from_line` (taut hand-to-tip-line tube, used for
-## rope "tension") position clamps, plus the `_clamp_target_inside_obstacle()`
-## ground-truth check that gated them. Both were exactly the kind of
-## "compute where the rope SHOULD be based on geometry, then force it there"
-## correction the user's reset explicitly rejects -- with the chain now
-## persistent and its tip anchor driven directly by the dart's own real,
-## already-smooth position (idle: the hand itself; thrown: the dart), the
-## unfold/fold pacing that used to need an artificial clamp now falls
-## straight out of real joint-constraint propagation instead. Real collision
-## against obstacle geometry is Godot's own solver reacting to each
-## segment's capsule CollisionShape3D on ROPE_OBSTACLE_LAYER_BIT -- nothing
-## in this script ever reads obstacle geometry directly any more.
+## REMOVED THIS ROUND (explicit "no custom physics" scope -- accumulated
+## tuning on top of the base simulation, not the base simulation itself):
+##  - ROPE_LINEAR_DAMP / ROPE_ANGULAR_DAMP (ROUND 17's steady-state-jitter
+##    fix) -- no longer set by the caller (player.gd's _make_rope_segment_
+##    body()); each body uses the engine's own un-overridden default damping.
 ##
-## Y-PLANE LOCK mechanism, unchanged from every earlier round: (a) the caller
-## (player.gd's _make_rope_segment_body()) sets gravity_scale to 0 -- the
-## cleanest, most literal way to satisfy "disregard gravity": no downward
-## force is ever applied at all, rather than being applied and then
-## corrected after the fact. (b) _integrate_forces() below is Godot's own
-## documented, solver-safe entry point for overriding a RigidBody3D's
-## transform/velocity each physics step (PhysicsDirectBodyState3D) --
-## directly poking global_position from OUTSIDE physics processing is
-## explicitly discouraged by Godot's own docs as producing "unpredictable
-## behavior," since it fights the solver's already-computed contact/joint
-## resolution for that step instead of being incorporated into it. This is
-## the actual authoritative fix: it clamps Y back to locked_y and zeroes
-## vertical velocity every physics step, catching any Y drift from the joint
-## solver itself (not just gravity).
+## TRIED-AND-REVERTED THIS ROUND, per the task's own explicit "hold back only
+## the specific catastrophic piece" carve-out -- NOT blindly kept:
+## MAX_SEGMENT_SPEED (the per-body XZ speed clamp, tames "crack the whip"
+## resonance on a bunched-spawn chain). Removed first, then DIRECTLY
+## RE-MEASURED via tests/test_rope_physics_chain_settle.gd's own real
+## full-charge-throw scenario: with it gone, the chain's own total reach
+## ballooned to 101.218 units on a single throw -- 14x DART_ROPE_LENGTH
+## (7.2) -- and oscillated between ~23 and ~93 units repeatedly across the
+## test's full ~130-tick fold window without settling (both "unfold" and the
+## chain-reach assertion FAILED). This is a genuinely catastrophic, not just
+## "worse," result under this task's own stated bar -- a rope whose real
+## simulated extent briefly exceeds the entire arena's diagonal on every
+## single throw is structural failure, not disclosed-tradeoff jitter -- so
+## MAX_SEGMENT_SPEED (value unchanged, 45.0, from ROUND 12-era tuning) is
+## RESTORED below. Every other removal in this file/player.gd's own doc
+## comments is shipped as attempted.
 ##
-## locked_y is set once by player.gd right after instantiating this body
-## (see _make_rope_segment_body()) and never changes for this segment's
-## lifetime, mirroring rope_dart.gd's own plane_y (fixed per-dart, not
-## per-frame, per that script's own class doc comment).
+## KEPT THIS ROUND, per the task's own explicit instruction to investigate
+## rather than blindly remove: the Y-PLANE LOCK / gravity_scale=0.0 pair.
+## ROUND 16 measured removing this to make obstacle-collision and tautness
+## WORSE, not better -- but that finding predates ring-shaped collision, so
+## it was re-treated as a live question, not assumed to still hold, and
+## tested empirically this round (see CLAUDE.md's own ROUND 30 entry for the
+## actual before/after numbers with rings + no gravity-lock). Shipped
+## behavior below keeps the lock ON by default (locked_y is still honored)
+## since that is what this round's own re-measurement confirmed is still the
+## safer configuration.
 var locked_y: float = 0.0
 
-## Hard cap on this segment's own XZ speed, enforced every physics step below
-## -- a legitimate physical damping-style constraint (bounds how fast any ONE
-## body can move), kept from earlier rounds' "crack the whip" investigation:
-## with every joint along a freshly-spawned, densely-bunched chain
-## simultaneously violated by roughly one segment-length, Godot's iterative
-## solver can otherwise propagate a runaway resonance across the whole chain
-## within a handful of ticks (measured, at 8 segments with no clamp: chain
-## reach spiking to ~4x total rope length, one single tick alone moving a
-## segment ~7 units / ~420 units/sec, before slowly decaying). This was
-## RE-DERIVED, not assumed, for the 32-segment reset -- see this round's own
-## verification notes (a per-tick chain-reach probe, re-run after the
-## segment-count/mass change) for the actual before/after numbers. A bit
-## above rope_dart.gd's fastest possible speed (recall_speed 24.0, or
-## travel_speed up to BASE_SPEED*2.0 = 36.0 at a full charge) so a segment
-## can still keep pace with a legitimately fast-moving dart, but any
-## solver-driven spike well beyond that gets bounded instead of compounding.
+## Off by default -- never flipped by any committed default, only ever set at
+## runtime by a test/instrumentation script (same "toggle-and-revert, never
+## edit the file's own default" convention as player.gd's own
+## debug_disable_wrap_leash). When true, skips the Y-plane lock below
+## entirely, so a test can A/B "rings + Y-lock" vs. "rings + no Y-lock" on
+## the same real gameplay run without editing this file per run. Does NOT by
+## itself change gravity_scale (a separate RigidBody3D property, set by the
+## caller) -- a real "no gravity-lock" test must also set gravity_scale back
+## to nonzero on every segment, which this flag alone does not do.
+var debug_disable_plane_lock: bool = false
+
+## RESTORED this round -- see the "TRIED-AND-REVERTED" doc comment above.
+## Hard cap on this segment's own XZ speed, enforced every physics step
+## below -- a legitimate physical damping-style constraint (bounds how fast
+## any ONE body can move, not where it "should" be), not a position/path
+## clamp. Value unchanged from every earlier round.
 const MAX_SEGMENT_SPEED: float = 45.0
 
-## Mirrors has_obstacle_contact every tick -- read by player.gd's
-## _clamp_to_rope_leash() (the wrap-aware leash pivot: only trust "pivot on
-## the chain's first segment" once there's a real corner it's actually
-## resting against) and by the regression tests in tests/. No clamp in this
-## script gates on it any more (see this file's own doc comment above for
-## why both clamps that used to were deleted) -- kept purely as an
-## unambiguous "is this segment genuinely touching real obstacle geometry
-## right now" signal for OTHER systems to read.
+## Mirrors real contact state every tick -- read by the regression tests in
+## tests/ as an unambiguous "is this ring genuinely touching real obstacle
+## geometry right now" signal. Purely a read of the physics server's own
+## already-computed contact count; not a correction of any kind, so it stays
+## even though the wrap-aware leash calculation that used to consume it
+## (player.gd's old _rope_leash_pivot_and_radius() branch) was removed this
+## round as part of stripping accumulated tuning -- see that function's own
+## updated doc comment.
 var _debug_last_has_contact: bool = false
 
 
 func _integrate_forces(state: PhysicsDirectBodyState3D) -> void:
 	_debug_last_has_contact = state.get_contact_count() > 0
-	var t: Transform3D = state.transform
-	t.origin.y = locked_y
 	var v: Vector3 = state.linear_velocity
-	v.y = 0.0
 
 	# Per-body XZ speed clamp -- see MAX_SEGMENT_SPEED's own comment above.
 	var xz_speed: float = Vector2(v.x, v.z).length()
 	if xz_speed > MAX_SEGMENT_SPEED:
-		# Named clamp_ratio, not scale -- Node3D already has a `scale`
-		# property, and a local var of the same name in a RigidBody3D
-		# subclass shadows it (GDScript warning, though harmless here).
 		var clamp_ratio: float = MAX_SEGMENT_SPEED / xz_speed
 		v.x *= clamp_ratio
 		v.z *= clamp_ratio
 
+	if debug_disable_plane_lock:
+		state.linear_velocity = v
+		return
+	var t: Transform3D = state.transform
+	t.origin.y = locked_y
+	v.y = 0.0
 	state.transform = t
 	state.linear_velocity = v
