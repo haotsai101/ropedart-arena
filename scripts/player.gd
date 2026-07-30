@@ -1924,10 +1924,25 @@ func _reset_rope_chain_to_hand() -> void:
 	## game_manager.gd's start_round() is the only caller of reset_for_round()
 	## in both local and online flow, so there is no third path).
 	##
-	## Without this, the chain's ROPE_PHYSICS_SEGMENTS dynamic segments (and,
-	## while idle, the dynamic tip body -- see _make_rope_tip_body()) are real,
-	## independent RigidBody3D physics bodies that stay exactly wherever they
-	## physically were at the moment of the teleport (built once in _ready(),
+	## POST-ROUND-22-REVERT NOTE (2026-07-30): this function was originally
+	## written against ROUND 22's free-drag-tip architecture
+	## (_make_rope_tip_body(), a tip anchor that unfreezes into a dynamic
+	## body while idle). ROUND 22 was reverted (never merged to main; real,
+	## measured multi-test regressions -- see that round's own CLAUDE.md
+	## entry) so this function has been adapted back to the standing
+	## architecture: _physics_rope_tip_anchor is ALWAYS a kinematic
+	## _make_rope_anchor_body(), driven every tick by
+	## _update_physics_rope_anchors() to _get_rope_tip_target() (the dart's
+	## live pommel position while thrown, the hand's own position while idle
+	## -- see that function's own doc comment). There is no freeze-state to
+	## manage here any more; resetting the tip anchor is exactly as simple as
+	## resetting the hand anchor, just to a different point. See the tip-anchor
+	## handling below (adapted from ROUND 24's original is_thrown/freeze
+	## branch, which no longer applies).
+	##
+	## Without this, the chain's ROPE_PHYSICS_SEGMENTS dynamic segments are
+	## real, independent RigidBody3D physics bodies that stay exactly wherever
+	## they physically were at the moment of the teleport (built once in _ready(),
 	## never rebuilt -- see _spawn_physics_rope()'s own doc comment, "the
 	## chain is persistent for the whole lifetime of a player node"). Only the
 	## chain's kinematic HAND anchor gets corrected every tick (see
@@ -2030,26 +2045,16 @@ func _reset_rope_chain_to_hand() -> void:
 		_reset_rope_body_state(seg, Transform3D(seg_basis, seg_center))
 
 	if _physics_rope_tip_anchor != null:
-		var is_thrown: bool = dart != null and is_instance_valid(dart)
-		if is_thrown:
-			# Only reachable if a future caller invokes this mid-throw --
-			# neither of today's two call sites can (reset_for_round() clears
-			# dart before calling this; _respawn() only ever fires after
-			# kill() already cleared dart, synchronously, well before the
-			# respawn timer). Leave the tip anchor's own kinematic tracking
-			# alone in that case -- _update_physics_rope_anchors() keeps
-			# driving it to the dart's own (unteleported) real position next
-			# tick as usual, same as it already does every other tick.
-			pass
-		else:
-			if _physics_rope_tip_anchor.freeze:
-				# Mirrors _update_physics_rope_anchors()'s own idle-transition
-				# unfreeze -- a teleport with no dart out should leave the tip
-				# in the same free-dragging dynamic state a normal idle tick
-				# would, not stuck kinematic.
-				_physics_rope_tip_anchor.freeze = false
-			var tip_center: Vector3 = hand_pos + span_dir * (float(ROPE_PHYSICS_SEGMENTS) * spacing)
-			_reset_rope_body_state(_physics_rope_tip_anchor, Transform3D(seg_basis, tip_center))
+		# Standing architecture (post-ROUND-22-revert): the tip anchor is
+		# ALWAYS kinematic, driven every tick by _update_physics_rope_anchors()
+		# to _get_rope_tip_target() regardless of thrown/idle state -- so
+		# resetting it here to that same tip_target (already computed above,
+		# identically to what _spawn_physics_rope() does for a brand new
+		# chain's own tip placement) is correct in both cases: while thrown it
+		# snaps to the dart's real (unteleported) position instead of lagging
+		# a tick behind; while idle it snaps to the hand, matching the bunch
+		# the dynamic segments above were just reset into.
+		_reset_rope_body_state(_physics_rope_tip_anchor, Transform3D(Basis.IDENTITY, tip_target))
 
 	_rebuild_rope_joints()
 
