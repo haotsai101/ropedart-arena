@@ -1804,9 +1804,9 @@ func _apply_rope_leash_velocity_clamp(delta: float) -> void:
 	## normalized -- which is unambiguous and correct in every configuration
 	## (taut, slack, wrapped, or a player who has already overshot past the
 	## anchor and kept moving in the same direction), since dart.head_2d is
-	## a single FIXED real point while ANCHORED, not something that can flip
-	## sides the way a chain-shape-derived point can. Wrap-awareness is
-	## carried entirely by the MAGNITUDE side (used_length/slack) above, not
+	## a single real point at whatever instant it's read, not something that
+	## can flip sides the way a chain-shape-derived point can. Wrap-awareness
+	## is carried entirely by the MAGNITUDE side (used_length/slack) above, not
 	## by this direction -- a real, disclosed simplification: a player moving
 	## purely TANGENTIALLY around a wrap corner (not increasing straight-line
 	## hand-to-anchor distance) won't have that specific tangential motion
@@ -1826,7 +1826,53 @@ func _apply_rope_leash_velocity_clamp(delta: float) -> void:
 	## decelerates to a dead stop exactly at the boundary, while pushing at
 	## an angle keeps sliding freely. Inward motion (slackening) is never
 	## touched at all.
-	if dart == null or not is_instance_valid(dart) or dart.state != DART_STATE_ANCHORED:
+	##
+	## ROUND 30 (2026-07-31) FIX -- no longer gated on dart.state ==
+	## DART_STATE_ANCHORED. Root-caused from a direct user report ("the
+	## segments are pulled apart when the max rope length is exceeded"):
+	## this clamp used to return immediately for FLYING and RECALLING,
+	## meaning the player had ZERO movement restriction while a dart was in
+	## flight or being reeled in -- but RopeChainPBD's two endpoints
+	## (hand/tip) are driven KINEMATICALLY every tick regardless of state,
+	## and a kinematic pair pinned farther apart than the chain's own total
+	## capacity (segment_count * segment_max_length == DART_ROPE_LENGTH) is a
+	## mathematically infeasible configuration for a one-sided <= distance
+	## constraint (see rope_chain_pbd.gd's own _satisfy_distance -- by the
+	## triangle inequality, if the two fixed endpoints are farther apart than
+	## the sum of every link's own max length, AT LEAST ONE link must exceed
+	## its max length; no amount of solver iteration can fix that, it's not a
+	## convergence problem). rope_dart.gd's own FLYING max-range check used to
+	## be measured from the dart's FIXED throw origin (origin_2d, itself just
+	## the owner's BODY position at throw-instant), not the player's own
+	## (moving) hand -- so a player who ran AWAY from their own just-thrown
+	## dart (DASH_SPEED=20 u/s, dart travel_speed up to 36 u/s -- either
+	## alone, let alone combined, closes DART_ROPE_LENGTH's 7.2-unit budget in
+	## well under a second) could push hand-to-dart distance past the chain's
+	## real capacity with nothing to stop it on EITHER side: this clamp only
+	## ever throttles the PLAYER's own contribution, and the dart's own
+	## independent, much-faster FLYING motion was never itself bounded
+	## relative to the hand at all -- so fixing only this ANCHORED-only gate
+	## was measured (via tests/test_rope_flee_during_flight.gd) to be
+	## insufficient by itself (max_hand_to_dart still reached 10.04 against a
+	## 7.2 capacity, max_link_gap_violation 0.21). The actual close is in
+	## rope_dart.gd's own FLYING branch (see its own ROUND 30 doc comment),
+	## which now anchors the instant real hand-to-head distance reaches
+	## ROPE_LENGTH, measured from the owner's CURRENT hand every tick -- this
+	## clamp here remains necessary too, both for the ANCHORED case (unchanged
+	## from before) and to stop the player once the dart anchors mid-flight
+	## from this same fix. Together these close the gap from both sides: the
+	## dart can't be driven farther from the hand than capacity, and the
+	## player can't walk farther from a now-fixed anchor than capacity. This
+	## also directly matches this mechanism's own ROUND 12 origin, quoted
+	## verbatim in CLAUDE.md: "REGARDLESS OF ANCHORED OR NOT, the rope bar
+	## should be attached to the next rope bar and never separate" -- the
+	## ANCHORED-only gate was never the intended scope, just an
+	## implementation gap. dart.head_2d is read live every tick regardless of
+	## state (FLYING: the dart's own current flight position; RECALLING: its
+	## current retraction-sample position; ANCHORED: unchanged from before),
+	## so the same slack/pull-direction math applies unmodified in every
+	## state -- nothing else in this function changed.
+	if dart == null or not is_instance_valid(dart):
 		return
 	if _rope_chain == null or _rope_chain.points.size() < 2:
 		return

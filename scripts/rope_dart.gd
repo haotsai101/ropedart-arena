@@ -244,15 +244,49 @@ func _physics_process(delta: float) -> void:
 				# see ANCHOR_EMBED_DEPTH's comment.
 				head_2d = (hit_point_2d as Vector2) + dir_2d * ANCHOR_EMBED_DEPTH
 				_anchor()
-			elif head_2d.distance_to(origin_2d) >= ROPE_LENGTH:
-				# Per explicit user direction (reversing an earlier design
-				# decision that auto-recalled here instead): reaching max
-				# range without hitting anything now ANCHORS the dart in
-				# open air at that point, same as an obstacle/player hit --
-				# it stays stuck there until the owner recalls it or walks
-				# over it (pickup_radius), rather than auto-yanking back.
-				head_2d = origin_2d + dir_2d * ROPE_LENGTH
-				_anchor()
+			else:
+				# ROUND 30 (2026-07-31) FIX -- max range is now measured from
+				# the owner's CURRENT hand position every tick, not the fixed
+				# throw origin (origin_2d, itself just the owner's BODY
+				# position at throw-instant, not even the hand). Root cause of
+				# a direct user report ("the segments are pulled apart when
+				# the max rope length is exceeded"): DART_ROPE_LENGTH/
+				# ROPE_LENGTH represents the PBD chain's real total physical
+				# capacity measured hand-to-tip (see player.gd's
+				# RopeChainPBD/DART_ROPE_LENGTH doc comments) -- but this
+				# check used to cap the dart's flight relative to a point
+				# that never moves again after launch(), while the chain's
+				# own kinematic hand endpoint tracks the owner's REAL,
+				# continuously-moving hand every tick. A player fleeing (or
+				# just running) while the dart is still FLYING could push
+				# real hand-to-dart distance well past ROPE_LENGTH before this
+				# stale origin-based check ever caught it -- a mathematically
+				# infeasible configuration for the chain's one-sided distance
+				# constraint (see rope_chain_pbd.gd), which shows up as
+				# segments visibly stretched past their own max length, not a
+				# convergence-order rounding residual. Measured directly via
+				# tests/test_rope_flee_during_flight.gd: a full-charge throw
+				# (travel_speed=36) with the player fleeing at DASH_SPEED=20
+				# directly away reached max_hand_to_dart=10.04 (DART_ROPE_
+				# LENGTH=7.2, a 2.84-unit overshoot) and max_link_gap_
+				# violation=0.21 with only player.gd's leash clamp fixed to
+				# apply during FLYING (ROUND 30's other change, kept -- it's
+				# still needed for the ANCHORED case and for restricting the
+				# player once the dart stops) -- that clamp alone cannot
+				# fully solve this because it only ever throttles the
+				# PLAYER's own contribution to closing distance; the DART's
+				# own up-to-36-u/s flight is entirely independent of it and
+				# was never itself bounded relative to the hand. Anchoring
+				# the instant real hand-to-head distance reaches ROPE_LENGTH
+				# closes the gap at its actual source: the dart can now never
+				# be kinematically driven farther from the hand than the
+				# chain's own real capacity, in any state, regardless of how
+				# the owner moves during the throw.
+				var hand_world: Vector3 = owner_player.get_hand_world_position()
+				var hand_2d: Vector2 = Vector2(hand_world.x, hand_world.z)
+				if head_2d.distance_to(hand_2d) >= ROPE_LENGTH:
+					head_2d = hand_2d + (head_2d - hand_2d).normalized() * ROPE_LENGTH
+					_anchor()
 
 		State.ANCHORED:
 			# ROUND (walk-to-pickup retrieval fix, see CLAUDE.md): walking up to
