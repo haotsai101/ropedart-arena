@@ -108,7 +108,7 @@ const DART_STATE_ANCHORED: int = 1
 const DART_ROPE_LENGTH: float = 6.0 * GameManager.PLAYER_CAPSULE_HEIGHT
 
 ## Rope visual radius -- the physics segments' own capsule collision radius
-## AND the rendered tube mesh's radius (see _build_tube_mesh()) share this
+## AND the rendered chain-link mesh's tube radius (see _build_chain_link_mesh()) share this
 ## single constant. ROUND (full architecture reset, see CLAUDE.md): the old
 ## separate idle-coil visual (ROPE_SEGMENTS cheap kinematic MeshInstance3D
 ## cylinders, redrawn as a spiral while dart == null) is GONE -- per direct
@@ -226,16 +226,31 @@ const ROPE_ANCHOR_MAX_SPEED: float = 26.0
 ## real spawn-point-to-spawn-point distance on this arena.
 const ROPE_ANCHOR_SNAP_THRESHOLD: float = 2.0
 
-## --- Continuous tube-mesh rendering for the rope (visual only -- traces the
-## real physics chain's own control points with a plain Catmull-Rom curve,
-## no obstacle awareness or correction of any kind, see above) ---
-## Sample count along the curve -- deliberately higher than
-## ROPE_PHYSICS_SEGMENTS itself, since this is purely a rendering smoothness
-## knob with no physics cost (plain Vector3 math, not simulated).
-const ROPE_TUBE_CURVE_SAMPLES: int = 48
-## Radial cross-section resolution of the extruded tube -- 8-sided reads as
-## round at this game's camera distance without excessive triangle count.
+## --- Chain-of-rings mesh rendering for the rope (visual only -- traces the
+## real physics chain's own control points, see above). 2026-07-31: replaced
+## the old single smooth Catmull-Rom tube with a real chain of separate oval
+## ring links, one per PBD segment (control_points[i] -> control_points[i+1]),
+## per explicit user request ("update the rope bar to ring, make joints
+## visible for better testing") -- see _build_chain_link_mesh(). Smoothing a
+## spline through the real control points was exactly what HID each
+## segment's own true endpoint from view; a chain of rings makes every real
+## joint directly visible as the boundary between two links, with no
+## obstacle-awareness or correction of any kind added (same standing
+## constraint as the old tube renderer -- if a ring ever visibly clips a
+## pillar, the real PBD segment it traces is itself inside the obstacle,
+## a physics bug to fix in rope_chain_pbd.gd, not something to mask here).
+## Radial cross-section resolution of the tube extruded around each ring's
+## own oval outline -- 8-sided reads as round at this game's camera distance
+## without excessive triangle count.
 const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
+## Points per semicircular end-cap of each ring's stadium/racetrack outline
+## (two straight sides + two caps = 2*ROPE_CHAIN_CAP_SEGMENTS + 2 points per
+## ring). 6 reads as a smooth curve at this game's camera distance.
+const ROPE_CHAIN_CAP_SEGMENTS: int = 6
+## Short-axis width of each ring link -- a few multiples of ROPE_RADIUS
+## (the tube's own thickness), same proportion a real chain link's width
+## bears to its own wire gauge.
+const ROPE_CHAIN_LINK_WIDTH: float = 0.16
 
 
 @onready var aim_indicator: Node3D = $AimIndicator
@@ -267,7 +282,7 @@ var _dagger_in_hand: Node3D = null
 ## winding up a throw.
 var _static_dagger_mesh: Node3D = null
 ## Shared material for the physics-rope tube mesh -- stored here (rather than
-## only as a local in _setup_dagger_in_hand()) so _build_tube_mesh() can reuse
+## only as a local in _setup_dagger_in_hand()) so _build_chain_link_mesh() can reuse
 ## the exact same look without duplicating the material setup.
 var _rope_material: StandardMaterial3D = null
 ## The real PBD/Verlet rope chain (see scripts/rope_chain_pbd.gd and the
@@ -296,7 +311,7 @@ var _hand_anchor_smoothed_2d: Vector2 = Vector2.ZERO
 var _tip_anchor_smoothed_2d: Vector2 = Vector2.ZERO
 ## The single continuous tube MeshInstance3D that visually replaces the
 ## per-segment CylinderMesh/capsule rendering -- see this file's
-## ROPE_TUBE_CURVE_SAMPLES doc comment and _update_rope_tube_mesh(). Rebuilt
+## ROPE_TUBE_RADIAL_SEGMENTS doc comment and _update_rope_tube_mesh(). Rebuilt
 ## (not just repositioned) every _process() frame the physics chain is
 ## active, since the curve it traces changes shape continuously as the
 ## simulated points move.
@@ -717,7 +732,7 @@ func _setup_dagger_in_hand() -> void:
 	dagger_attachment.add_child(spin_rope)
 	_charge_spin_rope = spin_rope
 
-	# Rope tube material -- shared by _build_tube_mesh() every frame the
+	# Rope tube material -- shared by _build_chain_link_mesh() every frame the
 	# persistent physics chain's tube mesh is rebuilt (see
 	# _update_rope_tube_mesh()). Stored once here rather than duplicated per
 	# rebuild.
@@ -1573,22 +1588,22 @@ func _reset_rope_chain_to_hand() -> void:
 
 
 func _update_rope_tube_mesh() -> void:
-	## Rebuilds one continuous ArrayMesh every _process() frame, tracing a
-	## smooth Catmull-Rom curve through the REAL PBD chain's own control
-	## points [hand, every interior point, tip] (in that order -- matches
-	## RopeChainPBD.points exactly) and extruding a round tube of ROPE_RADIUS
-	## along it (see _build_tube_mesh()). The underlying chain and its real
-	## obstacle-collision correction are completely unchanged by this -- only
-	## what gets DRAWN from its positions changed, from N disjoint segments to
-	## one smooth surface. NO obstacle-awareness or correction happens in
-	## this function or in _compute_rope_tube_curve_points() below -- that all
-	## already happened inside RopeChainPBD.step() itself.
+	## Rebuilds one combined ArrayMesh every _process() frame: a real chain of
+	## oval ring links, one per REAL PBD segment (control_points[i] ->
+	## control_points[i+1], in RopeChainPBD.points order -- [hand, every
+	## interior point, tip]), via _build_chain_link_mesh() below. The
+	## underlying chain and its real obstacle-collision correction are
+	## completely unchanged by this -- only what gets DRAWN from its
+	## positions changed, from a smoothed spline to N distinct rings. NO
+	## obstacle-awareness or correction happens in this function or in
+	## _build_chain_link_mesh() -- that all already happened inside
+	## RopeChainPBD.step() itself.
 	if _rope_chain == null or _rope_chain.points.size() != ROPE_PHYSICS_SEGMENTS + 1:
 		return
 
 	if _physics_rope_tube_mesh == null:
 		var mi := MeshInstance3D.new()
-		mi.name = "RopeTubeMesh"
+		mi.name = "RopeChainLinksMesh"
 		# top_level = true: every control point below comes from a 2D chain
 		# point reconstructed into WORLD-space Vector3 -- a non-top_level
 		# MeshInstance3D would render that already-global vertex data through
@@ -1600,10 +1615,10 @@ func _update_rope_tube_mesh() -> void:
 		# parent at all, so the already-global vertices render correctly with
 		# no further transform needed.
 		mi.top_level = true
-		# Material is applied AFTER _build_tube_mesh() gives this mesh its
-		# first real surface (below) -- set_surface_override_material(0, ...)
-		# errors ("Index p_surface = 0 is out of bounds") on a MeshInstance3D
-		# whose mesh has zero surfaces yet.
+		# Material is applied AFTER _build_chain_link_mesh() gives this mesh
+		# its first real surface (below) -- set_surface_override_material(0,
+		# ...) errors ("Index p_surface = 0 is out of bounds") on a
+		# MeshInstance3D whose mesh has zero surfaces yet.
 		add_child(mi)
 		_physics_rope_tube_mesh = mi
 
@@ -1613,107 +1628,52 @@ func _update_rope_tube_mesh() -> void:
 		var p2: Vector2 = p
 		control_points.append(Vector3(p2.x, plane_y, p2.y))
 
-	var curve_points: Array[Vector3] = _compute_rope_tube_curve_points(control_points)
-	_build_tube_mesh(_physics_rope_tube_mesh, curve_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
+	_build_chain_link_mesh(_physics_rope_tube_mesh, control_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
 	_physics_rope_tube_mesh.visible = true
 
 
-func _compute_rope_tube_curve_points(control_points: Array[Vector3]) -> Array[Vector3]:
-	## Pure Catmull-Rom sampling through the REAL physics chain's own control
-	## points, at ROPE_TUBE_CURVE_SAMPLES steps -- Vector3.cubic_interpolate(b,
-	## pre_a, post_b, weight) needs a "before the start" and "after the end"
-	## handle for every interpolated span; clamping the index at both ends
-	## (rather than requiring 4 real neighbors) is what lets this work even at
-	## the very first/last span, and lets the whole curve work correctly with
-	## as few as 2 control points (a degenerate straight line -- possible
-	## right at throw-instant, when the tip anchor and every not-yet-separated
-	## segment can start nearly coincident).
-	##
-	## NO OBSTACLE AWARENESS, NO CORRECTION, NO FALLBACK PATH COMPUTATION OF
-	## ANY KIND -- this is the whole point of this round's full architecture
-	## reset (see this file's ROPE_PHYSICS_* consts' doc comment, and
-	## CLAUDE.md's dated entry for the full writeup of what used to live here:
-	## a visibility-graph + Dijkstra shortest path, and before that a series
-	## of case-by-case corner-selection heuristics, all now deleted). If this
-	## curve ever visibly clips a pillar, that means the REAL RigidBody3D
-	## segments it's sampled through are themselves inside the pillar's
-	## collision geometry -- a genuine physics/collision bug to fix at the
-	## segment/joint/collision level (see rope_segment_body.gd), not
-	## something to detect-and-reroute here.
-	var n: int = control_points.size()
-	var curve_points: Array[Vector3] = []
-	curve_points.resize(ROPE_TUBE_CURVE_SAMPLES + 1)
-	for i in range(ROPE_TUBE_CURVE_SAMPLES + 1):
-		var t: float = float(i) / float(ROPE_TUBE_CURVE_SAMPLES)
-		var f: float = t * float(n - 1)
-		var seg_i: int = clampi(int(f), 0, n - 2)
-		var local_t: float = f - float(seg_i)
-		var p0: Vector3 = control_points[clampi(seg_i - 1, 0, n - 1)]
-		var p1: Vector3 = control_points[seg_i]
-		var p2: Vector3 = control_points[clampi(seg_i + 1, 0, n - 1)]
-		var p3: Vector3 = control_points[clampi(seg_i + 2, 0, n - 1)]
-		curve_points[i] = p1.cubic_interpolate(p2, p0, p3, local_t)
-	return curve_points
-
-
-func _build_tube_mesh(mi: MeshInstance3D, curve_points: Array[Vector3], radius: float, radial_segments: int) -> void:
-	## Extrudes a round tube of constant `radius` along `curve_points` (a
-	## polyline, already densely sampled by the caller -- see
-	## _update_rope_tube_mesh()) via SurfaceTool, and assigns the result as
-	## `mi`'s mesh. Each ring's orientation is built from the local tangent
-	## (direction to the next point) with a stable perpendicular basis
-	## (same RIGHT/UP basis-seed trick used elsewhere in this file for
-	## building a basis from a single direction vector), so the tube doesn't
-	## twist unpredictably along its length.
+func _build_chain_link_mesh(mi: MeshInstance3D, control_points: Array[Vector3], tube_radius: float, radial_segments: int) -> void:
+	## Renders the rope as a real chain of oval ring links, one per REAL PBD
+	## segment (control_points[i] -> control_points[i+1]) -- 2026-07-31,
+	## replacing the old single smooth Catmull-Rom tube per explicit user
+	## request ("update the rope bar to ring, make joints visible for better
+	## testing"). Each segment's own true endpoints are what a spline used to
+	## blend away; here every real joint is directly visible as the shared
+	## boundary between two rings, and a segment that stretches past
+	## ROPE_PHYSICS_SEGMENT_LENGTH (a real PBD constraint violation -- see
+	## RopeChainPBD.max_link_gap_violation()) shows up on screen as a
+	## visibly larger ring than its neighbors, not just a number in a test
+	## log. Every link is baked into ONE ArrayMesh (one SurfaceTool, one
+	## commit) for a single draw call, not N separate MeshInstance3D nodes.
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 
-	var point_count: int = curve_points.size()
-	if point_count < 2:
+	var n: int = control_points.size()
+	var built_any: bool = false
+	for i in range(n - 1):
+		var p_a: Vector3 = control_points[i]
+		var p_b: Vector3 = control_points[i + 1]
+		var seg_vec: Vector3 = p_b - p_a
+		var link_length: float = seg_vec.length()
+		if link_length < 0.001:
+			continue
+		var tangent: Vector3 = seg_vec / link_length
+		# Alternate the ring's flatten axis every other link, the same way a
+		# real chain's own links alternate a 90-degree twist to interlock --
+		# purely cosmetic, carries no physics meaning of its own.
+		var basis_seed: Vector3 = Vector3.RIGHT if absf(tangent.dot(Vector3.UP)) > 0.99 else Vector3.UP
+		var perp_a: Vector3 = basis_seed.cross(tangent).normalized()
+		var perp_b: Vector3 = tangent.cross(perp_a).normalized()
+		var flatten_axis: Vector3 = perp_a if (i % 2 == 0) else perp_b
+		var ring_normal: Vector3 = tangent.cross(flatten_axis).normalized()
+		var mid: Vector3 = (p_a + p_b) * 0.5
+		var loop_points: Array[Vector3] = _stadium_loop_points(mid, tangent, flatten_axis, link_length, ROPE_CHAIN_LINK_WIDTH)
+		_append_closed_tube(st, loop_points, tube_radius, radial_segments, ring_normal)
+		built_any = true
+
+	if not built_any:
 		mi.mesh = null
 		return
-
-	var rings: Array[PackedVector3Array] = []
-	rings.resize(point_count)
-	for i in range(point_count):
-		var tangent: Vector3
-		if i == 0:
-			tangent = (curve_points[1] - curve_points[0])
-		elif i == point_count - 1:
-			tangent = (curve_points[i] - curve_points[i - 1])
-		else:
-			tangent = (curve_points[i + 1] - curve_points[i - 1])
-		if tangent.length() < 0.0001:
-			tangent = Vector3.FORWARD
-		tangent = tangent.normalized()
-		var basis_seed: Vector3 = Vector3.RIGHT if absf(tangent.dot(Vector3.UP)) > 0.99 else Vector3.UP
-		var right: Vector3 = basis_seed.cross(tangent).normalized()
-		var up: Vector3 = tangent.cross(right).normalized()
-		var ring := PackedVector3Array()
-		ring.resize(radial_segments)
-		for j in range(radial_segments):
-			var angle: float = TAU * float(j) / float(radial_segments)
-			ring[j] = curve_points[i] + (right * cos(angle) + up * sin(angle)) * radius
-		rings[i] = ring
-
-	for i in range(point_count - 1):
-		var ring_a: PackedVector3Array = rings[i]
-		var ring_b: PackedVector3Array = rings[i + 1]
-		for j in range(radial_segments):
-			var j_next: int = (j + 1) % radial_segments
-			var a0: Vector3 = ring_a[j]
-			var a1: Vector3 = ring_a[j_next]
-			var b0: Vector3 = ring_b[j]
-			var b1: Vector3 = ring_b[j_next]
-			# Two triangles per quad, wound so the outward-facing normal
-			# points away from the tube's own centerline (consistent with
-			# SurfaceTool.generate_normals()'s face-winding expectations).
-			st.add_vertex(a0)
-			st.add_vertex(b0)
-			st.add_vertex(a1)
-			st.add_vertex(a1)
-			st.add_vertex(b0)
-			st.add_vertex(b1)
 
 	st.generate_normals()
 	mi.mesh = st.commit()
@@ -1722,6 +1682,98 @@ func _build_tube_mesh(mi: MeshInstance3D, curve_points: Array[Vector3], radius: 
 	# call before this line's mi.mesh assignment would still be.
 	if _rope_material != null:
 		mi.set_surface_override_material(0, _rope_material)
+
+
+func _stadium_loop_points(center: Vector3, tangent: Vector3, flatten_axis: Vector3, link_length: float, link_width: float) -> Array[Vector3]:
+	## A closed "stadium" (racetrack) outline -- two straight sides plus two
+	## semicircular end caps -- lying entirely in the plane spanned by
+	## `tangent` (its long axis, oriented along the real segment direction)
+	## and `flatten_axis` (its short axis), centered at `center`. This is
+	## the classic flattened-oval shape of a real chain link. Floors the
+	## straight-side length at a small positive minimum so a near-collapsed
+	## segment (consecutive PBD points nearly coincident, e.g. deep in the
+	## idle coil near the hand) still degenerates gracefully to a small
+	## round-ish ring instead of an inverted/degenerate outline.
+	var cap_radius: float = link_width * 0.5
+	var half_straight: float = maxf(link_length * 0.5 - cap_radius, 0.01)
+	var pts: Array[Vector3] = []
+
+	# Straight side at v = -cap_radius, u: -half_straight -> +half_straight.
+	pts.append(center + tangent * (-half_straight) + flatten_axis * (-cap_radius))
+	pts.append(center + tangent * half_straight + flatten_axis * (-cap_radius))
+
+	# Right end cap: semicircle centered at u=+half_straight, sweeping
+	# angle -90deg -> +90deg (toward +u), excluding both endpoints since
+	# they're already the straight sides' own shared corners.
+	for k in range(1, ROPE_CHAIN_CAP_SEGMENTS):
+		var t: float = float(k) / float(ROPE_CHAIN_CAP_SEGMENTS)
+		var angle: float = -PI * 0.5 + t * PI
+		var u: float = half_straight + cos(angle) * cap_radius
+		var v: float = sin(angle) * cap_radius
+		pts.append(center + tangent * u + flatten_axis * v)
+
+	# Straight side at v = +cap_radius, u: +half_straight -> -half_straight.
+	pts.append(center + tangent * half_straight + flatten_axis * cap_radius)
+	pts.append(center + tangent * (-half_straight) + flatten_axis * cap_radius)
+
+	# Left end cap: semicircle centered at u=-half_straight, sweeping
+	# angle +90deg -> +270deg (toward -u).
+	for k in range(1, ROPE_CHAIN_CAP_SEGMENTS):
+		var t: float = float(k) / float(ROPE_CHAIN_CAP_SEGMENTS)
+		var angle: float = PI * 0.5 + t * PI
+		var u: float = -half_straight + cos(angle) * cap_radius
+		var v: float = sin(angle) * cap_radius
+		pts.append(center + tangent * u + flatten_axis * v)
+
+	return pts
+
+
+func _append_closed_tube(st: SurfaceTool, loop_points: Array[Vector3], radius: float, radial_segments: int, loop_normal: Vector3) -> void:
+	## Extrudes a round tube of constant `radius` around a CLOSED loop (the
+	## last point connects back to the first) into the given, already-begun
+	## SurfaceTool -- lets _build_chain_link_mesh() bake every ring into one
+	## shared mesh instead of committing N separate ones. `loop_normal` is
+	## the fixed axis perpendicular to the whole loop's own plane (see
+	## _stadium_loop_points()) -- since every point on the loop's own path
+	## tangent is, by construction, always perpendicular to loop_normal,
+	## there's no degenerate parallel-tangent case to guard against here,
+	## unlike a tube built along an arbitrary 3D curve.
+	var point_count: int = loop_points.size()
+	if point_count < 3:
+		return
+
+	var rings: Array[PackedVector3Array] = []
+	rings.resize(point_count)
+	for i in range(point_count):
+		var prev_pt: Vector3 = loop_points[(i - 1 + point_count) % point_count]
+		var next_pt: Vector3 = loop_points[(i + 1) % point_count]
+		var path_tangent: Vector3 = (next_pt - prev_pt).normalized()
+		var cross_axis: Vector3 = loop_normal.cross(path_tangent).normalized()
+		var ring := PackedVector3Array()
+		ring.resize(radial_segments)
+		for j in range(radial_segments):
+			var angle: float = TAU * float(j) / float(radial_segments)
+			ring[j] = loop_points[i] + (cross_axis * cos(angle) + loop_normal * sin(angle)) * radius
+		rings[i] = ring
+
+	for i in range(point_count):
+		var ring_a: PackedVector3Array = rings[i]
+		var ring_b: PackedVector3Array = rings[(i + 1) % point_count]
+		for j in range(radial_segments):
+			var j_next: int = (j + 1) % radial_segments
+			var a0: Vector3 = ring_a[j]
+			var a1: Vector3 = ring_a[j_next]
+			var b0: Vector3 = ring_b[j]
+			var b1: Vector3 = ring_b[j_next]
+			# Two triangles per quad, wound so the outward-facing normal
+			# points away from the ring's own centerline (consistent with
+			# SurfaceTool.generate_normals()'s face-winding expectations).
+			st.add_vertex(a0)
+			st.add_vertex(b0)
+			st.add_vertex(a1)
+			st.add_vertex(a1)
+			st.add_vertex(b0)
+			st.add_vertex(b1)
 
 
 func _perform_slash() -> void:
