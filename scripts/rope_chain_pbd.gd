@@ -236,6 +236,7 @@ const CONVERGENCE_EPS: float = 0.00005
 ## own soak was able to construct, and should be reported as such.
 func step(delta: float, hand_target: Vector2, tip_target: Vector2, obstacle_rects: Array,
 		obstacle_radius: float, max_point_speed: float, solver_iterations: int) -> void:
+	var _step_start_usec: int = Time.get_ticks_usec()
 	var n: int = points.size()
 	if n < 2:
 		return
@@ -291,21 +292,82 @@ func step(delta: float, hand_target: Vector2, tip_target: Vector2, obstacle_rect
 			collision_correction += _resolve_collisions(i, obstacle_rects, obstacle_radius)
 		if collision_correction < CONVERGENCE_EPS and max_link_gap_violation() < CONVERGENCE_EPS:
 			return
+		# WALL-CLOCK TIME BUDGET (2026-07-31, real user report: "once the dart
+		# is thrown, the game soon become super laggy"). Direct real-GPU
+		# per-tick profiling (Time.get_ticks_usec() around this whole
+		# function, driving a single real player through real throw/recall
+		# cycling near a real pillar via mcp__godot__run_project -- not
+		# headless) caught this outer loop genuinely hitting the full
+		# MAX_OUTER_ROUNDS=40 cap, DOZENS of consecutive real physics ticks
+		# in a row (over 5 real seconds), each one costing ~230-241ms --
+		# Engine.get_frames_per_second() crashed to 1.0 during this window.
+		# This is exactly the "genuine bounded oscillation/limit-cycle...
+		# dense multi-obstacle configurations" case this file's own class
+		# doc comment already disclosed as a CORRECTNESS residual (~0.05-0.16
+		# units) -- but nobody had previously measured its PERFORMANCE cost:
+		# hitting the round cap means paying the full worst-case cost of
+		# EVERY one of those 40 rounds, EVERY single tick, for as long as the
+		# oscillation persists, which empirically can be dozens of ticks.
+		# Raising MAX_OUTER_ROUNDS was already tried and rejected once before
+		# (40 -> 150, "measurably SLOWER without shrinking the residual" --
+		# see this file's own class doc comment) -- i.e. more rounds don't
+		# fix the oscillation, they just pay for more of it. The fix here is
+		# the direct complement: bound the WALL-CLOCK cost of chasing a
+		# non-converging tick, rather than an iteration count -- self-
+		# adapting to real per-round cost on the actual hardware instead of
+		# guessing the "right" round number, and leaving the fast, common,
+		# early-exits-in-1-3-rounds case (see above) completely untouched.
+		# ROPE_STEP_TIME_BUDGET_USEC (20ms) is set comfortably above the
+		# worst LEGITIMATE multi-round transient measured this same session
+		# (a real full-charge throw's initial unfold near an obstacle, 3
+		# outer rounds, ~15.7ms total) so ordinary throw/recall transients
+		# are unaffected, while capping the pathological case's total step()
+		# cost to roughly budget + one final bounded distance pass (below)
+		# instead of the full 40-round worst case -- an order-of-magnitude-
+		# plus reduction, not a marginal tuning gain.
+		if Time.get_ticks_usec() - _step_start_usec > ROPE_STEP_TIME_BUDGET_USEC:
+			break
 	# Final distance pass so the tick always ends distance-exact even if the
-	# outer cap was reached before collision fully stabilized (a real,
-	# structural edge case -- see step()'s own doc comment) -- distance
-	# rigidity (requirement 1) is the non-negotiable guarantee; any residual
-	# collision correction still needed gets picked up next tick's own outer
-	# loop instead.
+	# outer cap (or the time budget above) was reached before collision fully
+	# stabilized (a real, structural edge case -- see step()'s own doc
+	# comment) -- distance rigidity (requirement 1) is the non-negotiable
+	# guarantee; any residual collision correction still needed gets picked
+	# up next tick's own outer loop instead.
 	_converge_distance(solver_iterations)
 
 
 ## How many (distance-converge, collision-correct) outer rounds step() will
 ## run before giving up on fully reconciling both constraints in the same
-## tick -- see step()'s own doc comment. Cheap to raise (each round only
-## costs real work while something is still actually being corrected, same
-## early-exit principle as _converge_distance()'s own iteration cap).
+## tick -- see step()'s own doc comment. NOT actually cheap to raise, despite
+## this constant's own early-exit design: a 2026-07-31 real-GPU profiling
+## session found a genuine (rare, organic) case where the outer loop never
+## converges and instead runs the full MAX_OUTER_ROUNDS every tick for dozens
+## of consecutive ticks, each one paying the full cost of every round -- see
+## ROPE_STEP_TIME_BUDGET_USEC below, the actual fix for that specific
+## failure mode. This constant is kept as a hard structural upper bound
+## (belt-and-suspenders against an infinite loop) but the time budget is what
+## actually protects real per-tick wall-clock cost now.
 const MAX_OUTER_ROUNDS: int = 40
+
+## Real-time (not iteration-count) ceiling on how long step()'s outer
+## reconciliation loop is allowed to keep retrying a non-converging tick --
+## see the time-budget check inside the outer loop above for the full
+## root-cause writeup. Set comfortably above the worst LEGITIMATE multi-round
+## transient directly measured this same session (~15.7ms, a real full-
+## charge throw's initial unfold near an obstacle) so ordinary gameplay is
+## unaffected, while bounding the pathological non-converging case to a
+## small, predictable multiple of this value instead of the previous
+## unbounded-by-wall-clock 40-round worst case (measured at 230-241ms/tick,
+## sustained for 20+ consecutive real ticks -- Engine.get_frames_per_second()
+## crashed to 1.0 during that window). Deliberately a WALL-CLOCK budget, not
+## a smaller round-count constant: this file's own class doc comment already
+## disclosed that RAISING the round count (40 -> 150) was tried once and
+## measured to make ticks slower without improving the residual (a genuine
+## bounded oscillation, not a "needs more sweeps" case) -- the direct
+## complement (a real-time ceiling) caps the cost of chasing that same
+## oscillation without needing to guess the "right" round count, and self-
+## adapts to whatever a single round actually costs on the real hardware.
+const ROPE_STEP_TIME_BUDGET_USEC: int = 20000
 
 
 ## Runs up to max_iterations alternating-direction distance-constraint

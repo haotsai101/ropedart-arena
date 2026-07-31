@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://dtimebudget001pbd"]
+
+[ext_resource type="Script" path="res://tests/test_rope_pbd_step_time_budget.gd" id="1_timebudget001"]
+
+[node name="TestRopePbdStepTimeBudget" type="Node"]
+script = ExtResource("1_timebudget001")
