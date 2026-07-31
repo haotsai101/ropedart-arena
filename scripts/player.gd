@@ -240,17 +240,45 @@ const ROPE_ANCHOR_SNAP_THRESHOLD: float = 2.0
 ## pillar, the real PBD segment it traces is itself inside the obstacle,
 ## a physics bug to fix in rope_chain_pbd.gd, not something to mask here).
 ## Radial cross-section resolution of the tube extruded around each ring's
-## own oval outline -- 8-sided reads as round at this game's camera distance
-## without excessive triangle count.
-const ROPE_TUBE_RADIAL_SEGMENTS: int = 8
+## own oval outline. LOWERED 8 -> 6 on 2026-07-31 (see
+## _build_chain_link_mesh()'s own PERFORMANCE doc comment): this and
+## ROPE_CHAIN_CAP_SEGMENTS below directly, multiplicatively control the
+## total inner-loop iteration count of the per-frame mesh rebuild (O(links *
+## loop_points * radial_segments)) -- a real, measured contributor to a
+## reported "super laggy once a dart is thrown" bug, on top of the
+## per-frame rebuild THROTTLING described at ROPE_MESH_REBUILD_INTERVAL
+## below. 6-sided still reads as round at this game's small on-screen rope
+## radius / camera distance.
+const ROPE_TUBE_RADIAL_SEGMENTS: int = 6
 ## Points per semicircular end-cap of each ring's stadium/racetrack outline
 ## (two straight sides + two caps = 2*ROPE_CHAIN_CAP_SEGMENTS + 2 points per
-## ring). 6 reads as a smooth curve at this game's camera distance.
-const ROPE_CHAIN_CAP_SEGMENTS: int = 6
+## ring). LOWERED 6 -> 3 on 2026-07-31, same performance investigation as
+## ROPE_TUBE_RADIAL_SEGMENTS above -- 3 (8 points/ring total) still reads as
+## a smooth-enough oval at this game's camera distance for something this
+## small and thin.
+const ROPE_CHAIN_CAP_SEGMENTS: int = 3
 ## Short-axis width of each ring link -- a few multiples of ROPE_RADIUS
 ## (the tube's own thickness), same proportion a real chain link's width
 ## bears to its own wire gauge.
 const ROPE_CHAIN_LINK_WIDTH: float = 0.16
+## Rebuild the render mesh every Nth _process() frame instead of every
+## single one -- added 2026-07-31 alongside the ROPE_TUBE_RADIAL_SEGMENTS/
+## ROPE_CHAIN_CAP_SEGMENTS reduction above, per the same lag investigation
+## (real per-call timing showed ~1.1-1.5ms per player per call even after
+## the density and allocation fixes -- with several players/bots each
+## paying this every render frame, that alone can meaningfully eat into a
+## 16.6ms/60fps budget). RopeChainPBD.step() -- the actual physics/PBD
+## simulation, which is what every existing gameplay guarantee (leash
+## bound, link-gap tolerance, obstacle collision) depends on -- is
+## completely UNAFFECTED: it still runs every _physics_process() tick at
+## full 60Hz, unconditionally, unchanged (see _update_physics_rope_anchors()
+## in _physics_process()). This constant only throttles how often the
+## VISUAL mesh is rebuilt from that already-correct, already-up-to-date
+## simulated state -- a one-render-frame-stale rope shape is not visually
+## distinguishable from an always-current one at typical display refresh
+## rates, the same "update the expensive procedural visual less often than
+## the simulation it traces" technique used broadly in real-time games.
+const ROPE_MESH_REBUILD_INTERVAL: int = 2
 
 
 @onready var aim_indicator: Node3D = $AimIndicator
@@ -312,10 +340,15 @@ var _tip_anchor_smoothed_2d: Vector2 = Vector2.ZERO
 ## The single continuous tube MeshInstance3D that visually replaces the
 ## per-segment CylinderMesh/capsule rendering -- see this file's
 ## ROPE_TUBE_RADIAL_SEGMENTS doc comment and _update_rope_tube_mesh(). Rebuilt
-## (not just repositioned) every _process() frame the physics chain is
-## active, since the curve it traces changes shape continuously as the
-## simulated points move.
+## (not just repositioned) roughly every ROPE_MESH_REBUILD_INTERVAL
+## _process() frames the physics chain is active, since the curve it traces
+## changes shape continuously as the simulated points move.
 var _physics_rope_tube_mesh: MeshInstance3D = null
+## Counts _process() frames for the ROPE_MESH_REBUILD_INTERVAL throttle
+## below -- purely a render-side counter, never read by anything
+## physics-related; RopeChainPBD.step() itself still runs every single
+## _physics_process() tick at full rate regardless of this.
+var _rope_mesh_frame_counter: int = 0
 ## Dart head that orbits the hand on a taut rope while charging, depicting
 ## winding up the throw -- see _update_charge_spin().
 var _charge_spin_dart: Node3D = null
@@ -1621,6 +1654,18 @@ func _update_rope_tube_mesh() -> void:
 		# MeshInstance3D whose mesh has zero surfaces yet.
 		add_child(mi)
 		_physics_rope_tube_mesh = mi
+		_rope_mesh_frame_counter = 0
+
+	_physics_rope_tube_mesh.visible = true
+
+	# See ROPE_MESH_REBUILD_INTERVAL's own doc comment -- only the RENDER
+	# rebuild is throttled; RopeChainPBD.step() itself keeps running every
+	# _physics_process() tick regardless, so the underlying simulation this
+	# mesh traces is never stale, only the drawn mesh can lag by up to
+	# ROPE_MESH_REBUILD_INTERVAL-1 render frames.
+	_rope_mesh_frame_counter += 1
+	if _rope_mesh_frame_counter % ROPE_MESH_REBUILD_INTERVAL != 0:
+		return
 
 	var plane_y: float = _get_rope_plane_y()
 	var control_points: Array[Vector3] = []
@@ -1629,7 +1674,6 @@ func _update_rope_tube_mesh() -> void:
 		control_points.append(Vector3(p2.x, plane_y, p2.y))
 
 	_build_chain_link_mesh(_physics_rope_tube_mesh, control_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
-	_physics_rope_tube_mesh.visible = true
 
 
 func _build_chain_link_mesh(mi: MeshInstance3D, control_points: Array[Vector3], tube_radius: float, radial_segments: int) -> void:
@@ -1643,13 +1687,42 @@ func _build_chain_link_mesh(mi: MeshInstance3D, control_points: Array[Vector3], 
 	## ROPE_PHYSICS_SEGMENT_LENGTH (a real PBD constraint violation -- see
 	## RopeChainPBD.max_link_gap_violation()) shows up on screen as a
 	## visibly larger ring than its neighbors, not just a number in a test
-	## log. Every link is baked into ONE ArrayMesh (one SurfaceTool, one
-	## commit) for a single draw call, not N separate MeshInstance3D nodes.
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	## log.
+	##
+	## PERFORMANCE (2026-07-31, per a real user report: "once the dart is
+	## thrown, the game soon become super laggy"): direct per-call timing
+	## (Time.get_ticks_usec(), a real live 4-hard-bot soak) measured the
+	## ORIGINAL SurfaceTool-based version of this function at ~1.4-2.1ms PER
+	## CALL, called once per player per _process() frame -- with 4 active
+	## players/chains that alone is 5.6-8.4ms of a 16.6ms/60fps frame
+	## budget, regardless of whether any dart was actually thrown (idle
+	## measured ~1.45ms/call too -- the "once thrown" framing is because a
+	## real player naturally starts throwing almost immediately, not
+	## because idle was ever cheap). A first fix attempt (precomputing the
+	## radial cos/sin table once instead of per-ring, and supplying analytic
+	## normals to skip generate_normals()) was measured, via the same
+	## before/after timing, to barely move the number (1451us -> 1396us) --
+	## i.e. trig cost was NOT the dominant factor. The actual dominant cost:
+	## SurfaceTool.add_vertex()/set_normal() are individual GDScript-to-
+	## engine calls, and the old code issued roughly (n_links * point_count
+	## * radial_segments * 12) of them -- tens of thousands per invocation.
+	## Fix: build plain PackedVector3Array vertex/normal buffers directly in
+	## GDScript (cheap, no per-element engine-boundary crossing) and submit
+	## the WHOLE mesh in one single ArrayMesh.add_surface_from_arrays() call
+	## instead of thousands of individual SurfaceTool calls.
+	var cos_table: PackedFloat32Array = PackedFloat32Array()
+	var sin_table: PackedFloat32Array = PackedFloat32Array()
+	cos_table.resize(radial_segments)
+	sin_table.resize(radial_segments)
+	for j in range(radial_segments):
+		var radial_angle: float = TAU * float(j) / float(radial_segments)
+		cos_table[j] = cos(radial_angle)
+		sin_table[j] = sin(radial_angle)
+
+	var all_verts: PackedVector3Array = PackedVector3Array()
+	var all_normals: PackedVector3Array = PackedVector3Array()
 
 	var n: int = control_points.size()
-	var built_any: bool = false
 	for i in range(n - 1):
 		var p_a: Vector3 = control_points[i]
 		var p_b: Vector3 = control_points[i + 1]
@@ -1668,15 +1741,25 @@ func _build_chain_link_mesh(mi: MeshInstance3D, control_points: Array[Vector3], 
 		var ring_normal: Vector3 = tangent.cross(flatten_axis).normalized()
 		var mid: Vector3 = (p_a + p_b) * 0.5
 		var loop_points: Array[Vector3] = _stadium_loop_points(mid, tangent, flatten_axis, link_length, ROPE_CHAIN_LINK_WIDTH)
-		_append_closed_tube(st, loop_points, tube_radius, radial_segments, ring_normal)
-		built_any = true
+		var chunk: Array = _closed_tube_arrays(loop_points, tube_radius, cos_table, sin_table, ring_normal)
+		all_verts.append_array(chunk[0])
+		all_normals.append_array(chunk[1])
 
-	if not built_any:
+	if all_verts.is_empty():
 		mi.mesh = null
 		return
 
-	st.generate_normals()
-	mi.mesh = st.commit()
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = all_verts
+	# Exact analytic per-vertex normals (the true outward radial direction
+	# of a tube, already known from the same math that placed the vertex --
+	# see _closed_tube_arrays()) -- no generate_normals() smoothing pass
+	# needed, which would be yet another full-mesh pass every frame.
+	arrays[Mesh.ARRAY_NORMAL] = all_normals
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	mi.mesh = mesh
 	# Must be applied AFTER mi.mesh is assigned -- set_surface_override_material
 	# errors on a MeshInstance3D whose mesh has no surfaces yet, which every
 	# call before this line's mi.mesh assignment would still be.
@@ -1728,52 +1811,85 @@ func _stadium_loop_points(center: Vector3, tangent: Vector3, flatten_axis: Vecto
 	return pts
 
 
-func _append_closed_tube(st: SurfaceTool, loop_points: Array[Vector3], radius: float, radial_segments: int, loop_normal: Vector3) -> void:
-	## Extrudes a round tube of constant `radius` around a CLOSED loop (the
-	## last point connects back to the first) into the given, already-begun
-	## SurfaceTool -- lets _build_chain_link_mesh() bake every ring into one
-	## shared mesh instead of committing N separate ones. `loop_normal` is
-	## the fixed axis perpendicular to the whole loop's own plane (see
+func _closed_tube_arrays(loop_points: Array[Vector3], radius: float, cos_table: PackedFloat32Array, sin_table: PackedFloat32Array, loop_normal: Vector3) -> Array:
+	## Returns [verts: PackedVector3Array, normals: PackedVector3Array] for a
+	## round tube of constant `radius` extruded around a CLOSED loop (the
+	## last point connects back to the first) -- one ring link's own worth
+	## of triangle data, for the caller (_build_chain_link_mesh()) to
+	## concatenate into its own single combined mesh buffer via
+	## append_array(), rather than committing N separate meshes. Returning
+	## plain arrays (built via index-assignment into a presized buffer, no
+	## per-vertex engine calls) instead of writing into a SurfaceTool is
+	## what makes this cheap -- see _build_chain_link_mesh()'s own doc
+	## comment for the measured before/after. `loop_normal` is the fixed
+	## axis perpendicular to the whole loop's own plane (see
 	## _stadium_loop_points()) -- since every point on the loop's own path
 	## tangent is, by construction, always perpendicular to loop_normal,
 	## there's no degenerate parallel-tangent case to guard against here,
-	## unlike a tube built along an arbitrary 3D curve.
+	## unlike a tube built along an arbitrary 3D curve. `cos_table`/
+	## `sin_table` are the caller's own precomputed radial unit-circle table.
+	var radial_segments: int = cos_table.size()
 	var point_count: int = loop_points.size()
 	if point_count < 3:
-		return
+		return [PackedVector3Array(), PackedVector3Array()]
 
-	var rings: Array[PackedVector3Array] = []
-	rings.resize(point_count)
+	# PERFORMANCE (2026-07-31, same investigation as _build_chain_link_mesh()'s
+	# own doc comment): the previous version of this function allocated a
+	# fresh small PackedVector3Array per loop point (2 * point_count, up to
+	# 28 per link / ~672 total per player per frame) for `rings`/
+	# `ring_normals`. Direct sub-function timing (Time.get_ticks_usec())
+	# showed THIS function, not mesh submission or array concatenation, was
+	# the dominant cost (~740-820us of ~1.1-1.25ms total). Flattened to two
+	# PRESIZED flat buffers (2 allocations per link, not 2*point_count) --
+	# ring i's own data lives at flat index [i*radial_segments ..
+	# i*radial_segments+radial_segments-1].
+	var ring_verts: PackedVector3Array = PackedVector3Array()
+	var ring_normals: PackedVector3Array = PackedVector3Array()
+	ring_verts.resize(point_count * radial_segments)
+	ring_normals.resize(point_count * radial_segments)
 	for i in range(point_count):
 		var prev_pt: Vector3 = loop_points[(i - 1 + point_count) % point_count]
 		var next_pt: Vector3 = loop_points[(i + 1) % point_count]
 		var path_tangent: Vector3 = (next_pt - prev_pt).normalized()
 		var cross_axis: Vector3 = loop_normal.cross(path_tangent).normalized()
-		var ring := PackedVector3Array()
-		ring.resize(radial_segments)
+		var base: int = i * radial_segments
+		var here: Vector3 = loop_points[i]
 		for j in range(radial_segments):
-			var angle: float = TAU * float(j) / float(radial_segments)
-			ring[j] = loop_points[i] + (cross_axis * cos(angle) + loop_normal * sin(angle)) * radius
-		rings[i] = ring
+			# This IS the tube's own true outward radial unit vector at this
+			# vertex -- already exactly what a correct per-vertex normal for
+			# a cylindrical surface is, no further derivation needed.
+			var dir: Vector3 = cross_axis * cos_table[j] + loop_normal * sin_table[j]
+			ring_verts[base + j] = here + dir * radius
+			ring_normals[base + j] = dir
 
+	var out_verts: PackedVector3Array = PackedVector3Array()
+	var out_normals: PackedVector3Array = PackedVector3Array()
+	out_verts.resize(point_count * radial_segments * 6)
+	out_normals.resize(point_count * radial_segments * 6)
+	var w: int = 0
 	for i in range(point_count):
-		var ring_a: PackedVector3Array = rings[i]
-		var ring_b: PackedVector3Array = rings[(i + 1) % point_count]
+		var base_a: int = i * radial_segments
+		var base_b: int = ((i + 1) % point_count) * radial_segments
 		for j in range(radial_segments):
 			var j_next: int = (j + 1) % radial_segments
-			var a0: Vector3 = ring_a[j]
-			var a1: Vector3 = ring_a[j_next]
-			var b0: Vector3 = ring_b[j]
-			var b1: Vector3 = ring_b[j_next]
+			var a0: Vector3 = ring_verts[base_a + j]
+			var a1: Vector3 = ring_verts[base_a + j_next]
+			var b0: Vector3 = ring_verts[base_b + j]
+			var b1: Vector3 = ring_verts[base_b + j_next]
+			var na0: Vector3 = ring_normals[base_a + j]
+			var na1: Vector3 = ring_normals[base_a + j_next]
+			var nb0: Vector3 = ring_normals[base_b + j]
+			var nb1: Vector3 = ring_normals[base_b + j_next]
 			# Two triangles per quad, wound so the outward-facing normal
-			# points away from the ring's own centerline (consistent with
-			# SurfaceTool.generate_normals()'s face-winding expectations).
-			st.add_vertex(a0)
-			st.add_vertex(b0)
-			st.add_vertex(a1)
-			st.add_vertex(a1)
-			st.add_vertex(b0)
-			st.add_vertex(b1)
+			# points away from the ring's own centerline.
+			out_verts[w] = a0; out_normals[w] = na0; w += 1
+			out_verts[w] = b0; out_normals[w] = nb0; w += 1
+			out_verts[w] = a1; out_normals[w] = na1; w += 1
+			out_verts[w] = a1; out_normals[w] = na1; w += 1
+			out_verts[w] = b0; out_normals[w] = nb0; w += 1
+			out_verts[w] = b1; out_normals[w] = nb1; w += 1
+
+	return [out_verts, out_normals]
 
 
 func _perform_slash() -> void:
