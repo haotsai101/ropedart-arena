@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://dqk3n8x2p1w7m5r9"]
-
-[ext_resource type="Script" path="res://tests/test_hand_side_tunnel_probe.gd" id="1_tunnelprobe"]
-
-[node name="TestHandSideTunnelProbe" type="Node"]
-script = ExtResource("1_tunnelprobe")

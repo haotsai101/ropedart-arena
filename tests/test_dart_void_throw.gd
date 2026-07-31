@@ -81,16 +81,33 @@ func _run_void_throw(label: String, from_pos: Vector2, aim: Vector2, main_scene:
 	var final_pos: Vector2 = dart.head_2d
 	var dist_from_origin: float = final_pos.distance_to(from_pos)
 	var relevant_coord: float = maxf(absf(final_pos.x), absf(final_pos.y))
+	# ROUND 30 (2026-07-31): max range is now measured from the owner's
+	# CURRENT hand position every tick (rope_dart.gd's own FLYING branch),
+	# not the fixed body-position throw origin (from_pos) -- see rope_dart.gd
+	# and player.gd's own ROUND 30 doc comments for the full root-cause (a
+	# player who moved during flight used to be able to push real
+	# hand-to-dart distance past the chain's true capacity, since this used
+	# to be checked against a point that never moved after launch). from_pos
+	# and the real hand position are only approximately equal (a fixed bone
+	# offset, plus minor idle-animation sway), so dist_from_origin no longer
+	# reads as exactly ROPE_LENGTH here even though the dart is correctly
+	# anchored at exactly ROPE_LENGTH from the hand -- check against the real
+	# hand position instead, with a tolerance sized for one full physics
+	# tick's worth of discrete travel (travel_speed=18 at ratio=0.0, delta
+	# ~0.016s -> ~0.29 units) plus a small margin.
+	var hand_world: Vector3 = player.get_hand_world_position()
+	var hand_2d: Vector2 = Vector2(hand_world.x, hand_world.z)
+	var dist_from_hand: float = final_pos.distance_to(hand_2d)
 
-	print("[dart void test] %s: state=%d final_pos=%s dist_from_origin=%.3f relevant_coord=%.3f frames=%d" \
-		% [label, dart.state, final_pos, dist_from_origin, relevant_coord, frames])
+	print("[dart void test] %s: state=%d final_pos=%s dist_from_origin=%.3f dist_from_hand=%.3f relevant_coord=%.3f frames=%d" \
+		% [label, dart.state, final_pos, dist_from_origin, dist_from_hand, relevant_coord, frames])
 
 	if dart.state != 1:  # State.ANCHORED
 		_fail(label, "dart never reached ANCHORED within %d frames (state=%d)" % [frames, dart.state])
 	if relevant_coord <= OLD_ARENA_HALF:
 		_fail(label, "dart anchored at %.3f, still inside the OLD arena_half=%.1f boundary -- the clamp was not actually removed" % [relevant_coord, OLD_ARENA_HALF])
-	if absf(dist_from_origin - ROPE_LENGTH) > 0.05:
-		_fail(label, "dart anchored %.3f units from its throw origin, expected exactly ROPE_LENGTH=%.1f (open void, nothing to hit before max range)" % [dist_from_origin, ROPE_LENGTH])
+	if absf(dist_from_hand - ROPE_LENGTH) > 0.35:
+		_fail(label, "dart anchored %.3f units from the owner's real hand, expected ~ROPE_LENGTH=%.1f (open void, nothing to hit before max range)" % [dist_from_hand, ROPE_LENGTH])
 
 	# Let a couple more frames run with the physics rope chain active and
 	# anchored off-map, to catch any error/crash from the rope system

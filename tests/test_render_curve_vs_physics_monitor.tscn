@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://d8k3n5x2q9m1p7r4"]
-
-[ext_resource type="Script" path="res://tests/test_render_curve_vs_physics_monitor.gd" id="1_curvemon"]
-
-[node name="TestRenderCurveVsPhysicsMonitor" type="Node"]
-script = ExtResource("1_curvemon")

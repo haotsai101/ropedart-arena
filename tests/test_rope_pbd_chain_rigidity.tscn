@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://dqx8pbd0chain001"]
+
+[ext_resource type="Script" path="res://tests/test_rope_pbd_chain_rigidity.gd" id="1_pbdrigid"]
+
+[node name="TestRopePBDChainRigidity" type="Node"]
+script = ExtResource("1_pbdrigid")
