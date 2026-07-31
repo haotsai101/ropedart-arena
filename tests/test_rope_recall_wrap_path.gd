@@ -85,6 +85,7 @@ func _run_scenario_a(main_scene: Node) -> bool:
 	player.dart.state = 1  # State.ANCHORED (see rope_dart.gd's enum)
 	var anchor: Vector2 = far_corner + Vector2(1.2, 1.2)
 	player.dart.head_2d = anchor
+	player.dart._render()  # sync head_mesh.global_transform -- _get_rope_tip_target() reads that, not head_2d directly
 	print("[TEST] hand=%s anchor=%s beeline_dist=%.2f" % [
 		player.get_pos_2d(), anchor, player.get_pos_2d().distance_to(anchor)])
 
@@ -187,6 +188,7 @@ func _run_scenario_b() -> bool:
 	# proximity check fires.
 	player.dart.state = 1  # State.ANCHORED
 	player.dart.head_2d = player.get_pos_2d() + Vector2(0.3, 0.0)
+	player.dart._render()  # sync head_mesh.global_transform -- _get_rope_tip_target() reads that, not head_2d directly
 	print("[TEST] player=%s dart anchored at=%s (pickup_radius=%.2f)" % [
 		player.get_pos_2d(), player.dart.head_2d, player.dart.pickup_radius])
 
@@ -215,20 +217,17 @@ func _run_scenario_b() -> bool:
 
 
 func _chain_path_length_2d(player) -> float:
-	var hand_pos: Vector3 = player._get_rope_hand_anchor_pos()
-	var tip_pos: Vector3 = player._get_rope_tip_target()
-	var hand_2d := Vector2(hand_pos.x, hand_pos.z)
-	var tip_2d := Vector2(tip_pos.x, tip_pos.z)
-	if player._physics_rope_segments.is_empty():
-		return hand_2d.distance_to(tip_2d)
+	## ADAPTED for the PBD chain rewrite: reads player._rope_chain.points
+	## (hand + every interior point + tip, in order) instead of the old
+	## RigidBody3D chain's _physics_rope_segments.
+	if player._rope_chain == null or player._rope_chain.points.size() < 2:
+		var hand_pos: Vector3 = player._get_rope_hand_anchor_pos()
+		var tip_pos: Vector3 = player._get_rope_tip_target()
+		return Vector2(hand_pos.x, hand_pos.z).distance_to(Vector2(tip_pos.x, tip_pos.z))
 	var total: float = 0.0
-	var prev: Vector2 = hand_2d
-	for seg in player._physics_rope_segments:
-		var p3: Vector3 = (seg as RigidBody3D).global_position
-		var p2d := Vector2(p3.x, p3.z)
-		total += prev.distance_to(p2d)
-		prev = p2d
-	total += prev.distance_to(tip_2d)
+	var points: PackedVector2Array = player._rope_chain.points
+	for i in range(points.size() - 1):
+		total += points[i].distance_to(points[i + 1])
 	return total
 
 

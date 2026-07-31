@@ -5,6 +5,15 @@ extends CharacterBody3D
 signal player_killed(player: Node)
 signal player_eliminated(player: Node)
 
+## Loaded via explicit preload() (not the bare class_name RopeChainPBD global
+## symbol rope_chain_pbd.gd also declares for editor convenience) so this
+## script never depends on Godot's global script class cache having already
+## been rebuilt -- that cache is only refreshed by the editor scanning the
+## project, which a fresh headless test run (this project's own primary
+## verification method, see CLAUDE.md) does not do, and referencing the bare
+## global name in that situation is a hard parse error, not a runtime one.
+const RopeChainPBDScript: Script = preload("res://scripts/rope_chain_pbd.gd")
+
 @export var move_speed: float = 6.0
 @export var dart_scene: PackedScene
 @export var player_index: int = 0
@@ -110,304 +119,112 @@ const DART_ROPE_LENGTH: float = 6.0 * GameManager.PLAYER_CAPSULE_HEIGHT
 ## at the hand, not a separate rendering system.
 const ROPE_RADIUS: float = 0.035
 
-## --- Real physics rope chain: ONE persistent object per player, spawned
-## once in _ready() and never torn down/rebuilt per-throw -- see
-## _spawn_physics_rope(). Full architecture reset (see CLAUDE.md's dated
-## entry) per direct, explicit user mandate rejecting every earlier round's
-## shortest-path/visibility-graph render-side routing: "Why are we computing
-## the shortest path???? It doesn't work like that. I want the rope to be a
-## physic object just like the character, tree, or pillar... The rope is 32
-## segments of bar. When held, all segments collapse into the character's
-## hand. When the dart is thrown, the rope unfold segment by segment and when
-## retrieving, the rope fold segment by segment as well."
+## --- PBD/Verlet rope chain: ONE persistent object per player, created once
+## in _ready() and never torn down/rebuilt per-throw -- see
+## scripts/rope_chain_pbd.gd (RopeChainPBD) for the full simulation itself,
+## and CLAUDE.md's dated "PBD/Verlet rope rewrite" round entry for why this
+## replaced the prior RigidBody3D + PhysicsServer3D pin-joint chain (three
+## separate joint-tuning attempts across earlier rounds all failed to make
+## that chain's segments never separate, with real measured regressions each
+## time -- see that file's own history for the full writeup). The user's own
+## words this round: "There shouldn't be any radius to compute. Regardless of
+## anchored or not, the rope bar should be attached to the next rope bar and
+## never separate. When the rope bars are stretched completely, character
+## cannot move further."
 ##
-## Mechanism: a kinematic hand anchor and a kinematic tip anchor, joined by
-## ROPE_PHYSICS_SEGMENTS dynamic RigidBody3D capsule links via raw
-## PhysicsServer3D pin joints (_join_rope_pin() -- explicit, independent
-## per-body local anchor points; NOT PinJoint3D nodes, whose implicit
-## shared-setup-position offsets were found, in an earlier round, to bake in
-## a wrong "hold body centers together" constraint instead of "hold capsule
-## ends together" whenever bodies don't already coincide at spawn -- see git
-## history for the original root-cause writeup). The tip anchor tracks
-## _get_rope_tip_target() every physics tick (player.gd's
-## _update_physics_rope_anchors(), called from _physics_process()) --
-## get_hand_world_position() (i.e. the tip COINCIDES with the hand) whenever
-## dart == null, and the dart's own live position otherwise. Segments are
-## spawned bunched near the hand (ROPE_BUNCH_SPACING) and STAY there at rest
-## since the tip anchor never moves away while idle -- this is what makes
-## "collapse into the hand" the chain's natural resting configuration rather
-## than a separately-authored idle visual, and what makes "unfold
-## segment-by-segment on throw" / "fold segment-by-segment on retrieve" fall
-## directly out of real joint-constraint propagation as the tip anchor moves
-## away/back, with NO separate pacing mechanism dictating it (see
-## ROPE_PHYSICS_SEGMENTS' own comment below for why the old growing-leash
-## max_reach_from_hand position clamp was deleted, not reused, for this).
+## Mechanism: _rope_chain (a RopeChainPBD instance) holds ROPE_PHYSICS_SEGMENTS
+## + 1 points on the XZ plane. points[0] (hand) and points[last] (tip) are
+## driven kinematically every physics tick by _update_physics_rope_anchors()
+## -- get_hand_world_position() whenever dart == null (the tip COINCIDES with
+## the hand), the dart's own live position otherwise -- exactly mirroring the
+## old chain's kinematic hand/tip anchor bodies. Every interior point is
+## Verlet-integrated and iteratively constrained (RopeChainPBD.step()) so
+## that NO consecutive pair can ever end up farther apart than
+## ROPE_PHYSICS_SEGMENT_LENGTH -- a hard, exact, every-tick guarantee, not a
+## soft joint approximation. "Collapse at the hand" / "unfold on throw" /
+## "fold on retrieve" all still fall directly out of this one mechanism with
+## no separate pacing logic: see RopeChainPBD's own class doc comment for why
+## a one-sided (<=) distance constraint alone produces exactly this behavior.
 ##
 ## Y-PLANE LOCK (non-negotiable, unchanged from every earlier round -- per
 ## explicit user requirement, "I want the rope to disregard gravity and live
-## on a plane"): every segment has gravity_scale = 0.0 AND is hard-locked to
-## the dart's fixed plane_y every physics step via rope_segment_body.gd's
-## _integrate_forces() override (Godot's own documented, solver-safe way to
-## correct a RigidBody3D's transform each step -- poking global_position from
-## outside physics processing is explicitly discouraged by Godot's docs).
-## Real collision against obstacle geometry (pillars/trees/cacti) is
-## Godot's own solver reacting to each segment's capsule CollisionShape3D on
-## ROPE_OBSTACLE_LAYER_BIT -- see arena_obstacle.gd's matching layer bit --
-## with collision_layer left at 0 so the chain can never push a player or
-## leak into any other gameplay system.
+## on a plane"): the whole chain is simulated in 2D (Vector2 on the XZ plane)
+## in the first place -- there is no Y coordinate to drift, gravity to
+## disregard, or per-step correction needed at all. This is a direct, load-
+## bearing consequence of moving the simulation into this project's own
+## "gameplay math runs on the XZ plane as Vector2" architecture invariant,
+## not a separate mechanism layered on top of a 3D physics body the way the
+## old rope_segment_body.gd's per-tick Y-clamp was.
 ##
-## WHAT WAS DELETED THIS ROUND, AND WHY: every render-side "compute where the
-## rope SHOULD be based on geometry, then draw that" correction layer --
-## the visibility-graph + Dijkstra shortest path
-## (_visibility_graph_route()/_segment_crosses_rect_interior()), the
-## corner-selection heuristics it had itself replaced
-## (_corner_route_waypoints()/_rect_nearest_edge_index()/
-## _rect_shared_corner()), and the per-sample obstacle-clamp fallbacks
-## (_point_inside_any_obstacle()/_nearest_point_outside_obstacles()/
-## _route_through_polyline()) -- plus BOTH of rope_segment_body.gd's
-## synthetic position clamps (max_reach_from_hand's growing-leash sphere and
-## max_perp_from_line's taut-line tube, see that script's own doc comment).
-## Per the user's own explicit framing: real objects like the character or a
-## pillar don't need a computed path to avoid each other, their real
-## collision shapes just physically can't occupy the same space -- so the
-## rope must work the same way, and _compute_rope_tube_curve_points() now
-## does nothing but trace a smooth Catmull-Rom curve through wherever the
-## REAL RigidBody3D segments actually are, full stop. If the rendered rope
-## ever clips a pillar now, that means the real physics chain clipped it --
-## a genuine collision bug to fix at the physics/collision level (segment
-## count, capsule radius, collision margins, joint config), never something
-## to paper over in the render.
-## ROUND 15 (2026-07-25): 32 -> 24, per explicit user direction ("Let's try
-## 24 joints"), alongside the DART_ROPE_LENGTH resize above.
+## COLLISION against obstacle geometry (pillars, tree/cactus scatter boxes)
+## is real, direct per-point correction against every "obstacles" group
+## member's own get_rect_2d() (see RopeChainPBD._resolve_collisions()) --
+## the same real, authoritative 2D obstacle data this project's own
+## architecture already treats as the ground truth for XZ-plane gameplay
+## math, not synthetic/invented geometry and not a from-scratch "compute
+## where the rope should route" correction.
 const ROPE_PHYSICS_SEGMENTS: int = 24
 ## Total simulated chain length always equals DART_ROPE_LENGTH (the dart's
-## own fixed max range) regardless of the CURRENT hand-to-dart distance.
+## own fixed max range) regardless of the CURRENT hand-to-dart distance --
+## each of ROPE_PHYSICS_SEGMENTS links has this as its own fixed, individual
+## maximum length (see RopeChainPBD.segment_max_length).
 const ROPE_PHYSICS_SEGMENT_LENGTH: float = DART_ROPE_LENGTH / float(ROPE_PHYSICS_SEGMENTS)
-const ROPE_PHYSICS_SEGMENT_HALF_LENGTH: float = ROPE_PHYSICS_SEGMENT_LENGTH * 0.5
-## Total span of the whole initial bunch laid out at _ready()-time
-## construction (see _spawn_physics_rope()) -- a small, FIXED length
-## independent of ROPE_PHYSICS_SEGMENTS (segments are spaced out evenly
-## across this fixed total, not by a fixed per-segment gap -- see
-## _spawn_physics_rope()'s own comment for why that distinction matters at
-## 32 segments), so the very first render frame reads as "collapsed at the
-## hand" (per the user's literal spec) regardless of segment count, rather
-## than sitting exactly on top of the hand anchor's own point.
-const ROPE_BUNCH_SPACING: float = 0.4
-## Mass per unit of segment length (a linear density), not a bare per-segment
-## mass -- this is what actually stayed constant across every prior
-## segment-count resize (ROUND 12: 8 segments @ 1.0 length-per-segment @ 0.03
-## mass; ROUND 12->15: 32 segments @ 0.25 length-per-segment @ 0.0075 mass;
-## every one of those ratios is 0.03/1.0=0.03). ROUND 15 itself only
-## re-derived mass for a segment-COUNT change (32->24) at a fixed total
-## length (8.4), so it approximated this via "keep the whole chain's total
-## mass at the original 0.24" -- equivalent to this density only because the
-## length didn't change that round. ROUND 16 (2026-07-25) changes the LENGTH
-## too (8.4 -> 7.2, see DART_ROPE_LENGTH above), so per the task's own
-## instruction to re-derive mass proportionally to the new total length, this
-## is now expressed directly as density * current segment length, which
-## automatically scales total chain mass down with a shorter rope (0.24 ->
-## 0.216) rather than holding it artificially fixed.
-const ROPE_SEGMENT_LINEAR_MASS_DENSITY: float = 0.03
-const ROPE_SEGMENT_MASS: float = ROPE_SEGMENT_LINEAR_MASS_DENSITY * ROPE_PHYSICS_SEGMENT_LENGTH
-## ROUND 17 (2026-07-26) -- raised from 1.6/2.2 (present since the very first
-## physics-chain commit, 2026-07-22, and never previously singled out as its
-## own lever) per direct user report ("why is the rope shaking without the
-## character moving") of a genuinely different configuration than any prior
-## round measured: a dart that has been ANCHORED and stationary for several
-## seconds, not mid-throw/mid-retrieve. See tests/test_rope_physics_chain_
-## settle.gd's own new "5. ANCHORED STEADY-STATE JITTER" section for the
-## measurement this was tuned against. Real numbers, not assumed: at the OLD
-## 1.6/2.2 damping, three of four realistic settled-anchor configs (open-air
-## slack, corner-wrap, a REAL throw-to-anchor at a pillar) already measured
-## tiny (seg_max_step 0.0007-0.006 units/tick over a 6s window, several
-## seconds after the anchor transition) -- i.e. even the OLD damping was
-## nowhere near the scale of a bug that would read as "visibly, measurably
-## changes shape" on screen. Raising damping to 3.0/4.0 still measurably
-## helped those three configs further (seg_max_step down to ~0.0002-0.002,
-## amplification vs. the hand's own tiny animated-idle motion often dropping
-## BELOW 1.0, i.e. the chain now damps out noise faster than the driving
-## hand bone introduces it) with zero measured regression: the full
-## regression suite (idle collapse, 8-config settled-obstacle sweep, throw
-## unfold/retrieve fold) and a 50-second 4-hard-bot soak were re-run at the
-## new damping and showed the same pass/fail pattern (including the same
-## already-documented ROUND 9/11/12/15/16 settled-config-sweep flakiness --
-## which config flakes shifts run to run, but the flake RATE did not
-## increase) as an identical run at the old damping via git-stash A/B.
-## HONEST, DISCLOSED LIMITATION -- the fourth config, "open_air_taut" (a
-## dart anchored at/near max ROPE_LENGTH range in open air, i.e. ZERO slack
-## -- the common real case per rope_dart.gd's own "anchor at max range if
-## nothing was hit" behavior), was NOT fixed by this change: it showed the
-## same bimodal ~0.0002-0.03 seg_max_step / ~0.004-0.04 joint_gap_max range
-## at BOTH 1.6/2.2 and 3.0/4.0 damping, across repeated runs. Root cause,
-## reasoned from the numbers (a fully-taut, zero-slack chain sitting exactly
-## at its own total physical capacity has no slack left to silently absorb
-## any tiny per-joint numerical residual -- unlike every other config, which
-## has real spare capacity to fold into): this reads as a genuine solver
-## degenerate-case sensitivity specific to zero slack, not a "too much
-## kinetic energy" problem body damping (which drains existing motion, not
-## a geometric constraint at its limit) can address -- consistent with
-## ROUND 13/14's separate finding that JOINT-level (not body-level) stiffness
-## tuning is the dangerous, already-rejected lever for problems in this
-## family. Left as an open, disclosed item, not attempted further this round
-## (out of scope for "try body damping" specifically).
-## SEPARATE, DIRECTLY-MEASURED FINDING FROM THIS SAME ROUND, kept here since
-## it changes where to look next if the user's NEXT report is still "the
-## rope shakes": arena_camera.gd's own _process() recomputes camera position
-## AND orthographic size every frame from the AABB of ALL alive players plus
-## ALL active darts -- not just the one player/dart on screen. A scratch
-## probe (2-player real match, one player force-anchored and never touched
-## again, one hard bot left to roam) measured the camera's own per-frame
-## position/size step (~0.019 / ~0.025 units/frame, driven purely by the
-## OTHER bot moving elsewhere) as COMPARABLE TO OR LARGER than this file's
-## own worst-case rope-chain jitter number above -- i.e. in any real match
-## with more than one active player (the normal case), continuous camera
-## re-centering/re-zooming is a real, measured, competing explanation for
-## "things on screen visibly reshape even though nothing near them moved,"
-## entirely independent of the rope's own physics and NOT addressed by this
-## round's damping change. Flagged for the user's own judgment, not fixed
-## here (out of this round's explicit scope) -- if reported again with
-## confirmation that OTHER players/bots were active/moving in the same clip,
-## this is the first place to look, not the rope chain again.
-const ROPE_LINEAR_DAMP: float = 3.0
-const ROPE_ANGULAR_DAMP: float = 4.0
 
-## ROUND 28 (2026-07-30) -- root-caused and fixed the hand-side (segment 0)
-## severe tunneling event ROUND 27's live monitor found (rope sweeping
-## 0.74-0.96 deep into a pillar during ORDINARY MOVEMENT, no throw/teleport
-## involved). ROUND 27 checked and ruled out one candidate (the player's own
-## root CharacterBody3D speed, DASH_SPEED=20 -> ~0.33 units/tick, far too
-## small) but never checked the ACTUAL quantity that drives the kinematic
-## hand/tip anchors: _get_rope_hand_anchor_pos()/_get_rope_tip_target() read
-## the real, ANIMATED handslot.r bone position every physics tick (via
-## get_hand_world_position() -> _dagger_in_hand.global_position), not the
-## player's root transform.
-##
-## VERIFIED via two new, permanent, real-gameplay-driving probes (not a
-## synthetic/scripted scenario -- same "drive the real GameManager loop"
-## discipline as ROUND 27's own test), each run single-instance (no CPU
-## contention from parallel soaks) so results are attributable to the
-## engine's own animation/physics behavior, not this session's own
-## methodology:
-##   tests/test_hand_anchor_cadence_probe.gd -- 60s real soak, 4 real hard
-##   bots: the hand anchor's driven position is BYTE-IDENTICAL (delta <
-##   0.00001) for stretches of up to 22 CONSECUTIVE physics ticks in a row
-##   (not a render-frame-vs-physics-tick starvation artifact -- idle frames
-##   ran 2.4x MORE often than physics ticks in this same run, so the
-##   skeleton pose itself was genuinely static, not merely unsampled), then
-##   JUMPS by ~0.69 units in a SINGLE tick, dozens of times per 60s, always
-##   at the exact tick _current_anim changes (confirmed via
-##   tests/test_hand_side_tunnel_probe.gd's own per-animation breakdown: the
-##   max hand_delta recorded while EACH clip is current -- Idle_A 0.6921,
-##   Running_A 0.6436, Punch_Jab 0.6715 -- consistently far exceeds
-##   move_speed(6.0)/DASH_SPEED(20.0)'s own theoretical per-tick ceiling of
-##   0.1/0.333, and is consistent across totally different destination
-##   clips, matching a fixed rig geometry quantity -- the arm's own
-##   idle-pose-to-swing-pose excursion -- not continuous locomotion).
-## ROOT CAUSE: _play_anim() calls _anim_player.play(anim_name, -1.0, speed)
-## with NO cross-fade (-1.0 = AnimationPlayer's own default blend time,
-## 0.0 unless explicitly configured, and never has been here) -- switching
-## between Idle_A/Walking_A/Running_A/Punch_Jab/etc (which real bots do
-## constantly: every CHASE/AIM/RETREAT transition, every opportunistic
-## melee slash) hard-CUTS the skeleton pose from the old clip's arm position
-## straight to the new clip's first frame, INSTANTLY, in one tick -- fed
-## directly, unsmoothed, into the kinematic anchor's global_position every
-## single _physics_process() tick. Segment 0 (and, while idle, the LAST
-## segment via the tip anchor's own dart==null fallback to the same hand
-## position -- see _get_rope_tip_target()) is the ONLY body in the whole
-## chain jointed directly to a body that can move this way: every other
-## joint is dynamic-to-dynamic, governed continuously by the solver's own
-## incremental integration, never subject to an external, instantaneous,
-## un-interpolated position override. When a clip-switch pose-jump happens
-## to land near a sharp obstacle corner, the resulting oversized single-tick
-## joint violation is exactly what ROUND 27's own tick-by-tick profile
-## showed (pen rising 0.07->0.74 then decaying over ~10 ticks as the solver
-## resolves it) -- a real, mechanistically-confirmed match, not a guess.
-## RigidBody3D.continuous_cd (see _make_rope_segment_body(), unchanged) is
-## Godot's simplified ray-cast-only CCD mode and would not reliably catch
-## this either way -- it sweeps a body's OWN velocity-integrated motion, not
-## a neighboring KINEMATIC body's instantaneous externally-set position
-## jump propagating through a joint constraint.
-##
-## THE FIX, same "bound a legitimate physical quantity, don't invent
-## geometry" category as MAX_SEGMENT_SPEED (rope_segment_body.gd) -- NOT a
-## "compute where the rope should be" correction: ROPE_ANCHOR_MAX_SPEED caps
-## how fast _update_physics_rope_anchors() is allowed to MOVE each kinematic
-## anchor toward its real target per tick (Vector3.move_toward(), a plain
-## step-size clamp, not a new position computed from geometry). Set to 26.0
-## units/sec (0.4333 units/tick @ 60Hz) -- comfortably above DASH_SPEED's own
-## real 20.0 units/sec ceiling (so every legitimate continuous root-motion
-## case, already measured, passes through completely unclamped) but well
-## below the measured ~0.65-0.92-unit (39-55 units/sec) clip-switch jumps,
-## turning what used to be a single catastrophic joint kick into a 2-3-tick
-## ramp instead. This does not (and cannot) fix the underlying animation
-## pose-pop itself -- a real, separate, purely-visual issue (out of this
-## round's scope; would need actual blend-time tuning in _play_anim(), which
-## risks the carefully-tuned Enter/Hold/Exit throw/recall phase timing
-## documented elsewhere in this file) -- it only bounds the PHYSICAL
-## consequence of that pop on the rope chain, the same way MAX_SEGMENT_SPEED
-## already bounds (without eliminating) other solver-driven spikes.
+## Per-interior-point XZ speed clamp during Verlet integration -- a
+## legitimate physical damping-style bound (how fast any ONE point can move
+## in a single tick), not a position/path clamp deciding where a point
+## "should" be. Kept from the old chain's own MAX_SEGMENT_SPEED at the same
+## value/reasoning: comfortably above the dart's own fastest legitimate
+## speed (recall_speed 24.0, travel_speed up to 36.0 at full charge) so a
+## point can keep pace with a real thrown/recalled dart, while still bounding
+## any solver-driven single-tick spike (e.g. a kinematic endpoint snapping a
+## large distance) from compounding across ticks. Unlike the old RigidBody3D
+## chain, THIS clamp is now a secondary safety net rather than the primary
+## rigidity guarantee -- the hard one-sided distance constraint in
+## RopeChainPBD.step() is what actually makes segments never separate, at
+## every tick, regardless of this clamp's value.
+const ROPE_INTERIOR_MAX_SPEED: float = 45.0
+
+## Iterations of (distance constraint sweep + collision correction) run every
+## physics tick -- see RopeChainPBD.step(). Higher = tighter convergence
+## (both for the "never separate" distance guarantee under a same-tick
+## cascading correction, and for real obstacle collision), at a linear CPU
+## cost (O(segments) per iteration, all plain Vector2 math -- cheap even at
+## this count for the handful of chains a real match ever has active).
+## An upper CAP, not a fixed cost -- RopeChainPBD._converge_distance() exits
+## early the moment every consecutive pair is within CONVERGENCE_EPS of its
+## own segment_max_length, so a typical at-rest tick converges in only a
+## couple of iterations regardless of this cap; this value only matters on
+## the (rare) ticks that genuinely need many sweeps to resolve a fresh
+## perturbation cascading through an already-slack chain. Sized generously
+## (200) based on direct measurement -- see rope_chain_pbd.gd's own step()
+## doc comment for the specific probe and numbers this was verified against.
+const ROPE_SOLVER_ITERATIONS: int = 600
+
+## Same root cause and fix as the old chain's own ROPE_ANCHOR_MAX_SPEED --
+## _play_anim() cuts between animation clips with no cross-fade, so the
+## ANIMATED hand bone _get_rope_hand_anchor_pos() reads every physics tick
+## can pop by up to ~0.9 units in a single tick whenever a bot (or player)
+## switches locomotion/action clips (Idle_A <-> Walking_A <-> Running_A <->
+## Punch_Jab, etc). Left completely unclamped, that pop would be fed straight
+## into the chain's kinematic hand point every tick -- caps how fast
+## _update_physics_rope_anchors() is allowed to MOVE that kinematic target
+## per tick (Vector2.move_toward(), a plain step-size clamp, not a position
+## computed from geometry). Comfortably above DASH_SPEED's own real 20.0
+## units/sec ceiling (so every legitimate continuous root-motion case passes
+## through unclamped) but well below the measured ~0.65-0.92-unit clip-switch
+## jumps.
 const ROPE_ANCHOR_MAX_SPEED: float = 26.0
 
-## ROUND 28 FOLLOW-UP -- found via this round's OWN re-verification soak
-## (never skip re-measuring after a fix, per this file's own standing
-## convention): the plain ROPE_ANCHOR_MAX_SPEED clamp above, applied
-## UNCONDITIONALLY, caused a genuine NEW regression, caught by re-running
-## tests/test_live_rope_monitor.gd for the same real soak length as
-## ROUND 27's own verification -- max_raw_pen jumped to 0.79-0.99 in EVERY
-## one of 6 fresh soaks (vs. 2-of-4 before), always within the first ~90
-## ticks of a match. Root cause, confirmed via a temporary per-tick
-## hand_target-vs-hand_actual gap probe: _spawn_physics_rope() runs from
-## _ready(), which fires BEFORE GameManager's start_round()->
-## reset_for_round() moves a freshly-instantiated player to its real spawn
-## point -- so the hand anchor's very first target is whatever temporary/
-## default position the player node happens to occupy at _ready()-time
-## (measured: a ~13.7-unit gap from the real eventual spawn point in one
-## repro). The OLD, unclamped code never cared: it snapped the anchor
-## directly to hand_pos every single tick regardless of distance, so this
-## gap was invisible (closed in one tick, before physics even started
-## meaningfully). The NEW clamp, applied uniformly, turned that same gap
-## into a genuine ~30-tick (0.5s) DRAGGED sweep of the entire chain across
-## the map from the wrong position to the right one -- exactly the same
-## failure class ROUND 23/24 already root-caused and fixed for
-## reset_for_round()/_respawn() teleports (_reset_rope_chain_to_hand()),
-## but for a THIRD transition their fix never covered (initial _ready()-time
-## placement, not one of the "confirmed... exactly two production call
-## sites" that function's own doc comment describes) -- until
-## reset_for_round() itself fires a few ticks later and its own instant
-## PhysicsServer3D.body_set_state() reset finally cleans it up, by which
-## time real damage (a real sweep through PillarA/PillarB) was already done.
-##
-## FIX: a plain distance GATE, not a new geometric correction -- if the
-## anchor's real target is farther than ROPE_ANCHOR_SNAP_THRESHOLD away,
-## SNAP instantly (matching the old, safe, pre-clamp behavior exactly, and
-## the same "large jump = discrete reset" precedent already established for
-## teleports) instead of rate-limiting; only gaps smaller than this snap
-## instantly-vs-clamp threshold go through the ROPE_ANCHOR_MAX_SPEED ramp.
-## Sized well above the largest legitimate small-scale target the round-28
-## measurements ever found (the worst measured single-tick animation
-## clip-switch pop was 0.92 units, Sword_Attack/Punch_Jab/Idle_A all in the
-## same ~0.65-0.92 band) and well below any real spawn-point-to-spawn-point
-## or mid-match teleport distance on this arena (spawn points are spread
-## across a 14.5-unit arena half-width) -- so it cleanly separates "smooth
-## out an oversized single-tick animation pop" (the actual bug this fix
-## targets) from "the anchor is nowhere near correct, just put it there"
-## (every other case, including this newly-found _ready()-vs-reset_for_
-## round() ordering gap). RE-VERIFIED after this change via the same real
-## tests/test_live_rope_monitor.gd soak methodology -- see this file's own
-## dated CLAUDE.md entry for the actual before/after numbers.
+## A large, genuinely-discrete target jump (a real teleport, e.g. the
+## _ready()-time default position vs. the real post-spawn position, before
+## reset_for_round() has run even once yet) SNAPS instantly instead of being
+## rate-limited by ROPE_ANCHOR_MAX_SPEED above -- rate-limiting a jump this
+## large would drag the whole chain across the map over real time, sweeping
+## through obstacles on the way. Sized well above the largest legitimate
+## small-scale animation clip-switch pop (~0.92 units) and well below any
+## real spawn-point-to-spawn-point distance on this arena.
 const ROPE_ANCHOR_SNAP_THRESHOLD: float = 2.0
-
-## Matches arena_obstacle.gd's own copy of this same bit -- see that script's
-## comment for why it's duplicated rather than shared, and for the
-## one-directional layer/mask design (chain reacts to obstacles; nothing
-## reacts to the chain) that keeps this simulated rope from ever pushing a
-## player or interfering with the dart's own already-working flight raycast.
-const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
-
-## Preloaded once at class scope (not instantiated per-dart) -- every rope
-## segment body shares this same script; see rope_segment_body.gd's own doc
-## comment for the plane-lock/no-gravity/speed-clamp mechanism it implements.
-const RopeSegmentBodyScript: Script = preload("res://scripts/rope_segment_body.gd")
 
 ## --- Continuous tube-mesh rendering for the rope (visual only -- traces the
 ## real physics chain's own control points with a plain Catmull-Rom curve,
@@ -453,48 +270,36 @@ var _static_dagger_mesh: Node3D = null
 ## only as a local in _setup_dagger_in_hand()) so _build_tube_mesh() can reuse
 ## the exact same look without duplicating the material setup.
 var _rope_material: StandardMaterial3D = null
-## The real physics-simulated rope chain (see the ROPE_PHYSICS_* consts'
-## comment above) -- ONE PERSISTENT object per player, built once in
-## _spawn_physics_rope() (called from _ready()) and only ever torn down in
-## _exit_tree() (freeing raw PhysicsServer3D joint RIDs, which are not
-## Node3D-owned and would otherwise leak across round/scene transitions --
-## see _physics_rope_joint_rids' own comment). NOT rebuilt per-throw any
-## more -- its "idle collapsed at the hand" / "thrown, unfolding" /
-## "retrieving, folding" looks are all just this one chain's own live,
-## continuously-simulated configuration, driven purely by where its tip
-## anchor is currently being told to go (see _get_rope_tip_target()).
-var _physics_rope_root: Node3D = null
-var _physics_rope_hand_anchor: RigidBody3D = null
-var _physics_rope_tip_anchor: RigidBody3D = null
-## True once _spawn_physics_rope() has built the chain -- guards against a
-## double-spawn; never goes back to false during a player's lifetime (the
-## chain is not freed between throws or rounds any more, only in _exit_tree()).
+## The real PBD/Verlet rope chain (see scripts/rope_chain_pbd.gd and the
+## ROPE_PHYSICS_* consts' comment above) -- ONE PERSISTENT object per player,
+## created once in _init_rope_chain() (called from _ready()) and simply
+## dropped (no RID/resource cleanup needed -- it's plain Vector2 data, not a
+## physics-server object) in _exit_tree(). NOT rebuilt per-throw -- its "idle
+## collapsed at the hand" / "thrown, unfolding" / "retrieving, folding" looks
+## are all just this one chain's own live, continuously-simulated
+## configuration, driven purely by where its tip point is currently being
+## told to go (see _get_rope_tip_target()).
+var _rope_chain: RefCounted = null
+## True once _init_rope_chain() has built _rope_chain -- guards against a
+## double-init; never goes back to false during a player's lifetime.
 var _physics_rope_active: bool = false
-## Every dynamic segment body, in hand->tip order -- kept as a flat array
-## (rather than re-walking _physics_rope_root's children each frame) so
-## _update_rope_tube_mesh() can cheaply build its curve control-point list
-## every _process() frame.
-var _physics_rope_segments: Array[RigidBody3D] = []
-## Off by default -- never flipped by any committed default, only ever set at
-## runtime by a test/instrumentation script (same "toggle-and-revert, never
-## edit the file's own default" convention as GameManager.lobby_mode). When
-## true, forces _rope_leash_pivot_and_radius() to always use the FALLBACK
-## flat [anchor, DART_ROPE_LENGTH] circle, skipping the wrap-aware branch
-## entirely, so live-monitoring A/B tests can compare real per-tick chain
-## jitter/penetration with vs. without the wrap-aware leash computation live,
-## on the exact same real gameplay run, without editing this file per run.
-var debug_disable_wrap_leash: bool = false
-## Raw PhysicsServer3D joint RIDs (see _join_rope_pin()) -- these are NOT
-## Node3D-owned, so unlike _physics_rope_root's children they are not freed
-## automatically when the root is queue_free()'d; _free_physics_rope() must
-## explicitly PhysicsServer3D.free_rid() every one of these or they leak.
-var _physics_rope_joint_rids: Array[RID] = []
+## Cached once per player (obstacles are static StaticBody3D nodes that never
+## move mid-match) rather than re-querying the "obstacles" group every solver
+## iteration of every physics tick -- see _rope_obstacle_rects().
+var _rope_obstacle_rects_cache: Array = []
+var _rope_obstacle_rects_cached: bool = false
+## Persisted smoothed hand/tip anchor targets (see _step_or_snap_2d()) --
+## these used to live as an actual RigidBody3D's own global_position; now
+## they're just the last value handed to RopeChainPBD.step(), remembered here
+## so the ROPE_ANCHOR_MAX_SPEED ramp has something to step FROM each tick.
+var _hand_anchor_smoothed_2d: Vector2 = Vector2.ZERO
+var _tip_anchor_smoothed_2d: Vector2 = Vector2.ZERO
 ## The single continuous tube MeshInstance3D that visually replaces the
 ## per-segment CylinderMesh/capsule rendering -- see this file's
 ## ROPE_TUBE_CURVE_SAMPLES doc comment and _update_rope_tube_mesh(). Rebuilt
 ## (not just repositioned) every _process() frame the physics chain is
 ## active, since the curve it traces changes shape continuously as the
-## simulated segments move.
+## simulated points move.
 var _physics_rope_tube_mesh: MeshInstance3D = null
 ## Dart head that orbits the hand on a taut rope while charging, depicting
 ## winding up the throw -- see _update_charge_spin().
@@ -634,16 +439,12 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
-	## The persistent physics rope chain (see _spawn_physics_rope()) is no
-	## longer freed between throws or rounds -- it now only ever needs
-	## cleanup once, when this player node itself is actually leaving the
-	## tree for good (round-transition scene teardown, match end, etc.).
-	## Raw PhysicsServer3D joint RIDs (see _physics_rope_joint_rids) are NOT
-	## owned by any Node3D, so without this they would leak silently for the
-	## rest of the process's lifetime every time a match's scene is torn down
-	## -- _exit_tree() is called for every node as it's removed from the
-	## SceneTree, which reliably covers that regardless of whether the whole
-	## scene is freed at once or just this node is.
+	## The persistent PBD rope chain (see _init_rope_chain()) is no longer
+	## freed between throws or rounds -- it now only ever needs cleanup once,
+	## when this player node itself is actually leaving the tree for good
+	## (round-transition scene teardown, match end, etc.). Unlike the old
+	## RigidBody3D + PhysicsServer3D chain, there's no RID to explicitly free
+	## here -- _free_physics_rope() just drops the reference.
 	_free_physics_rope()
 
 
@@ -859,7 +660,7 @@ func _setup_dagger_in_hand() -> void:
 	## The held dagger's visibility is kept in sync with (dart == null) in
 	## _process() rather than at each of _throw()/_on_dart_returned()/kill()/
 	## reset_for_round(), so there's a single source of truth for it. The
-	## persistent physics rope chain (see _spawn_physics_rope(), called at the
+	## persistent PBD rope chain (see _init_rope_chain(), called at the
 	## end of this function) is a completely separate object that always
 	## exists regardless of (dart == null) -- its own configuration (collapsed
 	## at the hand vs. unfolded) is what changes, not its presence.
@@ -928,13 +729,11 @@ func _setup_dagger_in_hand() -> void:
 	rope_mat.emission = Color(0.1, 0.07, 0.05)
 	_rope_material = rope_mat
 
-	# Build the persistent physics rope chain now -- _dagger_in_hand (the real
-	# hand attachment get_hand_world_position() reads) is set above, and this
-	# node is already inside the tree by the time _ready() reaches this call,
-	# so _spawn_physics_rope()'s get_parent().add_child() is valid. See
-	# _spawn_physics_rope()'s own doc comment for why this now happens exactly
-	# ONCE per player instead of per-throw.
-	_spawn_physics_rope()
+	# Build the persistent PBD rope chain now -- _dagger_in_hand (the real
+	# hand attachment get_hand_world_position() reads) is set above. See
+	# _init_rope_chain()'s own doc comment for why this happens exactly ONCE
+	# per player instead of per-throw.
+	_init_rope_chain()
 
 
 func _update_charge_spin(delta: float) -> void:
@@ -1571,13 +1370,13 @@ func get_hand_world_position() -> Vector3:
 
 
 func _update_persistent_rope() -> void:
-	## The physics chain is persistent (spawned once in _ready(), see
-	## _spawn_physics_rope()) -- this just keeps the render in sync every
-	## _process() frame. Defensive respawn if somehow not built yet (should
+	## The physics chain is persistent (created once in _ready(), see
+	## _init_rope_chain()) -- this just keeps the render in sync every
+	## _process() frame. Defensive re-init if somehow not built yet (should
 	## only ever happen for one frame at most, if player_mesh/skeleton setup
-	## failed and _setup_dagger_in_hand() never called _spawn_physics_rope()).
+	## failed and _setup_dagger_in_hand() never called _init_rope_chain()).
 	if not _physics_rope_active:
-		_spawn_physics_rope()
+		_init_rope_chain()
 	if is_dead:
 		if _physics_rope_tube_mesh != null:
 			_physics_rope_tube_mesh.visible = false
@@ -1586,8 +1385,8 @@ func _update_persistent_rope() -> void:
 
 
 func _get_rope_tip_target() -> Vector3:
-	## The single point both _spawn_physics_rope() (initial layout direction)
-	## and _update_physics_rope_anchors() (every-tick tracking) treat as
+	## The single point _update_physics_rope_anchors() (every-tick tracking)
+	## treats as
 	## "where the far end of the rope should be": the dart's actual rendered
 	## pommel position while one is out, or -- critically, per the user's
 	## explicit "collapse into the hand" idle spec -- the hand's OWN position
@@ -1620,705 +1419,178 @@ func _get_rope_plane_y() -> float:
 
 func _get_rope_hand_anchor_pos() -> Vector3:
 	## The hand end of the rope, X/Z from the real (animated, bobbing) hand
-	## bone but Y hard-clamped to _get_rope_plane_y() -- the kinematic hand
-	## anchor is JOINTED to the first dynamic segment, whose Y is hard-locked
-	## to plane_y every physics step (see rope_segment_body.gd) -- if the hand
-	## anchor's own Y were left free to follow the real hand bone's bob
-	## instead, the joint would fight a small constant Y mismatch every step.
+	## bone but Y hard-clamped to _get_rope_plane_y() -- the whole PBD chain is
+	## simulated in 2D (see RopeChainPBD), so this Y value is only used for
+	## reconstructing the tube mesh's 3D render positions, never fed into the
+	## simulation itself.
 	var hand_pos: Vector3 = get_hand_world_position()
 	return Vector3(hand_pos.x, _get_rope_plane_y(), hand_pos.z)
 
 
-func _spawn_physics_rope() -> void:
-	## Builds the real RigidBody3D chain ONCE per player (called from
+func _init_rope_chain() -> void:
+	## Creates the persistent RopeChainPBD ONCE per player (called from
 	## _setup_dagger_in_hand(), itself called once from _ready()) -- see this
-	## file's ROPE_PHYSICS_* consts' doc comment for the full architecture.
-	## A kinematic hand anchor, a kinematic tip anchor (tracked toward
-	## _get_rope_tip_target() every physics tick -- see
-	## _update_physics_rope_anchors(), called from _physics_process()),
-	## ROPE_PHYSICS_SEGMENTS dynamic segments between them, and a raw
-	## PhysicsServer3D pin joint (see _join_rope_pin()) between every
-	## consecutive pair, each using EXPLICIT per-body local anchor points.
-	## Godot's own solver is what keeps this off of pillars/trees/cacti --
-	## nothing here computes a bend point or reads any obstacle's rect/shape
-	## data directly.
-	##
-	## Parented under get_parent() (the arena root), not under self -- self is
-	## a moving CharacterBody3D, and physics bodies nested under a moving
-	## Node3D would need top_level=true to avoid their transforms getting
-	## double-applied; simplest to just avoid the nesting entirely (same
-	## parenting rope_dart.gd's own dart instance already uses from _throw()).
-	if _physics_rope_root != null:
+	## file's ROPE_PHYSICS_* consts' doc comment and rope_chain_pbd.gd's own
+	## class doc comment for the full architecture. Collapsed onto the hand's
+	## own current position at creation -- exactly the same "idle collapse"
+	## rest configuration reset_to_point() re-establishes at every later
+	## teleport (see _reset_rope_chain_to_hand()).
+	if _rope_chain != null:
 		return
-	var root := Node3D.new()
-	root.name = "PhysicsRopeChain_%d" % player_index
-	get_parent().add_child(root)
-	_physics_rope_root = root
-
-	var plane_y: float = _get_rope_plane_y()
-	# Hand end is plane-locked here too (X/Z from the real hand, Y forced to
-	# plane_y) -- see _get_rope_hand_anchor_pos()'s own comment for why this
-	# matters beyond just visual consistency: it keeps the joint to the first
-	# dynamic segment (itself plane-locked) from fighting a constant Y
-	# mismatch every physics step. At spawn time (always right at _ready(),
-	# before any throw), the tip coincides with the hand -- see
-	# _get_rope_tip_target()'s own "idle collapse" comment -- so the chain's
-	# very first configuration IS the collapsed-at-the-hand rest state.
+	_rope_chain = RopeChainPBDScript.new()
+	_rope_chain.configure(ROPE_PHYSICS_SEGMENTS, ROPE_PHYSICS_SEGMENT_LENGTH)
 	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
-	var tip_pos: Vector3 = _get_rope_tip_target()
-
-	# Initial layout direction: along the current hand->tip span if it's
-	# meaningful, else along the player's current aim -- purely cosmetic (a
-	# tiny fan-out for the very first render frame, see ROPE_BUNCH_SPACING).
-	# Both endpoints already share the same Y (plane_y), so this direction is
-	# naturally flat (zero Y component) whenever it's derived from the real
-	# span -- the aim-direction fallback is explicitly constructed flat too.
-	var span: Vector3 = tip_pos - hand_pos
-	var span_dir: Vector3
-	if span.length() > 0.01:
-		span_dir = span.normalized()
-	else:
-		span_dir = Vector3(aim_dir.x, 0.0, aim_dir.y).normalized()
-	if span_dir.length() < 0.01:
-		span_dir = Vector3.FORWARD
-
-	var y_axis: Vector3 = span_dir
-	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
-	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
-	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
-	var seg_basis := Basis(x_axis, y_axis, z_axis)
-
-	_physics_rope_hand_anchor = _make_rope_anchor_body(root, "RopeHandAnchor", hand_pos)
-	_physics_rope_tip_anchor = _make_rope_anchor_body(root, "RopeTipAnchor", tip_pos)
-
-	var local_far := Vector3(0.0, ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
-	var local_near := Vector3(0.0, -ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
-
-	_physics_rope_segments.clear()
-	var prev: RigidBody3D = _physics_rope_hand_anchor
-	var prev_local_far := Vector3.ZERO  # the hand anchor's own attachment point is always its own origin
-	var denom: float = float(maxi(ROPE_PHYSICS_SEGMENTS - 1, 1))
-	# ROPE_BUNCH_SPACING is the WHOLE bunch's total span, not a per-segment
-	# gap -- spacing between consecutive segments is derived by dividing that
-	# fixed total by (segment_count - 1), so the bunch's own footprint stays
-	# small and CONSTANT regardless of segment count. (An earlier version of
-	# this file used a per-segment gap instead, i.e. total span = N *
-	# ROPE_BUNCH_SPACING -- at 8 segments that was a barely-noticeable 0.48
-	# units, but scaled to 32 segments it laid the chain out across ~1.9
-	# units in a dead-straight line: not "collapsed into the hand" as the
-	# user's spec requires, and left the joint solver needing real seconds to
-	# reel that whole layout back in even while idle, since nothing but the
-	# solver's own soft correction was pulling it in. A SPIRAL layout was
-	# tried and measured, via this round's own regression test,
-	# tests/test_rope_physics_chain_settle.gd, to be WORSE, not better --
-	# curling the segment CENTERS into a tight coil while every segment's
-	# ORIENTATION stayed uniformly aligned along span_dir left each capsule's
-	# real END POINTS (offset ±HALF_LENGTH along ITS OWN local Y, i.e. along
-	# span_dir, not tangent to the spiral) badly misaligned with where the
-	# joint chain actually needed them -- a large initial violation that
-	# released outward like an over-wound spring, measured to grow the max
-	# reach from ~1.2 (straight line at old spacing) to ~1.4. A straight line
-	# with UNIFORM span_dir orientation is the joint-consistent configuration
-	# for this body layout -- consecutive segment ends genuinely do line up
-	# along that direction -- so the only real fix needed was making the
-	# LINE's own total length small and segment-count-independent, not
-	# changing its shape.
-	var spacing: float = ROPE_BUNCH_SPACING / denom
-	for i in range(ROPE_PHYSICS_SEGMENTS):
-		var seg_center: Vector3 = hand_pos + span_dir * (float(i) * spacing)
-		var seg: RigidBody3D = _make_rope_segment_body(root, "RopeSeg%d" % i, seg_center, seg_basis, plane_y)
-		_physics_rope_segments.append(seg)
-		_join_rope_pin(prev, prev_local_far, seg, local_near)
-		prev = seg
-		prev_local_far = local_far
-	_join_rope_pin(prev, prev_local_far, _physics_rope_tip_anchor, Vector3.ZERO)
+	var hand_2d := Vector2(hand_pos.x, hand_pos.z)
+	_rope_chain.reset_to_point(hand_2d)
+	_hand_anchor_smoothed_2d = hand_2d
+	_tip_anchor_smoothed_2d = hand_2d
 	_physics_rope_active = true
 
 
-func _make_rope_anchor_body(parent: Node3D, node_name: String, pos: Vector3) -> RigidBody3D:
-	## A driven (kinematic-frozen) endpoint with no collision shape and no
-	## mesh of its own -- purely a joint attachment point whose position is
-	## overwritten every physics tick (see _update_physics_rope_anchors()).
-	## collision_layer/mask both 0: it must never be detectable by, or react
-	## to, anything (including the real obstacle layer the segments below
-	## react to) -- it's just a moving pin, not a physical object. Its own
-	## local anchor point for every joint it's part of is always exactly
-	## Vector3.ZERO (its own origin) -- see _join_rope_pin()'s callers.
-	var body := RigidBody3D.new()
-	body.name = node_name
-	body.freeze = true
-	body.freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
-	body.collision_layer = 0
-	body.collision_mask = 0
-	# Must add_child() before setting global_position -- global_position's
-	# setter calls get_global_transform() internally, which errors ("Returning
-	# Transform3D()") on a node that isn't inside the tree yet.
-	parent.add_child(body)
-	body.global_position = pos
-	return body
+func _rope_obstacle_rects() -> Array:
+	## Real obstacle geometry (pillars, tree/cactus scatter boxes) read from
+	## the "obstacles" group's own get_rect_2d() -- the same authoritative 2D
+	## data this project's own architecture already treats as ground truth
+	## for XZ-plane gameplay math (see arena_obstacle.gd). Cached once per
+	## player instance since these are all static StaticBody3D nodes that
+	## never move mid-match -- avoids re-querying the whole group every
+	## solver iteration of every physics tick.
+	if not _rope_obstacle_rects_cached:
+		_rope_obstacle_rects_cache.clear()
+		for o in get_tree().get_nodes_in_group("obstacles"):
+			if o.has_method("get_rect_2d"):
+				_rope_obstacle_rects_cache.append(o.get_rect_2d())
+		_rope_obstacle_rects_cached = true
+	return _rope_obstacle_rects_cache
 
 
-func _make_rope_segment_body(parent: Node3D, node_name: String, pos: Vector3, orient_basis: Basis, plane_y: float) -> RigidBody3D:
-	## One real physics link: a capsule collider (smoother than a cylinder for
-	## sliding along an obstacle's edge/corner, same reasoning games commonly
-	## use capsules for chain links) -- NO mesh/visual of its own (the rope's
-	## visual is one continuous tube mesh built separately in
-	## _update_rope_tube_mesh(), decoupled from these discrete collision
-	## bodies). `orient_basis` is the segment's initial orientation (local Y
-	## aligned along the chain's layout direction, see _spawn_physics_rope())
-	## -- without this every segment defaulted to identity rotation (local Y
-	## = world up), forcing the solver to fight a large, unnecessary initial
-	## rotation error on top of position. (Named orient_basis, not basis, to
-	## avoid shadowing Node3D's own `basis` property, which GDScript warns on.)
-	##
-	## gravity_scale = 0.0 and the attached rope_segment_body.gd script
-	## (locked_y = plane_y) are the mechanism for the user's explicit
-	## "disregard gravity and live on a plane" requirement -- see that
-	## script's own doc comment for the full writeup.
-	##
-	## collision_mask = ROPE_OBSTACLE_LAYER_BIT ONLY (not the default layer):
-	## reacts to real obstacle geometry, never to players/ground/the dart
-	## head. collision_layer = 0: nothing else's mask can ever detect this
-	## segment either -- strictly one-directional, so the chain can never
-	## push a player or otherwise leak into gameplay logic.
-	##
-	## contact_monitor / max_contacts_reported: lets rope_segment_body.gd know,
-	## per tick, whether THIS segment is actually touching real obstacle
-	## geometry right now (state.get_contact_count() > 0) -- since this body's
-	## collision_mask only ever matches ROPE_OBSTACLE_LAYER_BIT (never another
-	## segment, a player, or the ground), any contact reported here is
-	## unambiguously "resting against a real obstacle." Consumed by
-	## player.gd's _clamp_to_rope_leash() (the wrap-aware leash pivot).
-	var body := RigidBody3D.new()
-	body.name = node_name
-	body.set_script(RopeSegmentBodyScript)
-	body.locked_y = plane_y
-	body.mass = ROPE_SEGMENT_MASS
-	body.gravity_scale = 0.0
-	body.linear_damp = ROPE_LINEAR_DAMP
-	body.angular_damp = ROPE_ANGULAR_DAMP
-	## ROUND 28: confirmed via ClassDB introspection (this project's actual
-	## Godot 4.7 build) that PhysicsServer3D's default GodotPhysics3D backend
-	## exposes only a single BOOLEAN CCD toggle
-	## (body_set_enable_continuous_collision_detection) -- there is no
-	## CCD_MODE_CAST_RAY/CCD_MODE_CAST_SHAPE distinction available to switch
-	## between in this engine build/version (that enum exists in some other
-	## Godot physics backends/newer API surfaces, not this one -- do not
-	## re-attempt without first re-confirming via ClassDB, as a bare
-	## reference to a nonexistent PhysicsServer3D constant is a script
-	## PARSE ERROR that breaks this entire file, not a silent no-op). This
-	## bool (already `true` since the physics-chain's very first commit) is
-	## therefore already this engine's strongest available CCD setting --
-	## the real, measured, primary fix for the hand-side tunneling class is
-	## ROPE_ANCHOR_MAX_SPEED (see that const's own doc comment), not a CCD
-	## mode upgrade.
-	body.continuous_cd = true
-	body.collision_layer = 0
-	body.collision_mask = ROPE_OBSTACLE_LAYER_BIT
-	body.contact_monitor = true
-	body.max_contacts_reported = 4
-
-	var shape := CollisionShape3D.new()
-	var capsule := CapsuleShape3D.new()
-	capsule.radius = ROPE_RADIUS
-	capsule.height = ROPE_PHYSICS_SEGMENT_LENGTH
-	shape.shape = capsule
-	body.add_child(shape)
-
-	# Must add_child() before setting global_transform -- same is_inside_tree()
-	# requirement as _make_rope_anchor_body() above.
-	parent.add_child(body)
-	body.global_transform = Transform3D(orient_basis, pos)
-	return body
-
-
-## STILL UNFIXED as of ROUND 14 -- both of ROUND 13's own untried leads were
-## run to completion this round (ROUND 13 itself was blocked mid-session by
-## Godot MCP connection instability, not by running out of approaches). Left
-## at PhysicsServer3D's own documented defaults (0.3 / 1.0) -- functionally a
-## NO-OP vs. the previously-uncalled default, re-verified this round to still
-## reproduce the exact same baseline joint-gap numbers (max_joint_gap=1.8345
-## @ joint 28, tick 0, on a full-charge throw) as before this const/API call
-## existed.
-##
-## ROUND 14 LEAD 1 (damping tuning, isolated from bias) -- RUN TO COMPLETION,
-## CONCLUSIVELY FAILED, in the WORSE direction, not just "didn't help":
-## damping=2.0 (bias left at default 0.3) measured max_joint_gap=6.6527 --
-## 3.6x WORSE than the 1.0-baseline's 1.8345, not an improvement. damping=4.0
-## went further and caused a full numerical explosion within the first few
-## ticks (segment positions/reach going to NaN, matching the exact failure
-## signature ROUND 1 already found for bias=0.9/damping=2.0). Both measured
-## via the same per-tick _joint_gaps() probe, tests/test_rope_physics_chain_
-## settle.gd. Damping tuning on the pin joint is not a viable lever at any
-## value tried above the existing default -- do not retry without a
-## fundamentally different starting point than "just raise damping further."
-const ROPE_JOINT_BIAS: float = 0.3
-const ROPE_JOINT_DAMPING: float = 1.0
-
-## ROUND 14 LEAD 2 -- RUN TO COMPLETION, CONCLUSIVELY FAILED. Swaps
-## _join_rope_pin() for _join_rope_6dof() (PhysicsServer3D.joint_make_
-## generic_6dof(), near-zero linear limits on all 3 axes, angular left fully
-## free to match a pin joint's own free rotation) -- kept in the codebase,
-## DISABLED, as a permanent "already tried, don't retry blindly" record, per
-## this project's own standing convention (see e.g. ROUND 1's rejected
-## PIN_JOINT_IMPULSE_CLAMP/lower-bias notes). Do not flip this back to true
-## without a genuinely new idea, not just a different tuning of the same
-## three params already swept below.
-##
-## Real API confirmed against Godot 4.3's servers/physics_server_3d.h (not
-## assumed -- the task's own suggested method name,
-## joint_set_generic_6dof_axis_param, does not exist; the real methods are
-## generic_6dof_joint_set_param()/generic_6dof_joint_set_flag()).
-##
-## THREE STIFFNESS LEVELS MEASURED, all via the same _joint_gaps() probe on
-## the same full-charge-throw scenario the pin-joint baseline used:
-##   1. Engine defaults (softness=0.7, damping=1.0, restitution=0.5, per
-##      servers/physics_3d/joints/godot_generic_6dof_joint_3d.h's own struct
-##      init) with only the linear limit range set to +-0.02: max_joint_gap
-##      =9.6505 -- already ~5x WORSE than the pin joint's 1.8345 baseline,
-##      before any deliberate stiffening.
-##   2. Moderate (softness=1.0, restitution=1.0, damping=1.0, a mild bump off
-##      default): max_joint_gap=8.9473 -- still ~5x worse than baseline, only
-##      a marginal improvement over the engine defaults above.
-##   3. Aggressive (softness=4.0, restitution=4.0, damping=2.0): catastrophic,
-##      immediate explosion -- max_joint_gap=276121696.0 (276 MILLION units)
-##      already by tick 0, growing to ~1.68e18 by the fold phase, with 8602
-##      real "Object went too far away" engine errors logged. The dart never
-##      even returned within the test's own 240-tick timeout.
-##
-## ROOT CAUSE for why this joint type underperforms a pin joint at ANY
-## setting tried, confirmed by reading the engine's own C++ source (servers/
-## physics_3d/joints/godot_generic_6dof_joint_3d.cpp), not assumed from the
-## numbers alone: line 59 of that file is a hardcoded compile-time macro,
-## `#define GENERIC_D6_DISABLE_WARMSTARTING 1` -- Godot's generic 6DOF joint
-## has warm-starting (carrying the previous step's accumulated impulse
-## forward as a head start for the next step's iterative solve, standard
-## practice for fast constraint convergence) explicitly DISABLED in this
-## engine version, unlike whatever internal path PIN_JOINT uses. This isn't
-## adjustable from script/PhysicsServer3D at all -- it's baked into the
-## engine binary this project runs against. Separately, its own linear-limit
-## correction formula (solveLinearAxis(), line 202) uses `restitution` as the
-## de-facto positional-error-correction term (`limitSoftness * (restitution *
-## depth / timeStep - damping * rel_vel)`) since there is no dedicated linear
-## ERP parameter exposed at all (only angular axes have
-## G6DOF_JOINT_ANGULAR_ERP) -- a structurally different, and per the measured
-## numbers above, less effective correction path than whatever the pin
-## joint's own PIN_JOINT_BIAS/PIN_JOINT_DAMPING drive internally.
-const ROPE_USE_6DOF_JOINT: bool = false
-const ROPE_6DOF_LINEAR_SLACK: float = 0.02
-
-
-func _join_rope_pin(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: Vector3) -> void:
-	## Creates one PinJoint3D-equivalent constraint via the low-level
-	## PhysicsServer3D API directly, instead of a PinJoint3D node -- lets each
-	## body's local anchor point be declared EXPLICITLY and INDEPENDENTLY
-	## (`local_a`/`local_b`, in each body's own local space) rather than both
-	## being implicitly derived from a single shared world position at setup
-	## time (see this file's ROPE_PHYSICS_* consts' doc comment for the full
-	## root-cause history on why that matters). No Node3D is created for this
-	## at all -- the joint exists purely as a RID on the physics server, so
-	## _free_physics_rope() must explicitly free it (see
-	## _physics_rope_joint_rids' own comment).
-	if ROPE_USE_6DOF_JOINT:
-		_join_rope_6dof(a, local_a, b, local_b)
-		return
-	var joint_rid: RID = PhysicsServer3D.joint_create()
-	PhysicsServer3D.joint_make_pin(joint_rid, a.get_rid(), local_a, b.get_rid(), local_b)
-	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_BIAS, ROPE_JOINT_BIAS)
-	PhysicsServer3D.pin_joint_set_param(joint_rid, PhysicsServer3D.PIN_JOINT_DAMPING, ROPE_JOINT_DAMPING)
-	_physics_rope_joint_rids.append(joint_rid)
-
-
-func _join_rope_6dof(a: RigidBody3D, local_a: Vector3, b: RigidBody3D, local_b: Vector3) -> void:
-	## ROUND 14 lead 2: same "each body's local anchor point declared
-	## independently" principle as _join_rope_pin(), but via
-	## PhysicsServer3D.joint_make_generic_6dof() (real API confirmed against
-	## Godot 4.3's servers/physics_server_3d.h, not assumed) instead of
-	## joint_make_pin() -- stays inside Godot's own iterative constraint
-	## solver (collision-aware, unlike a from-scratch position correction),
-	## but exposes a per-axis linear limit RANGE instead of a single
-	## bias/damping pair. Each axis is given a tiny (not exactly zero) linear
-	## limit range around 0 (ROPE_6DOF_LINEAR_SLACK) with
-	## G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT on -- angular flags are left OFF
-	## (their default), so rotation stays fully free at every joint, same as
-	## a pin joint. local_frame_a/b use Basis.IDENTITY (aligned with each
-	## body's OWN local axes, which is where local_a/local_b -- e.g.
-	## Vector3(0, +-HALF_LEN, 0) -- already live) so the joint's axes track
-	## each capsule's own orientation as it rotates, not a world-fixed frame.
-	var joint_rid: RID = PhysicsServer3D.joint_create()
-	var frame_a := Transform3D(Basis.IDENTITY, local_a)
-	var frame_b := Transform3D(Basis.IDENTITY, local_b)
-	PhysicsServer3D.joint_make_generic_6dof(joint_rid, a.get_rid(), frame_a, b.get_rid(), frame_b)
-	for axis in [Vector3.AXIS_X, Vector3.AXIS_Y, Vector3.AXIS_Z]:
-		PhysicsServer3D.generic_6dof_joint_set_flag(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_FLAG_ENABLE_LINEAR_LIMIT, true)
-		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LOWER_LIMIT, -ROPE_6DOF_LINEAR_SLACK)
-		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_UPPER_LIMIT, ROPE_6DOF_LINEAR_SLACK)
-		# TEMP-TESTING: engine source (servers/physics_3d/joints/godot_generic_6dof_joint_3d.cpp,
-		# solveLinearAxis()) shows the position-correction term is
-		# `limitSoftness * (restitution * depth / timeStep - damping * rel_vel)` --
-		# i.e. `restitution` (NOT a dedicated ERP param -- none exists for the
-		# linear axes, only angular has G6DOF_JOINT_ANGULAR_ERP) is what scales
-		# how much of the positional error gets corrected per tick. Defaults
-		# (softness 0.7 / damping 1.0 / restitution 0.5) measured far worse than
-		# the pin joint baseline -- pushing all three well above default here to
-		# test whether it can be made competitively stiff at all.
-		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_LIMIT_SOFTNESS, 1.0)
-		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_RESTITUTION, 1.0)
-		PhysicsServer3D.generic_6dof_joint_set_param(joint_rid, axis, PhysicsServer3D.G6DOF_JOINT_LINEAR_DAMPING, 1.0)
-	_physics_rope_joint_rids.append(joint_rid)
+func _step_or_snap_2d(current: Vector2, target: Vector2, delta: float) -> Vector2:
+	## See ROPE_ANCHOR_MAX_SPEED/ROPE_ANCHOR_SNAP_THRESHOLD's own doc
+	## comments. A genuinely large gap (a real teleport, or the brief
+	## _ready()-vs-reset_for_round() ordering gap) SNAPS instantly; only a
+	## small gap (an animation clip-switch pop) gets rate-limited.
+	var gap: float = current.distance_to(target)
+	if gap > ROPE_ANCHOR_SNAP_THRESHOLD:
+		return target
+	return current.move_toward(target, ROPE_ANCHOR_MAX_SPEED * delta)
 
 
 func _update_physics_rope_anchors() -> void:
-	## Drives the two kinematic endpoints every physics tick -- called from
-	## _physics_process() unconditionally. The hand end tracks
-	## _get_rope_hand_anchor_pos(); the tip end tracks _get_rope_tip_target(),
-	## whatever the dart's current state (FLYING/ANCHORED/RECALLING) or, while
-	## idle, the hand itself -- so the chain is simulated continuously for the
-	## player's entire lifetime, not just while a dart is out.
+	## Drives the chain's two kinematic endpoints and advances its solver by
+	## one physics tick -- called from _physics_process() unconditionally.
+	## The hand end tracks _get_rope_hand_anchor_pos(); the tip end tracks
+	## _get_rope_tip_target(), whatever the dart's current state
+	## (FLYING/ANCHORED/RECALLING) or, while idle, the hand itself -- so the
+	## chain is simulated continuously for the player's entire lifetime, not
+	## just while a dart is out.
 	##
-	## No separate pacing/clamp mechanism drives how fast the chain unfolds or
-	## folds any more (the old ROPE_UNSPOOL_SLACK growing-leash sphere clamp
-	## and ROPE_TAUT_PERP_RADIUS taut-line tube clamp, both in
-	## rope_segment_body.gd, were deleted this round -- see this file's
-	## ROPE_PHYSICS_* consts' doc comment for why: they were exactly the kind
-	## of "compute where the rope should be, then force it there" correction
-	## the user's full architecture reset explicitly rejected). The chain's
-	## unfold/fold rate is now purely emergent from real joint-constraint
-	## propagation as the tip anchor moves; rope_segment_body.gd's
-	## MAX_SEGMENT_SPEED clamp (a per-body XZ speed cap, a legitimate
-	## physical-damping-style limit, not a position/path clamp) is the only
-	## remaining stability mechanism beyond the Y-plane lock.
-	##
-	## ROUND 28: the HAND anchor's own per-tick step is now speed-clamped via
-	## ROPE_ANCHOR_MAX_SPEED (see that const's own doc comment for the full
-	## root-cause writeup) -- a plain Vector3.move_toward() step-size bound,
-	## same "legitimate physical quantity" category as MAX_SEGMENT_SPEED, not
-	## a geometric correction. The TIP anchor is deliberately only clamped
-	## while dart == null (idle): _get_rope_tip_target() falls back to this
-	## SAME raw animated hand-bone position while idle, so it shares the
-	## exact same clip-switch-pop vulnerability -- but while a dart is
-	## actually thrown, the tip anchor must keep tracking the dart's own
-	## real (already smooth, already fast-by-design) flight/recall position
-	## with zero added lag: rope_dart.gd's own travel_speed can legitimately
-	## reach BASE_SPEED*2.0=36 units/sec at a full-charge throw and
-	## recall_speed is 24 units/sec, both already above ROPE_ANCHOR_MAX_SPEED
-	## -- clamping those would reintroduce exactly the kind of visible
-	## throw/recall tracking lag earlier rounds' rejected growing-leash/taut-
-	## line clamps were removed for.
-	if not _physics_rope_active:
+	## The TIP anchor is deliberately only speed-clamped while dart == null
+	## (idle): _get_rope_tip_target() falls back to the same raw animated
+	## hand-bone position while idle, sharing the exact same clip-switch-pop
+	## vulnerability the hand anchor has -- but while a dart is actually
+	## thrown, the tip must keep tracking the dart's own real (already
+	## smooth, already fast-by-design) flight/recall position with zero added
+	## lag: rope_dart.gd's own travel_speed can legitimately reach
+	## BASE_SPEED*2.0=36 units/sec at a full-charge throw and recall_speed is
+	## 24 units/sec, both already above ROPE_ANCHOR_MAX_SPEED -- clamping
+	## those would reintroduce visible throw/recall tracking lag.
+	if not _physics_rope_active or _rope_chain == null:
 		return
-	var anchor_delta: float = get_physics_process_delta_time()
-	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
-	if _physics_rope_hand_anchor != null:
-		_step_or_snap_anchor(_physics_rope_hand_anchor, hand_pos, anchor_delta)
-	var tip_pos: Vector3 = _get_rope_tip_target()
-	if _physics_rope_tip_anchor != null:
-		if dart == null:
-			_step_or_snap_anchor(_physics_rope_tip_anchor, tip_pos, anchor_delta)
-		else:
-			_physics_rope_tip_anchor.global_position = tip_pos
+	var delta: float = get_physics_process_delta_time()
 
+	var hand_pos_3d: Vector3 = _get_rope_hand_anchor_pos()
+	var hand_target: Vector2 = Vector2(hand_pos_3d.x, hand_pos_3d.z)
+	_hand_anchor_smoothed_2d = _step_or_snap_2d(_hand_anchor_smoothed_2d, hand_target, delta)
 
-func _step_or_snap_anchor(anchor: RigidBody3D, target: Vector3, delta: float) -> void:
-	## See ROPE_ANCHOR_MAX_SPEED/ROPE_ANCHOR_SNAP_THRESHOLD's own doc
-	## comments for the full root-cause writeup (ROUND 28, plus its own
-	## follow-up fix). Two distinct cases, not one uniform clamp: a genuinely
-	## large gap (bad/stale starting position, e.g. the _ready()-vs-
-	## reset_for_round() ordering gap, or any other future discrete
-	## reposition this function doesn't already know about) SNAPS instantly,
-	## exactly like the old unclamped code always did -- only a SMALL gap
-	## (the oversized-but-still-modest single-tick animation clip-switch pop
-	## this whole fix targets) gets rate-limited.
-	var gap: float = anchor.global_position.distance_to(target)
-	if gap > ROPE_ANCHOR_SNAP_THRESHOLD:
-		anchor.global_position = target
+	var tip_pos_3d: Vector3 = _get_rope_tip_target()
+	var tip_target: Vector2 = Vector2(tip_pos_3d.x, tip_pos_3d.z)
+	if dart == null:
+		_tip_anchor_smoothed_2d = _step_or_snap_2d(_tip_anchor_smoothed_2d, tip_target, delta)
 	else:
-		anchor.global_position = anchor.global_position.move_toward(target, ROPE_ANCHOR_MAX_SPEED * delta)
+		_tip_anchor_smoothed_2d = tip_target
+
+	_rope_chain.step(delta, _hand_anchor_smoothed_2d, _tip_anchor_smoothed_2d,
+		_rope_obstacle_rects(), ROPE_RADIUS, ROPE_INTERIOR_MAX_SPEED, ROPE_SOLVER_ITERATIONS)
 
 
 func get_rope_polyline_2d() -> Array[Vector2]:
 	## Ordered hand -> tip control points of the REAL, currently-simulated
-	## physics rope chain -- the exact same points _update_rope_tube_mesh()
-	## draws a curve through -- exposed for rope_dart.gd's own use during
-	## RECALLING (see its _get_hand_rope_path_2d()), so a returning dart can
-	## retrace the rope's real live shape (obstacle wrap included) instead of
-	## cutting a straight line back to wherever the owner currently stands.
+	## PBD chain -- the exact same points _update_rope_tube_mesh() draws a
+	## curve through -- exposed for rope_dart.gd's own use during RECALLING
+	## (see its _get_hand_rope_path_2d()), so a returning dart can retrace the
+	## rope's real live shape (obstacle wrap included) instead of cutting a
+	## straight line back to wherever the owner currently stands.
 	## Deliberately does NOT include the tip/dart's own position -- rope_dart.gd
 	## already knows its own head_2d with zero extra lag (this function's own
-	## tip anchor, by contrast, tracks the dart one physics tick behind), so
+	## tip point, by contrast, tracks the dart one physics tick behind), so
 	## callers that want the full hand -> ... -> dart path append their own
 	## current position themselves.
 	var points: Array[Vector2] = []
-	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
-	points.append(Vector2(hand_pos.x, hand_pos.z))
-	for seg in _physics_rope_segments:
-		var p3: Vector3 = (seg as RigidBody3D).global_position
-		points.append(Vector2(p3.x, p3.z))
+	if _rope_chain != null:
+		for p in _rope_chain.get_polyline_no_tip():
+			points.append(p as Vector2)
 	return points
-
-
-func _rope_chain_rest_length_2d(tip_2d: Vector2) -> float:
-	## RESTORED ROUND 21 (2026-07-29) -- see _rope_leash_pivot_and_radius()'s
-	## own doc comment for the full history (added ROUND 6, deleted ROUND 20,
-	## restored here). Used by _rope_leash_pivot_and_radius(): the real
-	## chain's own already-committed length from its FIRST dynamic segment
-	## (the link nearest the hand) through every remaining segment to the
-	## tip/anchor -- i.e. how much of the chain's fixed DART_ROPE_LENGTH
-	## capacity is already spent on whatever's happening between the first
-	## segment and the dart (a corner wrap, typically), leaving the rest as
-	## budget for the hand-to-first-segment span specifically. Deliberately
-	## excludes the hand->seg[0] leg (the caller supplies its own live hand
-	## position for that part). Returns 0.0 if there's no chain yet.
-	if _physics_rope_segments.is_empty():
-		return 0.0
-	var total: float = 0.0
-	var prev_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
-	for i in range(1, _physics_rope_segments.size()):
-		var p3: Vector3 = (_physics_rope_segments[i] as RigidBody3D).global_position
-		total += Vector2(prev_pos.x, prev_pos.z).distance_to(Vector2(p3.x, p3.z))
-		prev_pos = p3
-	var prev_2d := Vector2(prev_pos.x, prev_pos.z)
-	total += prev_2d.distance_to(tip_2d)
-	return total
 
 
 func _free_physics_rope() -> void:
 	## Only ever called from _exit_tree() now -- the chain is persistent for
-	## the whole lifetime of a player node (see this file's ROPE_PHYSICS_*
-	## consts' doc comment), not freed between throws or rounds. Raw
-	## PhysicsServer3D joints are independent RIDs, not owned by any node --
-	## queue_free()'ing the root below does NOT free these; must be done
-	## explicitly first or they leak for the lifetime of the process.
-	for joint_rid in _physics_rope_joint_rids:
-		if joint_rid.is_valid():
-			PhysicsServer3D.free_rid(joint_rid)
-	_physics_rope_joint_rids.clear()
-	if _physics_rope_root != null and is_instance_valid(_physics_rope_root):
-		_physics_rope_root.queue_free()
-	_physics_rope_root = null
-	_physics_rope_hand_anchor = null
-	_physics_rope_tip_anchor = null
-	_physics_rope_segments.clear()
+	## the whole lifetime of a player node. Unlike the old RigidBody3D +
+	## PhysicsServer3D chain, there is no RID/resource to explicitly free
+	## here -- RopeChainPBD is plain script data (Vector2 arrays), reclaimed
+	## by the garbage collector like any other object once _rope_chain is
+	## dropped.
+	_rope_chain = null
 	_physics_rope_active = false
 	if _physics_rope_tube_mesh != null:
 		_physics_rope_tube_mesh.visible = false
 
 
 func _reset_rope_chain_to_hand() -> void:
-	## ROUND 24 (2026-07-29) FIX -- see CLAUDE.md's own dated entry (and ROUND
-	## 23's audit immediately above it) for the full root-cause writeup. Must
-	## be called from EVERY real discrete player teleport -- confirmed to be
-	## exactly two production call sites, reset_for_round() and _respawn()
+	## Must be called from EVERY real discrete player teleport -- confirmed to
+	## be exactly two production call sites, reset_for_round() and _respawn()
 	## (ring-outs/_start_fall() already funnel into kill()->_respawn(), and
 	## game_manager.gd's start_round() is the only caller of reset_for_round()
 	## in both local and online flow, so there is no third path).
 	##
-	## POST-ROUND-22-REVERT NOTE (2026-07-30): this function was originally
-	## written against ROUND 22's free-drag-tip architecture
-	## (_make_rope_tip_body(), a tip anchor that unfreezes into a dynamic
-	## body while idle). ROUND 22 was reverted (never merged to main; real,
-	## measured multi-test regressions -- see that round's own CLAUDE.md
-	## entry) so this function has been adapted back to the standing
-	## architecture: _physics_rope_tip_anchor is ALWAYS a kinematic
-	## _make_rope_anchor_body(), driven every tick by
-	## _update_physics_rope_anchors() to _get_rope_tip_target() (the dart's
-	## live pommel position while thrown, the hand's own position while idle
-	## -- see that function's own doc comment). There is no freeze-state to
-	## manage here any more; resetting the tip anchor is exactly as simple as
-	## resetting the hand anchor, just to a different point. See the tip-anchor
-	## handling below (adapted from ROUND 24's original is_thrown/freeze
-	## branch, which no longer applies).
-	##
-	## Without this, the chain's ROPE_PHYSICS_SEGMENTS dynamic segments are
-	## real, independent RigidBody3D physics bodies that stay exactly wherever
-	## they physically were at the moment of the teleport (built once in _ready(),
-	## never rebuilt -- see _spawn_physics_rope()'s own doc comment, "the
-	## chain is persistent for the whole lifetime of a player node"). Only the
-	## chain's kinematic HAND anchor gets corrected every tick (see
-	## _update_physics_rope_anchors()); the dynamic segments get violently
-	## "reeled in" toward the new hand position over the following 1-5+ real
-	## seconds, sweeping straight through whatever real obstacle geometry
-	## happens to lie on the path between the stale pre-teleport position and
-	## the new one. ROUND 23's own isolated reproduction
-	## (tests/test_teleport_chain_drag_penetration.gd) measured this at
-	## max_pillar_pen=0.9752 sustained across 157 ticks (~2.6s), chain reach
-	## spiking to 22.5 units (>3x DART_ROPE_LENGTH) before settling.
-	##
-	## This is a genuine, one-time, discrete physics-state reset via
-	## PhysicsServer3D.body_set_state() -- NOT a per-frame "compute where it
-	## should be and force it" correction (that whole class of fix was already
-	## tried and explicitly rejected by the user for the rope's SHAPE -- see
-	## ROUND 4's entry above -- this is a different thing: a one-time snap at
-	## a well-defined discrete game-state transition, exactly the same
-	## category of operation as _spawn_physics_rope()'s own one-time initial
-	## layout, just re-triggered at every teleport instead of only once at
-	## _ready()). Zeroes each body's linear AND angular velocity in the same
-	## call so no residual momentum from the old position carries over into
-	## the new one.
-	##
-	## Collapses the chain into the exact same "small bunch near the hand,
-	## laid out along the current hand->tip span direction" configuration
-	## _spawn_physics_rope() already uses for a brand new chain -- this is the
-	## chain's own natural idle-collapsed rest shape, not a newly-invented
-	## pose.
-	##
-	## ROUND 24 FOLLOW-UP (same round, found via this round's own new
-	## multi-cycle regression test, tests/test_repeated_respawn_soak.gd --
-	## NOT caught by the single-teleport reproduction above, which only ever
-	## exercises ONE reset from a freshly-_ready()-built chain): repositioning
-	## bodies alone is NOT sufficient for every REPEATED reset. Measured
-	## directly: a soak of 24 back-to-back reset_for_round()/kill()-
-	## >_respawn() cycles (alternating two spawn points on opposite sides of
-	## PillarA) showed a real, large (up to 0.92), near-instant (tick 1 after
-	## the reset) penetration specifically whenever the NEW spawn point
-	## happened to land close to a DIFFERENT real obstacle (PillarB, ~2.8
-	## units from one of the two test spawn points) -- 100% reproducible on
-	## every cycle landing near PillarB, 0.0000 on every cycle landing far
-	## from every obstacle, across 12 repeated cycles each. Root cause: the
-	## raw PhysicsServer3D pin joints (_join_rope_pin()) are never recreated
-	## by a reset -- only REPOSITIONED bodies are. Godot's iterative solver
-	## keeps per-joint warm-start impulse accumulator state ACROSS physics
-	## steps for fast convergence (a real, standard, deliberate Godot
-	## optimization, not a bug in the engine) -- external
-	## PhysicsServer3D.body_set_state() calls reset each BODY's own transform/
-	## velocity, but do NOT reset the JOINT's own separate accumulated-impulse
-	## state left over from whatever large constraint violation the chain was
-	## experiencing the instant before this reset fires (e.g. mid whip-crack
-	## idle drift, or a real thrown-dart wrap -- both plausible immediately
-	## before a mid-round kill). The very first solve step after a reposition
-	## then applies that STALE impulse against the NEW (small, correct)
-	## positions, producing an erroneous one-tick "kick" large enough to
-	## tunnel a segment through nearby geometry. This is exactly why the
-	## FIRST-ever chain build (fresh joint_create() calls, zero warm-start
-	## history) already verified clean in
-	## test_teleport_chain_drag_penetration.gd, while a REPEATED reset of an
-	## already-existing, already-joint-connected chain did not, until this
-	## fix.
-	##
-	## The fix: destroy and recreate every joint in the chain as part of this
-	## same reset (mirrors _spawn_physics_rope()'s own joint-creation loop
-	## exactly, via the shared _join_rope_pin() helper) -- guarantees zero
-	## residual solver state, the same guarantee a genuinely fresh chain
-	## already has. This is still a one-time, discrete, well-defined-
-	## transition operation (freeing+recreating a handful of RIDs once per
-	## teleport), not a per-frame correction.
-	if not _physics_rope_active:
+	## Collapses the chain into the exact same "every point coincides with
+	## the hand" configuration _init_rope_chain() already uses for a brand
+	## new chain -- this is the chain's own natural idle-collapsed rest
+	## shape, not a newly-invented pose. Unlike the old RigidBody3D chain,
+	## there is no joint/impulse solver state that can go stale across a
+	## reset (see rope_chain_pbd.gd's own class doc comment for why a PBD
+	## chain has no such state at all) -- a plain reset_to_point() is the
+	## whole fix, with none of the old chain's own "must also destroy and
+	## recreate every joint RID or the solver's warm-start history reproduces
+	## the bug on a SECOND reset" follow-up complexity.
+	if not _physics_rope_active or _rope_chain == null:
 		return
+	var hand_pos_3d: Vector3 = _get_rope_hand_anchor_pos()
+	var hand_2d := Vector2(hand_pos_3d.x, hand_pos_3d.z)
+	_rope_chain.reset_to_point(hand_2d)
+	_hand_anchor_smoothed_2d = hand_2d
+	_tip_anchor_smoothed_2d = hand_2d
 
-	var hand_pos: Vector3 = _get_rope_hand_anchor_pos()
-	var tip_target: Vector3 = _get_rope_tip_target()
-
-	var span: Vector3 = tip_target - hand_pos
-	var span_dir: Vector3
-	if span.length() > 0.01:
-		span_dir = span.normalized()
-	else:
-		span_dir = Vector3(aim_dir.x, 0.0, aim_dir.y).normalized()
-	if span_dir.length() < 0.01:
-		span_dir = Vector3.FORWARD
-
-	var y_axis: Vector3 = span_dir
-	var basis_seed: Vector3 = Vector3.RIGHT if absf(y_axis.dot(Vector3.UP)) > 0.99 else Vector3.UP
-	var x_axis: Vector3 = basis_seed.cross(y_axis).normalized()
-	var z_axis: Vector3 = x_axis.cross(y_axis).normalized()
-	var seg_basis := Basis(x_axis, y_axis, z_axis)
-
-	if _physics_rope_hand_anchor != null:
-		_reset_rope_body_state(_physics_rope_hand_anchor, Transform3D(Basis.IDENTITY, hand_pos))
-
-	var denom: float = float(maxi(ROPE_PHYSICS_SEGMENTS - 1, 1))
-	var spacing: float = ROPE_BUNCH_SPACING / denom
-	for i in range(_physics_rope_segments.size()):
-		var seg: RigidBody3D = _physics_rope_segments[i]
-		var seg_center: Vector3 = hand_pos + span_dir * (float(i) * spacing)
-		_reset_rope_body_state(seg, Transform3D(seg_basis, seg_center))
-
-	if _physics_rope_tip_anchor != null:
-		# Standing architecture (post-ROUND-22-revert): the tip anchor is
-		# ALWAYS kinematic, driven every tick by _update_physics_rope_anchors()
-		# to _get_rope_tip_target() regardless of thrown/idle state -- so
-		# resetting it here to that same tip_target (already computed above,
-		# identically to what _spawn_physics_rope() does for a brand new
-		# chain's own tip placement) is correct in both cases: while thrown it
-		# snaps to the dart's real (unteleported) position instead of lagging
-		# a tick behind; while idle it snaps to the hand, matching the bunch
-		# the dynamic segments above were just reset into.
-		_reset_rope_body_state(_physics_rope_tip_anchor, Transform3D(Basis.IDENTITY, tip_target))
-
-	_rebuild_rope_joints()
-
-
-func _rebuild_rope_joints() -> void:
-	## See _reset_rope_chain_to_hand()'s own "ROUND 24 FOLLOW-UP" doc comment
-	## for the full root-cause writeup on why repositioning bodies alone isn't
-	## enough for a REPEATED reset. Frees every existing joint RID (each
-	## joint's own accumulated warm-start impulse state dies with it -- there
-	## is no PhysicsServer3D API to reset that state on an existing joint in
-	## place) and recreates the exact same chain topology
-	## _spawn_physics_rope() builds, using the same _join_rope_pin() helper
-	## and the same local anchor points (each capsule's own ends,
-	## ROPE_PHYSICS_SEGMENT_HALF_LENGTH along local Y) -- every joint born
-	## here starts with zero solver history, identical to a genuinely fresh
-	## chain build.
-	for joint_rid in _physics_rope_joint_rids:
-		if joint_rid.is_valid():
-			PhysicsServer3D.free_rid(joint_rid)
-	_physics_rope_joint_rids.clear()
-
-	if _physics_rope_hand_anchor == null or _physics_rope_tip_anchor == null:
-		return
-
-	var local_far := Vector3(0.0, ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
-	var local_near := Vector3(0.0, -ROPE_PHYSICS_SEGMENT_HALF_LENGTH, 0.0)
-
-	var prev: RigidBody3D = _physics_rope_hand_anchor
-	var prev_local_far := Vector3.ZERO
-	for seg in _physics_rope_segments:
-		_join_rope_pin(prev, prev_local_far, seg as RigidBody3D, local_near)
-		prev = seg
-		prev_local_far = local_far
-	_join_rope_pin(prev, prev_local_far, _physics_rope_tip_anchor, Vector3.ZERO)
-
-
-func _reset_rope_body_state(body: RigidBody3D, xform: Transform3D) -> void:
-	## Instant, discrete physics-state reset for one rope chain body -- see
-	## _reset_rope_chain_to_hand()'s own doc comment for why body_set_state()
-	## (not global_transform/global_position, and not a per-frame correction)
-	## is the right primitive here: it hard-sets the physics server's own
-	## authoritative transform AND wipes any residual velocity in the same
-	## call, so the body can't carry stale momentum from wherever it was
-	## before the teleport into its new position.
-	var rid: RID = body.get_rid()
-	PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_TRANSFORM, xform)
-	PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
-	PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY, Vector3.ZERO)
 
 
 func _update_rope_tube_mesh() -> void:
 	## Rebuilds one continuous ArrayMesh every _process() frame, tracing a
-	## smooth Catmull-Rom curve through the REAL physics chain's own control
-	## points [hand anchor, every dynamic segment's center, tip anchor] (in
-	## that order -- matches the actual joint chain order from
-	## _spawn_physics_rope()) and extruding a round tube of ROPE_RADIUS along
-	## it (see _build_tube_mesh()). The underlying RigidBody3D segments and
-	## their capsule collision shapes are completely unchanged by this -- they
-	## still exist, still collide with real obstacle geometry, and still
-	## drive this curve's shape; only what gets DRAWN from their positions
-	## changed, from N disjoint capsule meshes to one smooth surface. NO
-	## obstacle-awareness or correction happens in this function or in
-	## _compute_rope_tube_curve_points() below -- see this file's
-	## ROPE_PHYSICS_* consts' doc comment for why that was deleted wholesale
-	## this round.
-	if _physics_rope_root == null or _physics_rope_hand_anchor == null or _physics_rope_tip_anchor == null:
-		return
-	if _physics_rope_segments.size() != ROPE_PHYSICS_SEGMENTS:
+	## smooth Catmull-Rom curve through the REAL PBD chain's own control
+	## points [hand, every interior point, tip] (in that order -- matches
+	## RopeChainPBD.points exactly) and extruding a round tube of ROPE_RADIUS
+	## along it (see _build_tube_mesh()). The underlying chain and its real
+	## obstacle-collision correction are completely unchanged by this -- only
+	## what gets DRAWN from its positions changed, from N disjoint segments to
+	## one smooth surface. NO obstacle-awareness or correction happens in
+	## this function or in _compute_rope_tube_curve_points() below -- that all
+	## already happened inside RopeChainPBD.step() itself.
+	if _rope_chain == null or _rope_chain.points.size() != ROPE_PHYSICS_SEGMENTS + 1:
 		return
 
 	if _physics_rope_tube_mesh == null:
 		var mi := MeshInstance3D.new()
 		mi.name = "RopeTubeMesh"
-		# top_level = true: every control point below comes from
-		# .global_position reads (already WORLD space) -- a non-top_level
+		# top_level = true: every control point below comes from a 2D chain
+		# point reconstructed into WORLD-space Vector3 -- a non-top_level
 		# MeshInstance3D would render that already-global vertex data through
 		# its own parent-derived global_transform too, double-transforming it
 		# (see git history for the original root-caused bug this fixed: a
@@ -2335,10 +1607,11 @@ func _update_rope_tube_mesh() -> void:
 		add_child(mi)
 		_physics_rope_tube_mesh = mi
 
-	var control_points: Array[Vector3] = [_physics_rope_hand_anchor.global_position]
-	for seg in _physics_rope_segments:
-		control_points.append((seg as RigidBody3D).global_position)
-	control_points.append(_physics_rope_tip_anchor.global_position)
+	var plane_y: float = _get_rope_plane_y()
+	var control_points: Array[Vector3] = []
+	for p in _rope_chain.points:
+		var p2: Vector2 = p
+		control_points.append(Vector3(p2.x, plane_y, p2.y))
 
 	var curve_points: Array[Vector3] = _compute_rope_tube_curve_points(control_points)
 	_build_tube_mesh(_physics_rope_tube_mesh, curve_points, ROPE_RADIUS, ROPE_TUBE_RADIAL_SEGMENTS)
@@ -2475,194 +1748,112 @@ func _perform_slash() -> void:
 			p.trip()
 
 
-func _rope_leash_pivot_and_radius() -> Array:
-	## Returns [pivot: Vector2, radius: float] describing the current tether
-	## boundary circle, or [] if no leash constraint applies this tick (no
-	## dart, or not ANCHORED). Pure read -- computes but never applies
-	## anything; see _apply_rope_leash_velocity_clamp() for the caller that
-	## actually acts on this.
-	##
-	## ROUND 21 (2026-07-29) -- WRAP-AWARE BOUND RESTORED, per direct user
-	## report: "The rope is too long when it's wrapped around the map object.
-	## Even when the rope is not straight the max length shouldn't change. It
-	## should always be fixed." ROUND 20 (55348f7) made this function
-	## unconditionally return [anchor, DART_ROPE_LENGTH] -- a flat circle
-	## around the anchor regardless of how much of the rope's real length was
-	## already spent wrapping a corner. That is what let a player stand at a
-	## position where the STRAIGHT-LINE distance to the anchor reads as
-	## exactly DART_ROPE_LENGTH while the REAL wrapped path (hand -> around
-	## the corner -> dart) is longer than DART_ROPE_LENGTH -- i.e. the rope's
-	## fixed physical budget being asked to stretch past its own capacity,
-	## which is precisely "the rope is too long when wrapped." Restoring the
-	## wrap-aware branch is NOT a reversal of ROUND 19/20's own standing
-	## preference -- it addresses a DIFFERENT axis of the same mechanic:
-	##   - ROUND 19's requirement (still in full effect, untouched by this
-	##     round): the boundary must be ENFORCED without teleporting the
-	##     player's canonical position -- _apply_rope_leash_velocity_clamp()'s
-	##     velocity-projection mechanism stays exactly as ROUND 19 built it.
-	##   - ROUND 20's requirement, re-read correctly: "the max length should
-	##     be total rope length" means the TOTAL REAL ROPE BUDGET
-	##     (DART_ROPE_LENGTH) must never be exceeded, wrapped or not -- it was
-	##     never a request to pretend a wrap doesn't consume real rope. A flat
-	##     circle around the anchor, ignoring wrap geometry entirely, actually
-	##     VIOLATES "max length is always fixed" the moment a wrap is
-	##     involved, since it lets the real total path (hand -> wrap -> dart)
-	##     run past DART_ROPE_LENGTH while still reporting the boundary as
-	##     satisfied.
-	## Two possible bounds, restored to their exact ROUND 6/7 form (verified
-	## still correct against this round's own re-run -- see
-	## tests/test_rope_leash_corner_wrap.gd's numbers in CLAUDE.md):
-	## 1. WRAP-AWARE: while at least one segment is genuinely resting against
-	##    real obstacle contact (rope_segment_body.gd's own
-	##    `_debug_last_has_contact`, an unambiguous "the solver actually put
-	##    this segment here" signal -- see ROUND 5's clipping fix), pivot on
-	##    the chain's own first dynamic segment (always topologically nearest
-	##    the hand) with the radius shrunk by _rope_chain_rest_length_2d() --
-	##    the REAL, already-simulated remaining chain length from that
-	##    segment to the tip, wrap included. This reads real physics state,
-	##    not a computed corner/route: a segment resting against real contact
-	##    is exactly where the solver put it -- NOT synthetic/invented
-	##    geometry, which is what ROUND 19/20's own objection was actually
-	##    about (see doc comment on _apply_rope_leash_velocity_clamp()).
-	## 2. FALLBACK: a plain circle of radius DART_ROPE_LENGTH around the
-	##    anchor itself -- covers the tick(s) before the physics chain
-	##    exists/settles, and by the triangle inequality is always at least
-	##    as permissive as bound 1, so returning bound 1 alone (when it
-	##    applies) is always the stricter, correct choice -- no need to
-	##    intersect both.
-	if dart == null or dart.state != DART_STATE_ANCHORED:
-		return []
-	var anchor: Vector2 = dart.head_2d
-
-	if not debug_disable_wrap_leash and _physics_rope_active and not _physics_rope_segments.is_empty():
-		var any_obstacle_contact: bool = false
-		for seg in _physics_rope_segments:
-			if bool((seg as RigidBody3D).get("_debug_last_has_contact")):
-				any_obstacle_contact = true
-				break
-		if any_obstacle_contact:
-			var first_seg_pos: Vector3 = (_physics_rope_segments[0] as RigidBody3D).global_position
-			var first_2d := Vector2(first_seg_pos.x, first_seg_pos.z)
-			var rest_len: float = _rope_chain_rest_length_2d(anchor)
-			if rest_len < DART_ROPE_LENGTH:
-				return [first_2d, DART_ROPE_LENGTH - rest_len]
-
-	return [anchor, DART_ROPE_LENGTH]
-
-
 func _apply_rope_leash_velocity_clamp(delta: float) -> void:
-	## ROUND 21 (2026-07-29) note: _rope_leash_pivot_and_radius() above had
-	## its wrap-aware bound restored this round (see that function's own doc
-	## comment). This function -- the ENFORCEMENT mechanism -- is completely
-	## untouched: it still only ever projects velocity before move_and_slide()
-	## and never teleports global_position, exactly as ROUND 19 built it. The
-	## user's ROUND 19/20 objection was about the teleport and, per ROUND 20's
-	## own framing, about not wanting a computed formula standing in for real
-	## physics state -- restoring wrap-awareness here doesn't reintroduce
-	## either: the bound is read from the chain's own real, already-simulated
-	## positions (_rope_chain_rest_length_2d(), gated on real obstacle
-	## contact), not invented geometry, and however that bound moves tick to
-	## tick, it is still only ever enforced via this same velocity projection,
-	## never a position snap.
+	## NO PIVOT, NO RADIUS, NO CIRCLE -- per the user's own exact, direct
+	## requirement this round: "There shouldn't be any radius to compute.
+	## Regardless of anchored or not, the rope bar should be attached to the
+	## next rope bar and never separate. When the rope bars are stretched
+	## completely, character cannot move further." This replaces the old
+	## _rope_leash_pivot_and_radius()'s synthetic pivot+radius circle (and its
+	## own special-cased "is a segment resting on real obstacle contact"
+	## wrap-aware branch) with a DIRECT measurement of the real, already-
+	## simulated PBD chain.
 	##
-	## TELEPORT-FREE LEASH REDESIGN (2026-07-28, direct, explicit user
-	## requirement: "The max length of the rope shouldn't be computed between
-	## the dart and the character" -- confirmed via clarifying question to
-	## mean this function's PREDECESSOR, the old _clamp_to_rope_leash(), which
-	## every round from ROUND 6 onward (see git history/CLAUDE.md) had
-	## computed a pivot+radius exactly as _rope_leash_pivot_and_radius() above
-	## still does, then SNAPPED global_position onto that circle's boundary
-	## whenever the player's real position was found to be outside it --
-	## instant, discontinuous, once per violating tick). The user's own
-	## standing, repeated preference across this whole rope saga (going back
-	## to the very first "I want it to be a physics object" round) is no
-	## computed-formula-then-force-it correction of anything the real
-	## simulation is supposed to be authoritative over -- and unlike the
-	## rope's OWN rendering/shape (already fully real-physics-driven since the
-	## ROUND 12 architecture reset), the player's canonical position was still
-	## being teleported by a plain distance formula every time it happened to
-	## be found on the wrong side of a computed boundary.
+	## USED LENGTH (how much of the fixed DART_ROPE_LENGTH budget is
+	## currently spent) is the LARGER (more restrictive -- i.e. less
+	## remaining slack) of two independent, real, non-invented measurements:
+	##  1. RopeChainPBD.total_extension_2d() -- the chain's own real,
+	##     currently-simulated total path length, hand to tip. Correctly
+	##     wrap-aware (routing around a real obstacle corner consumes more of
+	##     the chain's own real length, which shows up here directly, no
+	##     special-cased branch) -- but DEPENDS on the solver having fully
+	##     converged this exact tick.
+	##  2. The straight-line distance from the hand to the dart's own real
+	##     anchor point -- always exact and instant (two point positions, no
+	##     solver/convergence involved), and mathematically guaranteed to
+	##     never exceed the chain's true total capacity for any valid rope
+	##     configuration -- not itself wrap-aware, so only used as a
+	##     convergence-independent SAFETY FLOOR, not the primary signal.
+	## FOUND via a dedicated isolated diagnostic this round (a sustained,
+	## continuous outward push, not a one-off nudge): using
+	## total_extension_2d() ALONE let a genuine, severe runaway feedback loop
+	## through -- under CONTINUOUS outward pushing, the chain's own solver,
+	## perpetually catching up to a hand target that keeps moving every
+	## single tick, can under-report its true extension for many consecutive
+	## ticks (see rope_chain_pbd.gd's own "KNOWN, DISCLOSED RESIDUAL" doc
+	## comment on convergence lag under sustained forcing), which read as
+	## MORE slack than physically real and let the player run to 15+ units
+	## from a 7.2-unit-max anchor within one second. The straight-line floor
+	## fixes this because it can never itself accumulate a lag-driven error.
 	##
-	## HYPOTHESIS TESTED FIRST, DIRECTLY, BEFORE CHANGING ANYTHING (per this
-	## round's own explicit verification protocol): does the old position-snap
-	## itself explain the still-unsolved ROUND 17/18 anchored steady-state
-	## jitter (rope visibly reshaping while the player stands still near a
-	## pillar)? A new instrumented run of
-	## tests/test_rope_physics_chain_settle.gd's own steady-state jitter probe
-	## (see that file's own "LEASH-CLAMP-FIRING" instrumentation, added this
-	## round) -- with GameManager.current_state ALSO corrected to PLAYING for
-	## the first time in that test file's history (previously LOBBY the whole
-	## run, which meant the old clamp's own call site in _physics_process()
-	## was UNREACHABLE the entire time ROUND 17/18 were measuring "steady-
-	## state jitter," a genuine methodology gap this round found and fixed) --
-	## measured `player_pos_fire_events = 0/360` in EVERY one of the 5 real
-	## configs, including `corner_wrap_anchor` (100% real obstacle contact the
-	## whole window) and `open_air_taut` (zero-slack, right at the boundary),
-	## even while those same two configs' own segment jitter stayed at their
-	## already-known-and-still-unexplained ~0.06-0.075 units/tick. **The old
-	## clamp never fired even once during this specific stationary-near-a-
-	## pillar reproduction** -- a stationary player who starts within their
-	## own tether radius stays there forever with zero input, so there was
-	## nothing for a position-snap to correct in that scenario. HYPOTHESIS
-	## REFUTED for the passive-standing-still bug report specifically -- the
-	## still-open ROUND 17/18 jitter has some other, still-unknown cause. (A
-	## DIFFERENT, still-real scenario where the old clamp WAS proven to fire
-	## repeatedly: tests/test_rope_leash_corner_wrap.gd's own adversarial
-	## sweep, where a player actively pushes outward against the tether every
-	## tick -- that test's own historical fold-jump numbers are exactly what a
-	## repeatedly-firing position snap looks like. This redesign still fixes
-	## that mechanism even though it wasn't the passive-jitter bug's own
-	## cause -- see the re-measurement in this round's own final report.)
+	## PULL DIRECTION -- also corrected this round, after TWO separate wrong
+	## attempts each caught by the same isolated diagnostic: (1) an initial
+	## `points[0] - points[1]` (single adjacent link) direction was
+	## unreliable whenever that ONE link specifically still had slack even
+	## while the chain overall read as taut; (2) a follow-up "direction to
+	## the chain's own farthest point from the hand" was WRONG-SIGNED (and,
+	## worse, wrong-signed in a way that only surfaces once a player has been
+	## pushed PAST the anchor and kept going, since up to that point the
+	## farthest chain point and the real anchor happen to point the same
+	## way) -- once the hand has traveled far past the rest of the chain,
+	## the "farthest point from hand" is the anchor END of the chain, so
+	## `farthest_point - hand` points BACK toward the anchor (inward), the
+	## opposite of the player's real outward direction of travel. The
+	## correct, general, always-valid pull direction is simply the gradient
+	## of "distance from the real anchor point" -- `hand - dart.head_2d`,
+	## normalized -- which is unambiguous and correct in every configuration
+	## (taut, slack, wrapped, or a player who has already overshot past the
+	## anchor and kept moving in the same direction), since dart.head_2d is
+	## a single FIXED real point while ANCHORED, not something that can flip
+	## sides the way a chain-shape-derived point can. Wrap-awareness is
+	## carried entirely by the MAGNITUDE side (used_length/slack) above, not
+	## by this direction -- a real, disclosed simplification: a player moving
+	## purely TANGENTIALLY around a wrap corner (not increasing straight-line
+	## hand-to-anchor distance) won't have that specific tangential motion
+	## restricted by this direction alone, even if it's consuming real wrap
+	## slack. Not observed as a problem in this round's own soak, but worth
+	## revisiting if a future report specifically describes "sliding along a
+	## wrapped corner past where the rope should stop it."
 	##
-	## THE REDESIGN: instead of correcting POSITION after move_and_slide(),
-	## this projects VELOCITY before it -- called from _physics_process()
-	## right before move_and_slide(), never after. Decomposes the player's
-	## already-computed velocity into a radial component (along the line from
-	## the tether pivot to the player's CURRENT, real position) and a
-	## tangential component; only the OUTWARD radial component is ever
-	## reduced, and only down to the exact amount of remaining budget this
-	## tick (`(radius - cur_dist) / delta`), never below zero and never touching
-	## the tangential component at all -- so pushing straight out against a
-	## taut tether smoothly decelerates to a dead stop exactly at the
-	## boundary (never overshoots, never needs correcting after the fact,
-	## because it was never allowed to move past the boundary to begin with),
-	## while pushing at an angle keeps sliding freely along the boundary, the
-	## same "run at an angle along the tether's edge" feel the old function's
-	## own doc comment described -- just achieved by never letting the
-	## over-limit motion happen, instead of happening then being undone.
-	## Inward motion (radial_component <= 0) is never touched at all.
-	##
-	## Known, disclosed limitation: this clamps velocity based on the
-	## PREDICTED tick, but move_and_slide() can itself still reduce the
-	## actual travel distance below that prediction (sliding against an
-	## obstacle collision elsewhere) -- in principle a tick could therefore
-	## still end up compounding with the next tick's own fresh radial budget
-	## in a way that's not bit-for-bit identical to a perfect continuous
-	## constraint. This is the same class of small, bounded, per-tick
-	## tolerance this codebase already accepts elsewhere (e.g. the corner-wrap
-	## fix's own MAX_ACCEPTABLE_OVERSHOOT), not a new category of risk, and
-	## unlike the old design it can never manifest as a discontinuous jump --
-	## only, at most, a few extra ticks to fully settle at the boundary.
-	var bound: Array = _rope_leash_pivot_and_radius()
-	if bound.is_empty():
+	## ENFORCEMENT MECHANISM is UNCHANGED from the prior design (ROUND 19,
+	## 2026-07-28): velocity is projected BEFORE move_and_slide() runs, never
+	## a position snap after the fact -- decomposes the player's already-
+	## computed velocity into a component along the outward direction and a
+	## perpendicular component; only the outward component is ever reduced,
+	## and only down to the exact amount of remaining slack budget this tick,
+	## never below zero and never touching the perpendicular component at
+	## all -- so pushing straight out against a taut rope smoothly
+	## decelerates to a dead stop exactly at the boundary, while pushing at
+	## an angle keeps sliding freely. Inward motion (slackening) is never
+	## touched at all.
+	if dart == null or not is_instance_valid(dart) or dart.state != DART_STATE_ANCHORED:
 		return
-	var pivot: Vector2 = bound[0]
-	var radius: float = bound[1]
-	var pos: Vector2 = get_pos_2d()
-	var cur_offset: Vector2 = pos - pivot
-	var cur_dist: float = cur_offset.length()
-	if cur_dist < 0.0001 or delta <= 0.0:
-		return  # degenerate (at the pivot, or a zero/negative delta) -- nothing to project
-	var radial_dir: Vector2 = cur_offset / cur_dist
+	if _rope_chain == null or _rope_chain.points.size() < 2:
+		return
+	if delta <= 0.0:
+		return
+
+	var hand_2d: Vector2 = _rope_chain.points[0]
+	var chain_extension: float = _rope_chain.total_extension_2d()
+	var straight_line_used: float = hand_2d.distance_to(dart.head_2d)
+	var used_length: float = maxf(chain_extension, straight_line_used)
+	var slack: float = DART_ROPE_LENGTH - used_length
+
+	var pull_vec: Vector2 = hand_2d - dart.head_2d
+	if pull_vec.length() < 0.0001:
+		return  # degenerate: hand exactly coincides with the anchor
+	var pull_dir: Vector2 = pull_vec.normalized()
+
 	var vel_2d: Vector2 = Vector2(velocity.x, velocity.z)
-	var radial_component: float = vel_2d.dot(radial_dir)
+	var radial_component: float = vel_2d.dot(pull_dir)
 	if radial_component <= 0.0:
-		return  # moving inward or purely tangential -- never restricted
-	var max_radial_component: float = maxf((radius - cur_dist) / delta, 0.0)
+		return  # moving inward (slackening) or purely tangential -- never restricted
+	var max_radial_component: float = maxf(slack, 0.0) / delta
 	if radial_component > max_radial_component:
-		vel_2d -= radial_dir * (radial_component - max_radial_component)
+		vel_2d -= pull_dir * (radial_component - max_radial_component)
 		velocity.x = vel_2d.x
 		velocity.z = vel_2d.y
+
 
 
 func _check_boundary_fall() -> void:

@@ -3,18 +3,13 @@ extends StaticBody3D
 ## thrown dagger against its footprint (see get_rect_2d(), a simple 2D
 ## swept-rect test — no physics-engine query needed for that).
 
-## Layer 2 (named "rope_obstacles" in project.godot's [layer_names]) is added
-## on top of whatever collision_layer this node already has (normally the
-## default layer 1, left untouched so every existing raycast/query that hits
-## obstacles via the default layer keeps working unchanged) -- this is the
-## dedicated bit player.gd's real physics rope chain (see
-## _spawn_physics_rope() there) uses as its collision_mask, so the rope reacts
-## to real map geometry (pillars, trees/cacti) without ever being able to
-## detect/collide with players, the ground, or the dart head (none of which
-## carry this bit). No shared constant between the two scripts -- see
-## player.gd's ROPE_OBSTACLE_LAYER_BIT comment for this codebase's existing
-## precedent of tolerating small hand-synced duplication like this.
-const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
+## NOTE: this node used to also carry a dedicated "rope_obstacles" collision
+## layer bit (layer 2) so the old RigidBody3D + PhysicsServer3D rope chain's
+## segments could react to real obstacle geometry via a physics-engine
+## collision_mask. The rope is now a PBD chain (see scripts/rope_chain_pbd.gd)
+## that reads this node's own get_rect_2d() directly for its collision
+## correction -- a plain 2D check, no physics-engine layer/mask needed for
+## that any more -- so the extra layer bit was removed as dead weight.
 
 @export var half_size: Vector2 = Vector2(0.75, 0.75)
 
@@ -32,7 +27,6 @@ var _outline_hull: PackedVector2Array = []
 
 func _ready() -> void:
 	add_to_group("obstacles")
-	collision_layer = collision_layer | ROPE_OBSTACLE_LAYER_BIT
 	_compute_outline_hull()
 
 

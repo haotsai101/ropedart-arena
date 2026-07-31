@@ -114,19 +114,16 @@ func _run() -> void:
 		if tick < 40:
 			var dart_state: Variant = player.dart.state if player.dart != null and is_instance_valid(player.dart) else null
 			var diag := ""
-			if player.dart != null and is_instance_valid(player.dart) and dart_state == 1 and not player._physics_rope_segments.is_empty():
-				# ROUND 21 (2026-07-29): the wrap-aware bound was restored to
-				# _rope_leash_pivot_and_radius() (see player.gd's own doc
-				# comment there) -- this diag now calls the real function
-				# directly instead of hardcoding the flat-circle formula, so
-				# it stays accurate regardless of which branch is live.
-				var bound: Array = player._rope_leash_pivot_and_radius()
-				if not bound.is_empty():
-					var pivot: Vector2 = bound[0]
-					var radius: float = bound[1]
-					var offset_len: float = (pos - pivot).length()
-					diag = " pivot=%s radius=%.4f offset_len=%.4f (violates=%s)" % [
-						pivot, radius, offset_len, offset_len > radius]
+			if player.dart != null and is_instance_valid(player.dart) and dart_state == 1 and player._rope_chain != null:
+				# ADAPTED for the PBD chain rewrite: there is no pivot/radius
+				# function any more (see player.gd's _apply_rope_leash_velocity_
+				# clamp() doc comment -- "NO PIVOT, NO RADIUS, NO CIRCLE") --
+				# this diag now reports the same real, direct slack
+				# measurement the leash clamp itself uses.
+				var hand_2d: Vector2 = player._rope_chain.points[0]
+				var used_length: float = maxf(player._rope_chain.total_extension_2d(), hand_2d.distance_to(player.dart.head_2d))
+				var slack: float = player.DART_ROPE_LENGTH - used_length
+				diag = " used_length=%.4f slack=%.4f (taut=%s)" % [used_length, slack, slack <= 0.0]
 			print("[TEST] tick=%d pos=%s drift_from_pre_throw=%s dart_state=%s%s" % [tick, pos, drift, dart_state, diag])
 
 	print("[TEST] PHASE 2 RESULT: max_drift=%.5f at tick=%d drift_vec=%s (pre_throw_pos=%s)" % [

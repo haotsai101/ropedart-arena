@@ -1,15 +1,15 @@
 extends Node
-## ROUND 27 (2026-07-30) -- LIVE, REAL-GAMEPLAY rope-segment ("bar") monitor.
+## LIVE, REAL-GAMEPLAY rope-segment ("bar") monitor.
 ##
-## Per direct user request ("monitor the rope bar object for clipping and
-## jittering... maybe try remove leash-length calculation completely"), and
-## per the coordinator's explicit instruction that every prior round's
-## SYNTHETIC test scenario has failed to reproduce/explain a jitter bug the
-## user can see, reproducibly, in real gameplay (ROUND 26 measured a
-## stationary-near-pillar synthetic config and found the leash velocity
-## clamp structurally cannot fire for a zero-velocity player -- true, but
-## real gameplay is never actually zero-velocity for long: real bot AI is
-## constantly steering, retreating, dodging, chasing).
+## ADAPTED for the PBD/Verlet rope chain rewrite (see scripts/rope_chain_pbd.gd
+## and CLAUDE.md's own dated round entry) -- reads player._rope_chain.points/
+## .last_had_collision instead of the old RigidBody3D chain's
+## _physics_rope_segments/rope_segment_body.gd's _debug_last_has_contact.
+## The old `--disable-wrap-leash` A/B toggle is REMOVED: there is no separate
+## wrap-aware-vs-flat leash branch any more (see player.gd's
+## _apply_rope_leash_velocity_clamp() -- "NO PIVOT, NO RADIUS, NO CIRCLE" --
+## a single, always-live direct slack measurement replaced that whole
+## mechanism, so there is nothing left to A/B toggle).
 ##
 ## This test does NOT force-anchor a dart, does NOT hold a player stationary,
 ## and does NOT use any settle-window discard. It drives the REAL
@@ -17,31 +17,20 @@ extends Node
 ## production call sequence) with REAL bot_controller-driven players (CHASE
 ## -> AIM -> RETREAT, real aim noise, real dodge logic) on the REAL
 ## scenes/main.tscn map, for an extended continuous soak, and logs EVERY
-## PHYSICS TICK, for EVERY dynamic rope segment of EVERY active chain:
+## PHYSICS TICK, for EVERY interior rope chain point of EVERY active chain:
 ##   (a) real world position
 ##   (b) real penetration depth into any obstacle rect (0 if not penetrating)
-##   (c) frame-to-frame position delta (jitter), per segment INDEX, not an
-##       aggregate -- so a specific segment/obstacle signature can be found
-##   (d) rope_segment_body.gd's own _debug_last_has_contact flag
-## plus (bonus, informational, feeds Task 3's "fixed length" investigation):
-## the real joint gap between every consecutive segment pair, vs. the
-## chain's own fixed rest length per segment.
-##
-## A/B TOGGLE: pass `--disable-wrap-leash` as a user arg (after `--` on the
-## godot command line) to set every real player's debug_disable_wrap_leash
-## = true for the whole run -- forces _rope_leash_pivot_and_radius() to
-## always fall back to the flat [anchor, DART_ROPE_LENGTH] circle, per the
-## user's own suspicion that the wrap-aware leash computation itself is
-## responsible for jitter/clipping. Player.gd's own committed DEFAULT for
-## this field is `false` (unchanged, wrap-aware live) -- only this test's
-## own runtime toggle ever flips it, same "toggle-and-revert, never edit the
-## file's own default" convention as GameManager.lobby_mode.
+##   (c) frame-to-frame position delta (jitter), per point INDEX, not an
+##       aggregate -- so a specific point/obstacle signature can be found
+##   (d) RopeChainPBD's own last_had_collision flag
+## plus (bonus, informational, feeds requirement 1's "never separate"
+## verification): how far each consecutive pair currently sits PAST its own
+## fixed segment_max_length (should read ~0.0 always).
 ##
 ## Also pass `--ticks=N` to override SOAK_TICKS (default 9000 = 150s @ 60Hz).
 ##
 ## Run via:
 ##   godot --headless --path . res://tests/test_live_rope_monitor.tscn
-##   godot --headless --path . res://tests/test_live_rope_monitor.tscn -- --disable-wrap-leash
 ##   godot --headless --path . res://tests/test_live_rope_monitor.tscn -- --ticks=3600
 
 var SOAK_TICKS: int = 9000
@@ -58,24 +47,15 @@ func _ready() -> void:
 
 
 func _run() -> void:
-	var disable_wrap_leash: bool = false
-	var rng_seed: int = 1337  ## fixed default so back-to-back A/B runs (with
-	## vs. without --disable-wrap-leash) drive IDENTICAL real bot AI decisions
-	## (aim noise, dodge-direction commits, etc. -- see bot_controller.gd's own
-	## randf()/randi() calls) up until the moment the leash behavior itself
-	## causes a real divergence -- an actual controlled experiment, not two
-	## independently-random matches whose different throw counts/kill counts/
-	## obstacle proximity already confound any comparison on their own.
+	var rng_seed: int = 1337  ## fixed default so repeated runs are directly comparable
 	for arg in OS.get_cmdline_user_args():
-		if arg == "--disable-wrap-leash":
-			disable_wrap_leash = true
-		elif arg.begins_with("--ticks="):
+		if arg.begins_with("--ticks="):
 			SOAK_TICKS = int(arg.substr(8))
 		elif arg.begins_with("--seed="):
 			rng_seed = int(arg.substr(7))
 
 	seed(rng_seed)
-	print("[LIVEMON] starting: disable_wrap_leash=%s SOAK_TICKS=%d rng_seed=%d" % [disable_wrap_leash, SOAK_TICKS, rng_seed])
+	print("[LIVEMON] starting: SOAK_TICKS=%d rng_seed=%d" % [SOAK_TICKS, rng_seed])
 
 	var main_scene: Node = load("res://scenes/main.tscn").instantiate()
 	add_child(main_scene)
@@ -101,10 +81,7 @@ func _run() -> void:
 	GameManager.start_round()
 
 	var players: Array = GameManager._all_players.duplicate()
-	if disable_wrap_leash:
-		for p in players:
-			p.debug_disable_wrap_leash = true
-	print("[LIVEMON] real GameManager flow started: %d real players, disable_wrap_leash=%s" % [players.size(), disable_wrap_leash])
+	print("[LIVEMON] real GameManager flow started: %d real players" % players.size())
 
 	# --- Per-segment-index aggregates (key: "%d_%d" % [player_index, seg_idx]) ---
 	var seg_max_jitter: Dictionary = {}
@@ -188,19 +165,19 @@ func _run() -> void:
 			prev_player_pos[p] = cur_gpos
 			var in_grace: bool = tick < int(grace_until.get(p, -1))
 
-			if not p._physics_rope_active:
+			if not p._physics_rope_active or p._rope_chain == null:
 				continue
 			active_chain_ticks += 1
 
-			var segs: Array = p._physics_rope_segments
-			var prev_seg_pos: Vector2 = Vector2(p._physics_rope_hand_anchor.global_position.x, p._physics_rope_hand_anchor.global_position.z) if p._physics_rope_hand_anchor != null else Vector2.ZERO
+			# ADAPTED for the PBD/Verlet rope chain rewrite (see
+			# scripts/rope_chain_pbd.gd): points[0] is the hand, points[size-1]
+			# is the tip -- iterate the INTERIOR points only (1..size-2), same
+			# set the old RigidBody3D chain's _physics_rope_segments held.
+			var chain_points: PackedVector2Array = p._rope_chain.points
+			var prev_seg_pos: Vector2 = chain_points[0] if chain_points.size() > 0 else Vector2.ZERO
 
-			for i in range(segs.size()):
-				var seg: RigidBody3D = segs[i]
-				if seg == null or not is_instance_valid(seg):
-					continue
-				var pos3: Vector3 = seg.global_position
-				var pos2: Vector2 = Vector2(pos3.x, pos3.z)
+			for i in range(1, chain_points.size() - 1):
+				var pos2: Vector2 = chain_points[i]
 				var key: String = "%d_%d" % [p.player_index, i]
 
 				# (c) frame-to-frame jitter, per segment index
@@ -210,7 +187,7 @@ func _run() -> void:
 				prev_pos[key] = pos2
 
 				# (d) real contact flag
-				var has_contact: bool = bool(seg.get("_debug_last_has_contact"))
+				var has_contact: bool = bool(p._rope_chain.last_had_collision[i])
 				if has_contact:
 					contact_ticks_total += 1
 					seg_contact_ticks[key] = int(seg_contact_ticks.get(key, 0)) + 1
@@ -282,9 +259,13 @@ func _run() -> void:
 							"pos": pos2, "contact": has_contact, "jitter_this_tick": jitter,
 						})
 
-				# --- bonus: joint gap between consecutive segments (Task 3 feed) ---
-				var gap: float = pos2.distance_to(prev_seg_pos)
-				seg_max_joint_gap[key] = maxf(seg_max_joint_gap.get(key, 0.0), gap)
+				# --- requirement 1 ("never separate") feed: how far this link
+				# currently sits PAST its own fixed segment_max_length -- should
+				# read ~0.0 on every sample; see rope_chain_pbd.gd's own
+				# max_link_gap_violation() for the same measurement computed
+				# internally.
+				var gap_violation: float = maxf(0.0, pos2.distance_to(prev_seg_pos) - p.ROPE_PHYSICS_SEGMENT_LENGTH)
+				seg_max_joint_gap[key] = maxf(seg_max_joint_gap.get(key, 0.0), gap_violation)
 				prev_seg_pos = pos2
 
 		if tick_max_pen > RAW_PEN_TOLERANCE:
@@ -296,8 +277,8 @@ func _run() -> void:
 				max_raw_pen, raw_pen_events, jitter_alert_events, max_jitter_overall, contact_ticks_total])
 
 	# ---------------- FINAL REPORT ----------------
-	print("[LIVEMON] ================ FINAL RESULTS over %d ticks (~%.0fs, %d players, %d throws, %d kills, disable_wrap_leash=%s) ================" % [
-		total_ticks, float(total_ticks) / 60.0, players.size(), throws_seen, kills_seen, disable_wrap_leash])
+	print("[LIVEMON] ================ FINAL RESULTS over %d ticks (~%.0fs, %d players, %d throws, %d kills) ================" % [
+		total_ticks, float(total_ticks) / 60.0, players.size(), throws_seen, kills_seen])
 	print("[LIVEMON] max_raw_pen=%.5f  raw_pen_events=%d/%d ticks (%.3f%%)" % [
 		max_raw_pen, raw_pen_events, total_ticks, 100.0 * float(raw_pen_events) / float(maxi(total_ticks, 1))])
 	print("[LIVEMON] max_jitter_overall=%.4f  jitter_alert_events(>%.2f)=%d  active_chain_sample_ticks=%d  contact_ticks_total=%d" % [
