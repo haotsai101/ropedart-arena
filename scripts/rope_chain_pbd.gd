@@ -66,6 +66,25 @@ class_name RopeChainPBD
 ## category/precedent as the old chain's ROPE_LINEAR_DAMP.
 const VELOCITY_DAMPING: float = 0.92
 
+## DIAGNOSTIC FIELDS (added ROUND 34, kept permanently -- same category as
+## last_had_collision below: cheap, always-updated, no functional effect on
+## the simulation itself, reusable by any future investigation). Last
+## step()'s own wall-clock cost, outer round count, and whether any real
+## collision correction happened this tick.
+var last_step_usec: int = 0
+var last_outer_rounds_used: int = 0
+var last_had_any_collision: bool = false
+## Total _converge_distance() inner-sweep iterations actually run across the
+## whole step() call, and whether any single _converge_distance() call this
+## tick hit its own solver_iterations cap without early-exiting via
+## CONVERGENCE_EPS -- distinguishes "many outer rounds" (the ROUND 33
+## MAX_OUTER_ROUNDS pathology, bounded by ROPE_STEP_TIME_BUDGET_USEC) from
+## "few outer rounds, but the inner sweep itself can't converge" (the ROUND
+## 34 ROOT CAUSE -- see the PLATEAU EARLY-EXIT doc comment on
+## _converge_distance() below for the full story).
+var last_total_inner_iterations: int = 0
+var last_hit_inner_cap: bool = false
+
 var points: PackedVector2Array = PackedVector2Array()
 var prev_points: PackedVector2Array = PackedVector2Array()
 ## Per-point "did this point get pushed out of real obstacle geometry this
@@ -237,6 +256,8 @@ const CONVERGENCE_EPS: float = 0.00005
 func step(delta: float, hand_target: Vector2, tip_target: Vector2, obstacle_rects: Array,
 		obstacle_radius: float, max_point_speed: float, solver_iterations: int) -> void:
 	var _step_start_usec: int = Time.get_ticks_usec()
+	last_total_inner_iterations = 0
+	last_hit_inner_cap = false
 	var n: int = points.size()
 	if n < 2:
 		return
@@ -285,12 +306,57 @@ func step(delta: float, hand_target: Vector2, tip_target: Vector2, obstacle_rect
 	# Position-Based Dynamics principle as the inner distance sweep itself,
 	# just applied one level up to reconcile two different constraint
 	# families instead of many instances of the same one.
+	last_had_any_collision = false
+	var _outer_rounds_ran: int = 0
 	for outer_round in range(MAX_OUTER_ROUNDS):
-		_converge_distance(solver_iterations)
+		_outer_rounds_ran = outer_round + 1
+		var distance_converged: bool = _converge_distance(solver_iterations)
 		var collision_correction: float = 0.0
 		for i in range(1, n - 1):
 			collision_correction += _resolve_collisions(i, obstacle_rects, obstacle_radius)
+		if collision_correction > 0.0:
+			last_had_any_collision = true
 		if collision_correction < CONVERGENCE_EPS and max_link_gap_violation() < CONVERGENCE_EPS:
+			last_outer_rounds_used = _outer_rounds_ran
+			last_step_usec = Time.get_ticks_usec() - _step_start_usec
+			return
+		# OUTER-LOOP EARLY-EXIT for a genuinely INFEASIBLE target (2026-08-01,
+		# same real user report/root cause as _converge_distance()'s own
+		# "PLATEAU EARLY-EXIT" doc comment above -- read that first). The
+		# plateau fix alone was measured, via the same real per-tick
+		# profiling, to be INSUFFICIENT on its own: it makes each individual
+		# _converge_distance() call cheaper, but this OUTER loop's own
+		# break condition above (collision_correction < EPS AND
+		# max_link_gap_violation() < EPS) can never be satisfied when the
+		# distance target itself is infeasible (max_link_gap_violation()
+		# has a nonzero floor no amount of iteration can close) -- so
+		# without this second check, the outer loop just ran MORE
+		# now-individually-cheaper rounds instead of fewer expensive ones,
+		# and total step() cost stayed pinned to the SAME
+		# ROPE_STEP_TIME_BUDGET_USEC ceiling either way (measured: ~20-24ms
+		# per tick, unchanged, just redistributed across more rounds).
+		if not distance_converged and collision_correction < CONVERGENCE_EPS:
+			# This round's distance solve did NOT reach genuine convergence
+			# (plateaued or hit its own iteration cap -- i.e. this is as close
+			# as the distance constraint can structurally get), AND collision
+			# correction did ZERO real work this round (no obstacle nearby, or
+			# every point already outside every obstacle). _resolve_collisions()
+			# is a pure function of the current points -- if it changed
+			# nothing, re-running _converge_distance() on the exact same
+			# points next round is DETERMINISTIC repetition of the identical,
+			# already-plateaued result: not "might need one more round to be
+			# sure," but *provably* futile, since nothing about the input to
+			# either function changed. Breaking here the first time this
+			# combination occurs is therefore exactly as correct as breaking
+			# after 40 identical repeats, just far cheaper. Does NOT weaken
+			# the genuine multi-obstacle reconciliation this loop exists for:
+			# whenever collision correction is actually doing real work
+			# (collision_correction >= CONVERGENCE_EPS, the dense-obstacle
+			# oscillation case ROPE_STEP_TIME_BUDGET_USEC itself was built
+			# for), this condition is false and the loop keeps its full
+			# existing wall-clock-bounded behavior.
+			last_outer_rounds_used = _outer_rounds_ran
+			last_step_usec = Time.get_ticks_usec() - _step_start_usec
 			return
 		# WALL-CLOCK TIME BUDGET (2026-07-31, real user report: "once the dart
 		# is thrown, the game soon become super laggy"). Direct real-GPU
@@ -334,6 +400,8 @@ func step(delta: float, hand_target: Vector2, tip_target: Vector2, obstacle_rect
 	# guarantee; any residual collision correction still needed gets picked
 	# up next tick's own outer loop instead.
 	_converge_distance(solver_iterations)
+	last_outer_rounds_used = _outer_rounds_ran
+	last_step_usec = Time.get_ticks_usec() - _step_start_usec
 
 
 ## How many (distance-converge, collision-correct) outer rounds step() will
@@ -374,8 +442,68 @@ const ROPE_STEP_TIME_BUDGET_USEC: int = 20000
 ## sweeps, stopping as soon as max_link_gap_violation() drops below
 ## CONVERGENCE_EPS -- see step()'s own doc comment for why an early-exit cap
 ## replaced a fixed iteration count.
-func _converge_distance(max_iterations: int) -> void:
+##
+## PLATEAU EARLY-EXIT (2026-08-01, real user report: "the game lags when the
+## chain reaches max length"). Direct real-GPU per-tick profiling (a real
+## player circling in open air, hand and tip kinematically driven to a
+## straight-line distance right at/above the chain's own total capacity --
+## no obstacle involved at all) caught this loop burning its FULL
+## max_iterations cap (600, see ROPE_SOLVER_ITERATIONS's own doc comment in
+## player.gd) on EVERY ONE of MAX_OUTER_ROUNDS' outer rounds, EVERY tick, for
+## as long as the requested hand-to-tip distance stayed at/above
+## segment_count*segment_max_length -- ~28-31ms/tick, recurring every few
+## real seconds during ordinary near-max-length movement, only ever bounded
+## by step()'s own ROPE_STEP_TIME_BUDGET_USEC (itself only a ceiling on the
+## OUTER loop, not on how long any single _converge_distance() call is
+## allowed to keep grinding).
+##
+## ROOT CAUSE, confirmed by direct measurement (a temporary total_extension_2d()
+## trace correlated tick-for-tick against last_hit_inner_cap): whenever the two
+## KINEMATIC endpoints (hand, tip -- see step()'s own points[0]/points[n-1]
+## assignment) are driven to a combined straight-line separation that equals
+## or exceeds the chain's own fixed total capacity, satisfying
+## max_link_gap_violation() < CONVERGENCE_EPS is a genuinely INFEASIBLE
+## target -- by the triangle inequality, no arrangement of intermediate
+## points can make every one of segment_count links simultaneously read
+## <=segment_max_length AND sum to more than that same total. This is not a
+## "needs more iterations" problem (the same class of dead-end this file's
+## own MAX_OUTER_ROUNDS doc comment already found for RAISING the outer
+## round count, see ROPE_STEP_TIME_BUDGET_USEC's own history) -- no amount of
+## Gauss-Seidel sweeping ever reaches an unreachable target, so every one of
+## the 600 iterations after the first handful (which do real, useful work
+## pulling the chain taut) is pure wasted computation, repeated 40 outer-round
+## times, every single tick, for as long as the infeasible configuration
+## persists.
+##
+## FIX: track max_link_gap_violation()'s own iteration-to-iteration
+## IMPROVEMENT (not just its absolute value) and stop once it plateaus (stops
+## improving by more than PLATEAU_EPS) for PLATEAU_STAGNANT_ITERS consecutive
+## iterations in a row -- this is a DIRECT COMPLEMENT to the existing
+## absolute-threshold check, exactly the same "bound wasted iteration, change
+## zero correctness behavior in the reachable case" category as
+## ROPE_STEP_TIME_BUDGET_USEC itself: a genuinely convergING chain keeps
+## improving every iteration (this file's own Jakobsen-style alternating
+## sweep propagates a correction across the whole chain within roughly
+## segment_count iterations in the normal case -- see step()'s own doc
+## comment on the two-phase distance/collision design), so the plateau check
+## essentially never fires there; only a chain that has already reached (or
+## gotten as close as it structurally CAN get to) its own best achievable
+## state, and is therefore no longer making progress, trips it -- indistinguishable
+## in effect from "converged," just at a nonzero floor instead of zero.
+## PLATEAU_STAGNANT_ITERS=8 (not 1-2) is deliberately conservative: it lets a
+## few consecutive non-improving iterations pass (numerical noise, or a
+## genuinely slow-but-real convergence step) before concluding the loop is
+## truly stuck, rather than risking a false-early-exit on a legitimately
+## reachable target.
+## Return value: true if the distance constraint reached genuine convergence
+## (< CONVERGENCE_EPS) this call; false if it exited via the plateau
+## detector or the max_iterations cap without reaching that target -- see
+## step()'s own OUTER-LOOP EARLY-EXIT doc comment below for why the caller
+## needs to distinguish these two cases, not just "did it return."
+func _converge_distance(max_iterations: int) -> bool:
 	var n: int = points.size()
+	var prev_violation: float = INF
+	var stagnant_count: int = 0
 	for iteration in range(max_iterations):
 		if iteration % 2 == 0:
 			for i in range(n - 1):
@@ -383,8 +511,30 @@ func _converge_distance(max_iterations: int) -> void:
 		else:
 			for i in range(n - 2, -1, -1):
 				_satisfy_distance(i, i + 1)
-		if max_link_gap_violation() < CONVERGENCE_EPS:
-			return
+		last_total_inner_iterations += 1
+		var violation: float = max_link_gap_violation()
+		if violation < CONVERGENCE_EPS:
+			return true
+		if prev_violation - violation < PLATEAU_EPS:
+			stagnant_count += 1
+			if stagnant_count >= PLATEAU_STAGNANT_ITERS:
+				return false
+		else:
+			stagnant_count = 0
+		prev_violation = violation
+	last_hit_inner_cap = true
+	return false
+
+
+## See _converge_distance()'s own "PLATEAU EARLY-EXIT" doc comment above.
+## Deliberately much tighter than CONVERGENCE_EPS (0.00005) -- this only
+## needs to distinguish "still meaningfully improving" from "no longer
+## improving," not to itself serve as an acceptable final-violation
+## tolerance (that job still belongs to CONVERGENCE_EPS/the absolute check
+## above, which always runs first).
+const PLATEAU_EPS: float = 0.000001
+## See _converge_distance()'s own "PLATEAU EARLY-EXIT" doc comment above.
+const PLATEAU_STAGNANT_ITERS: int = 8
 
 
 func _satisfy_distance(i: int, j: int) -> void:
