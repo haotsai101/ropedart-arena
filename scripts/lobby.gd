@@ -454,7 +454,21 @@ func _build_waiting_screen() -> void:
 	root_vbox.offset_top = vh * 0.015
 	root_vbox.offset_right = -inset
 	root_vbox.offset_bottom = -(vh * 0.015)
-	root_vbox.add_theme_constant_override("separation", 6)
+	# This screen packs 17 direct children (room code, players list, 3
+	# settings rows, the 3-row char picker + preview, hints, prompts) into
+	# one column -- a flat 6px gap between every one of them adds up to
+	# ~100px of pure spacing, which is exactly what pushed the last two rows
+	# (error label, "leave room" hint) below the panel bottom at the default
+	# 1152x648 desktop window: a recursive Control-rect scan (root VBox came
+	# out to 609px tall against a ~554px content budget at that resolution)
+	# confirmed real clipping there, while the same scan found zero overflow
+	# at portrait phone aspect ratios -- "expand" stretch mode (see
+	# project.godot's window/stretch settings) never reports a design width
+	# narrower than the 1152 baseline, it only grows vh for taller windows,
+	# so this screen's actual risk was the squat desktop window, not phones.
+	# Scaling the gap down with vh keeps it visually proportionate at any
+	# window size while reclaiming the budget that was missing on desktop.
+	root_vbox.add_theme_constant_override("separation", maxi(2, int(vh * 0.006)))
 	root_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	panel.add_child(root_vbox)
 
