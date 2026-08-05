@@ -2,23 +2,26 @@ extends CharacterBody3D
 ## Player controller — 2D logic on XZ plane, 3D rendering.
 ## Supports keyboard (player_index=0), gamepads (player_index>=1), and AI bots.
 ##
-## WEAPON/COMBAT SYSTEM REMOVED (branch remove-weapon-system): the rope dart
-## throw/anchor/recall weapon, its persistent PBD/RigidBody3D rope chain, melee
-## slash, kill/trip/death, lives, and the leash tether are all gone from this
-## script. What's left is pure movement/locomotion: WASD/gamepad/bot move
-## input, dash, aim direction (kept as a general-purpose facing/aim primitive,
-## not tied to any weapon), skeletal locomotion animation, and the platform
-## ring-out boundary (kept as a map/movement feature — see _check_boundary_fall
-## below — but decoupled from the old kill()/lives/respawn-timer pipeline: it
-## now just teleports the player back to their spawn point instead of costing
-## a life, since there is no life/round-outcome system left to feed).
+## Post-GDD-rewrite rebuild status (see docs/implementation-plan.md): the
+## weapon/combat system was intentionally stripped to bare movement ahead of
+## the GDD rewrite, then rebuilt phase by phase. Phase 1 re-added the
+## persistent rope_dart.gd instance (HOLSTERED/CHARGING/FLYING/EMBEDDED) and
+## its leash velocity clamp (_apply_rope_leash_velocity_clamp). Phase 2 (this
+## pass) adds RETURNING (_handle_recall_input/_get_recall_held) and combat:
+## is_dead + take_dart_hit() (dart contact, always lethal) and _trip_timer +
+## apply_rope_trip() (rope-line contact, movement debuff only, never lethal)
+## — both called from rope_dart.gd's own _check_player_hits(), not from here.
+## No lives/round-outcome tracking exists yet (Phase 5) — a "kill" is just an
+## instant teleport to spawn_pos, same minimal shape the ring-out fall
+## already used (_start_fall/_on_fall_finished) before this rebuild, just
+## without the fall animation.
 ##
-## KNOWN GAP: bot_controller.gd was intentionally left untouched (per explicit
-## direction) and still references dart/lives/is_dead/get_desired_throw/
-## get_desired_slash — none of which exist on this script any more. See
-## CLAUDE.md's "Known gaps after the weapon-system removal" section for the
-## full disclosure of what specifically breaks and why it doesn't crash the
-## whole game.
+## KNOWN GAP: bot_controller.gd was intentionally left mostly untouched
+## through Phase 2 (per explicit direction — full bot rework is Phase 6) and
+## still has some rough/dead logic (e.g. its "darts" group dodge loop is a
+## silent no-op since rope_dart.gd is deliberately not added to that group —
+## see rope_dart.gd's own header comment). It was patched just enough this
+## phase to not crash against the new dart/is_dead shape.
 
 @export var move_speed: float = 6.0
 @export var player_index: int = 0
@@ -71,10 +74,52 @@ var _player_materials: Array[StandardMaterial3D] = []
 
 var player_color: Color
 var character_color: Color = Color(0.85, 0.08, 0.04, 1.0)   # set in _ready from CHARACTER_DEFS
+## Fixed rotation applied to raw human move/aim input (keyboard, gamepad
+## sticks, virtual joystick) so screen-up/right consistently matches
+## up/right on the isometric-yawed camera -- see _compute_camera_yaw_offset()
+## below. Cached once in _ready() since the camera's yaw is a fixed constant
+## (arena_camera.gd only pans/zooms, never rotates -- see its own comments).
+## NOT applied to bot_controller.gd's output: bots compute their desired
+## move/aim directly from world-space player positions (to_target vectors --
+## see bot_controller.gd's _physics_process), so their output is already
+## correct world-space and must NOT be rotated again here.
+var _move_rotation_offset: float = 0.0
 var aim_dir: Vector2 = Vector2(0, 1)
 var _facing_dir: Vector2 = Vector2(0, 1)  # last direction the mesh visually turned to face
 var spawn_pos: Vector3
 var bot_controller: Node = null
+
+# Rope dart -- one persistent instance per player (see rope_dart.gd's own
+# header comment): HOLSTERED/CHARGING/FLYING/EMBEDDED are all states of this
+# SAME node, never null, so "is the dart out" is read from dart.state, not
+# from dart being present. Mirrors rope_dart.gd's State enum ordinals by hand
+# (no shared constant between the two scripts -- same convention this
+# project used before the weapon-system removal).
+const DART_STATE_HOLSTERED := 0
+const DART_STATE_CHARGING := 1
+const DART_STATE_FLYING := 2
+const DART_STATE_EMBEDDED := 3
+const DART_STATE_RETURNING := 5
+var dart: Node = null
+var _prev_throw_held: bool = false
+var _prev_recall_held: bool = false
+
+# Combat (Phase 2 -- see rope_dart.gd's _check_player_hits()). Dart contact
+# is always lethal in every away-state; rope-line contact only trips/slows.
+# No lives/round tracking yet (Phase 5) -- a "kill" here is just an instant
+# teleport back to spawn_pos, same minimal-consequence shape as the ring-out
+# fall already uses (_start_fall/_on_fall_finished), just without the fall
+# animation since a dart kill doesn't need one.
+var is_dead: bool = false
+const RESPAWN_INVULN_TIME: float = 0.3  ## brief window after respawn where
+## this player can't be re-targeted/re-killed the same tick they teleport in
+## (guards against a degenerate case where spawn_pos itself sits inside a
+## still-lethal dart's hit/trip radius) -- see _physics_process()'s countdown.
+var _invuln_timer: float = 0.0
+
+const TRIP_DURATION: float = 0.6
+const TRIP_SPEED_MULT: float = 0.35  ## how much rope-contact slows movement
+var _trip_timer: float = 0.0
 
 # Ring-out fall state — walking past the platform edge plays a short falling
 # visual, then teleports the player back to spawn_pos. No lives/death system
@@ -112,6 +157,7 @@ var _net_aim: Vector2 = Vector2.ZERO
 
 func _ready() -> void:
 	add_to_group("players")
+	_move_rotation_offset = _compute_camera_yaw_offset()
 	player_color = PLAYER_COLORS[clamp(player_index, 0, PLAYER_COLORS.size() - 1)]
 	# Build the assembled character mesh (base body + headwear/cloth swap +
 	# color tint) via the shared builder -- see character_builder.gd's header
@@ -144,6 +190,13 @@ func _ready() -> void:
 	_setup_animation()
 	if is_bot:
 		bot_controller = get_node_or_null("BotController")
+	# Rope dart: one persistent instance, added as a sibling in the current
+	# scene (not a child of this CharacterBody3D) so it can move independently
+	# once thrown -- see rope_dart.gd's own header comment.
+	var dart_scene: PackedScene = load("res://scenes/rope_dart.tscn")
+	dart = dart_scene.instantiate()
+	dart.owner_player = self
+	get_tree().current_scene.add_child(dart)
 	# Virtual controls for touch devices (player_index 0, human only)
 	if player_index == 0 and not is_bot and DisplayServer.is_touchscreen_available():
 		var vc: Node = load("res://scripts/virtual_controls.gd").new()
@@ -362,6 +415,14 @@ func _physics_process(delta: float) -> void:
 		move_input = _get_move_input()
 		aim_input  = _get_aim_input()
 
+	# --- Respawn invuln / rope-trip countdowns ---
+	if _invuln_timer > 0.0:
+		_invuln_timer -= delta
+		if _invuln_timer <= 0.0:
+			is_dead = false
+	if _trip_timer > 0.0:
+		_trip_timer -= delta
+
 	# --- Dash cooldown countdown ---
 	if _dash_cooldown_timer > 0.0:
 		_dash_cooldown_timer -= delta
@@ -390,7 +451,12 @@ func _physics_process(delta: float) -> void:
 	else:
 		if move_input.length() > 1.0:
 			move_input = move_input.normalized()
-		velocity = Vector3(move_input.x, 0.0, move_input.y) * move_speed
+		# Rope-trip debuff: a brief movement slow, never lethal (see
+		# apply_rope_trip()) -- does not affect dash, which stays at full
+		# DASH_SPEED above so a tripped player can still burst free.
+		var trip_mult: float = TRIP_SPEED_MULT if _trip_timer > 0.0 else 1.0
+		velocity = Vector3(move_input.x, 0.0, move_input.y) * move_speed * trip_mult
+	_apply_rope_leash_velocity_clamp()
 	move_and_slide()
 	_check_boundary_fall()
 	if is_falling:
@@ -403,6 +469,12 @@ func _physics_process(delta: float) -> void:
 		aim_dir = move_input.normalized()
 	aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
 
+	# --- Rope dart throw: hold to charge, release to throw ---
+	_handle_throw_input()
+	# --- Rope dart recall: pulls the dart back toward this player at
+	# increasing speed (see rope_dart.gd's begin_recall()/_process_returning()) ---
+	_handle_recall_input()
+
 
 func _get_dash_pressed() -> bool:
 	if is_bot and bot_controller != null:
@@ -412,40 +484,194 @@ func _get_dash_pressed() -> bool:
 	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_LEFT_SHOULDER)
 
 
+func _get_action_held() -> bool:
+	## Unified Throw/Recall input signal (Right Trigger / Left Mouse / Space /
+	## touch Throw button, per the GDD Controls section) -- Throw and Recall
+	## are now the SAME physical input everywhere (keyboard/mouse, gamepad,
+	## touch), gated purely by dart.state in _handle_throw_input() (HOLSTERED/
+	## CHARGING) vs _handle_recall_input() (FLYING/EMBEDDED). This does NOT
+	## cover bots: see _get_throw_held()/_get_recall_held() below, which read
+	## bot_controller.gd's independent get_desired_throw()/get_desired_recall()
+	## AI decisions instead of this shared physical signal.
+	if player_index == 0:
+		if _virtual_controls != null and _virtual_controls.get_throw_held():
+			return true
+		return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	var joy := player_index - 1
+	if Input.is_joy_button_pressed(joy, JOY_BUTTON_RIGHT_SHOULDER):
+		return true
+	return Input.get_joy_axis(joy, JOY_AXIS_TRIGGER_RIGHT) > 0.3
+
+
+func _get_throw_held() -> bool:
+	## NOTE: bots (get_desired_throw()) return a one-shot "throw now" pulse,
+	## not a true held/level signal -- bot throwing is already known-broken
+	## (see this file's header comment) and out of scope this phase; this
+	## just keeps that call from crashing, it doesn't make bots throw well.
+	if is_bot and bot_controller != null:
+		return bot_controller.get_desired_throw()
+	return _get_action_held()
+
+
+func _handle_throw_input() -> void:
+	if dart == null or not is_instance_valid(dart):
+		return
+	var held: bool = _get_throw_held()
+	if held and not _prev_throw_held and dart.state == DART_STATE_HOLSTERED:
+		dart.begin_charge()
+	elif not held and _prev_throw_held and dart.state == DART_STATE_CHARGING:
+		dart.release_throw(aim_dir)
+	_prev_throw_held = held
+
+
+func _get_recall_held() -> bool:
+	## Same physical signal as _get_throw_held() for humans/gamepad/touch --
+	## Throw and Recall are one button, gated by dart.state (see
+	## _get_action_held()'s comment). Bots are the one exception: they keep an
+	## independent get_desired_recall() AI decision, since a bot has no single
+	## physical "button" whose state can double for both intents.
+	if is_bot and bot_controller != null:
+		return bot_controller.get_desired_recall()
+	return _get_action_held()
+
+
+func _handle_recall_input() -> void:
+	if dart == null or not is_instance_valid(dart):
+		return
+	var held: bool = _get_recall_held()
+	if held and not _prev_recall_held and (dart.state == DART_STATE_FLYING or dart.state == DART_STATE_EMBEDDED):
+		dart.begin_recall()
+	_prev_recall_held = held
+
+
+func _apply_rope_leash_velocity_clamp() -> void:
+	## Once the dart is EMBEDDED (a taut, stationary anchor), keep the player
+	## from walking further from it than the rope allows -- a velocity
+	## projection applied BEFORE move_and_slide(), not a position snap after,
+	## so the player's own canonical position is never discontinuously moved.
+	##
+	## Wrap-aware as of Task #7 item 4: rather than a plain circle of radius
+	## dart.rope_length around the anchor, pivot on the LAST wrap point
+	## between the anchor and the player (dart.get_rope_path_2d(), the exact
+	## same live wrapped path the rope's own visual/FLYING-constraint/
+	## hit-detection all already use -- see rope_dart.gd's own header comment
+	## on that mechanism), with the allowed radius from that pivot shrunk by
+	## however much of the total rope_length the wrap segments before it have
+	## already consumed. In the common unobstructed case the path is just
+	## [anchor, player] and this reduces exactly to the old plain-circle
+	## behavior (pivot=anchor, radius=rope_length, zero behavior change).
+	if dart == null or not is_instance_valid(dart) or dart.state != DART_STATE_EMBEDDED:
+		return
+	var player_pos: Vector2 = get_pos_2d()
+	var path: PackedVector2Array = dart.get_rope_path_2d(player_pos)
+	var pivot: Vector2 = dart.pos_2d
+	var radius: float = dart.rope_length
+	if path.size() > 2:
+		var consumed := 0.0
+		for i in path.size() - 2:
+			consumed += path[i].distance_to(path[i + 1])
+		pivot = path[path.size() - 2]
+		radius = maxf(dart.rope_length - consumed, 0.0)
+	var offset: Vector2 = player_pos - pivot
+	var dist: float = offset.length()
+	if dist <= radius or dist < 0.0001:
+		return
+	var radial_dir: Vector2 = offset / dist
+	var vel2d := Vector2(velocity.x, velocity.z)
+	var outward: float = vel2d.dot(radial_dir)
+	if outward > 0.0:
+		vel2d -= radial_dir * outward
+		velocity.x = vel2d.x
+		velocity.z = vel2d.y
+
+
+## Called by rope_dart.gd's _check_player_hits() when the dart HEAD overlaps
+## this player in any away-state -- always lethal (GDD Combat: "Dart Contact
+## ... Always lethal. Applies in every dart state: Flying, Embedded landing,
+## Swinging, Returning"). Minimal Phase 2 kill: teleport to spawn_pos, no
+## VFX/lives/round tracking (that's Phase 5 -- see this file's header
+## comment and docs/implementation-plan.md's Phase 2 section).
+func take_dart_hit() -> void:
+	if is_dead:
+		return
+	is_dead = true
+	_invuln_timer = RESPAWN_INVULN_TIME
+	_trip_timer = 0.0
+	velocity = Vector3.ZERO
+	_is_dashing = false
+	_dash_timer = 0.0
+	global_position = spawn_pos
+
+
+## Called by rope_dart.gd's _check_player_hits() when the ROPE LINE (not the
+## dart head) overlaps this player -- never lethal, just a brief movement
+## debuff (GDD Combat: "Rope Contact ... trips and slows -- never lethal").
+func apply_rope_trip() -> void:
+	if is_dead:
+		return
+	_trip_timer = TRIP_DURATION
+
+
 func _get_move_input() -> Vector2:
 	if is_bot and bot_controller != null:
+		# Bots reason entirely in world-space (to_target = target_pos - my_pos,
+		# both already world XZ -- see bot_controller.gd's _physics_process),
+		# so their output must NOT be rotated by the camera-relative offset
+		# below; only raw human input (keyboard/gamepad/touch) needs it.
 		return bot_controller.get_desired_move()
 	if player_index == 0:
 		# Virtual joystick takes priority when a finger is on it
 		if _virtual_controls != null:
 			var vc_move: Vector2 = _virtual_controls.get_move()
 			if vc_move.length() > 0.1:
-				return vc_move
-		return Vector2(
+				return vc_move.rotated(_move_rotation_offset)
+		var raw := Vector2(
 			float(Input.is_key_pressed(KEY_D)) - float(Input.is_key_pressed(KEY_A)),
 			float(Input.is_key_pressed(KEY_S)) - float(Input.is_key_pressed(KEY_W))
 		)
+		return raw.rotated(_move_rotation_offset)
 	var joy := player_index - 1
 	var v := Vector2(Input.get_joy_axis(joy, JOY_AXIS_LEFT_X),
 					 Input.get_joy_axis(joy, JOY_AXIS_LEFT_Y))
-	return v if v.length() >= DEADZONE else Vector2.ZERO
+	return v.rotated(_move_rotation_offset) if v.length() >= DEADZONE else Vector2.ZERO
 
 
 func _get_aim_input() -> Vector2:
 	if is_bot and bot_controller != null:
+		# Same world-space reasoning as _get_move_input() above -- don't rotate.
 		return bot_controller.get_desired_aim()
 	if player_index == 0:
 		# Virtual joystick takes priority when a finger is active on the right stick
 		if _virtual_controls != null:
 			var vc_aim: Vector2 = _virtual_controls.get_aim()
 			if vc_aim.length() > 0.1:
-				return vc_aim
-		# Mouse aim: project cursor onto the XZ gameplay plane
+				return vc_aim.rotated(_move_rotation_offset)
+		# Mouse aim: project cursor onto the XZ gameplay plane -- already
+		# camera-correct via project_ray_origin/normal, do NOT rotate this.
 		return _get_mouse_aim()
 	var joy := player_index - 1
 	var v := Vector2(Input.get_joy_axis(joy, JOY_AXIS_RIGHT_X),
 					 Input.get_joy_axis(joy, JOY_AXIS_RIGHT_Y))
-	return v if v.length() >= DEADZONE else Vector2.ZERO
+	return v.rotated(_move_rotation_offset) if v.length() >= DEADZONE else Vector2.ZERO
+
+
+## Fixed rotation to apply to raw human move/aim input vectors (keyboard
+## D-A/S-W, gamepad left/right stick axes, virtual-joystick screen-space
+## offsets) so that "up" on the input device consistently maps to "up" on
+## screen under the isometric-yawed camera. Derived from the camera's actual
+## ground-projected right vector rather than a hardcoded degree constant, so
+## a future camera angle tweak (see arena_camera.gd) doesn't silently break
+## this again. Falls back to the camera's known 45-degree yaw if no camera
+## is available yet (shouldn't normally happen -- main.tscn's Camera3D is a
+## sibling node already in the tree before players are added).
+func _compute_camera_yaw_offset() -> float:
+	var cam := get_viewport().get_camera_3d()
+	if cam == null:
+		return -PI / 4.0
+	var right_xz := Vector2(cam.global_transform.basis.x.x, cam.global_transform.basis.x.z)
+	if right_xz.length() < 0.001:
+		return -PI / 4.0
+	return right_xz.angle()
 
 
 func _get_mouse_aim() -> Vector2:

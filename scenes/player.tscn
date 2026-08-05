@@ -3,7 +3,7 @@
 [ext_resource type="Script" uid="uid://vxgbjq1ea8n7" path="res://scripts/player.gd" id="1_player"]
 [sub_resource type="CapsuleShape3D" id="PlayerShape"]
 radius = 0.4
-height = 1.2
+height = 2.0
 
 [sub_resource type="SphereMesh" id="AimMesh"]
 radius = 0.15

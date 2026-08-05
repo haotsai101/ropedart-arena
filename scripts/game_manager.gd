@@ -127,22 +127,50 @@ func resolve_cloth_id(base_char_id: String, choice: String) -> String:
 		return choice
 	return str(get_character_def(base_char_id).get("native_cloth", "none"))
 
-const PLAYER_HALF_HEIGHT := 0.7  # half-height of the player capsule; added to spawn marker Y
+## Half-height of the player capsule; added to spawn marker Y (spawn markers
+## in main.tscn/main_forest.tscn sit at Y=0, i.e. floor level) so a spawned
+## player's capsule CENTER lands at the right height above the floor, and
+## subtracted back off in player.gd's _mesh_ground_offset so the rendered
+## mesh's feet land exactly at the floor regardless of this value (the two
+## offsets are always equal and opposite, so they cancel -- see that
+## constant's own comment).
+##
+## Resolved by direct in-engine measurement (Task #7, 2026-08-05), not
+## assumption: a headless probe (`tests/_tmp_measure_player_aabb.gd`, since
+## removed) instantiated a real player.tscn with the DEFAULT character
+## (char_barbarian, its own native headwear equipped -- the actual default
+## appearance a player spawns with) and measured every MeshInstance3D's real
+## world-space AABB. Result: feet sit at world Y ~0.0 in every case (already
+## the offset math's own designed invariant, confirmed rather than assumed),
+## head (including native headwear) tops out at world Y ~2.038. The same
+## probe run across all 6 CHARACTER_DEFS (with each one's own native
+## headwear) showed a 1.85-2.26 range -- e.g. Mage's tall wizard hat is the
+## outlier at the top -- so a single shared capsule sized to the exact
+## default-character number will slightly undershoot a couple of the taller
+## hat silhouettes and slightly overshoot the shorter ones; this is an
+## accepted trade-off for one shared CapsuleShape3D across every character
+## model, same "representative character, not a per-character shape" scope
+## the task asked for.
+const PLAYER_HALF_HEIGHT := 1.0  # half of PLAYER_CAPSULE_HEIGHT below
 
 ## The RAW scenes/player.tscn CapsuleShape3D.height value, mirrored here by
 ## hand (no way to read a .tscn sub-resource from a const expression at
-## compile time). Originally introduced to derive the now-removed rope dart's
-## length ("6x character height") -- kept as a general character-size
-## constant in case a future weapon/combat system needs it again.
-const PLAYER_CAPSULE_HEIGHT := 1.2
+## compile time). Previously 1.2 (a stale torso-only guess that disagreed
+## with PLAYER_HALF_HEIGHT*2.0=1.4, leaving the capsule both floating above
+## the true floor and far too short to reach any character's actual head --
+## see PLAYER_HALF_HEIGHT's own comment for the real measurement). Now 2.0,
+## matching that measurement and kept in agreement with PLAYER_HALF_HEIGHT
+## (2.0 / 2.0 = 1.0) rather than the two constants disagreeing with each
+## other. Read by rope_dart.gd's rope_length export (6x character height).
+const PLAYER_CAPSULE_HEIGHT := 2.0
 
 const _FALLBACK_SPAWNS := [
-	Vector3(-10.0, 0.7, -10.0),
-	Vector3( 10.0, 0.7, -10.0),
-	Vector3(-10.0, 0.7,  10.0),
-	Vector3( 10.0, 0.7,  10.0),
-	Vector3(  0.0, 0.7, -12.0),
-	Vector3(  0.0, 0.7,  12.0),
+	Vector3(-10.0, PLAYER_HALF_HEIGHT, -10.0),
+	Vector3( 10.0, PLAYER_HALF_HEIGHT, -10.0),
+	Vector3(-10.0, PLAYER_HALF_HEIGHT,  10.0),
+	Vector3( 10.0, PLAYER_HALF_HEIGHT,  10.0),
+	Vector3(  0.0, PLAYER_HALF_HEIGHT, -12.0),
+	Vector3(  0.0, PLAYER_HALF_HEIGHT,  12.0),
 ]
 
 

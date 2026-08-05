@@ -8,6 +8,13 @@ enum BotState { CHASE, AIM, RETREAT }
 @export var difficulty: int = Difficulty.EASY
 
 const DART_STATE_FLYING = 0  # mirrors Dagger.State.FLYING ordinal
+## Mirrors rope_dart.gd's State.HOLSTERED ordinal (0 in both the old deleted
+## Dagger enum and the current rope_dart.gd enum, coincidentally the same
+## value). Used below to tell "dart in hand" apart from "dart away" now that
+## dart is a persistent node whose STATE changes on throw, not a field that
+## goes null (see player.gd's own header comment on this) -- unlike
+## DART_STATE_FLYING above, this one is live code, not dead/no-op code.
+const DART_STATE_HOLSTERED = 0
 
 const THROW_RANGE   := [4.0, 5.5, 7.0]
 const AIM_DURATION  := [1.4, 0.7, 0.25]
@@ -30,6 +37,7 @@ var _timer: float = 0.0
 var _desired_move: Vector2 = Vector2.ZERO
 var _desired_aim: Vector2 = Vector2(0.0, 1.0)
 var _throw_pending: bool = false
+var _recall_pending: bool = false
 var _dash_pending: bool = false
 var _slash_pending: bool = false  # true while a live target is within melee range
 var _dodge_dir: Vector2 = Vector2.ZERO  # committed dodge direction; reset when threat clears
@@ -59,6 +67,16 @@ func get_desired_dash() -> bool:
 		return true
 	return false
 
+## Same one-shot "pulse, not held" contract as get_desired_throw() above --
+## player.gd's _handle_recall_input() only needs a rising edge to call
+## rope_dart.gd's begin_recall(), same as _handle_throw_input() does for
+## begin_charge()/release_throw().
+func get_desired_recall() -> bool:
+	if _recall_pending:
+		_recall_pending = false
+		return true
+	return false
+
 func get_desired_slash() -> bool:
 	return _slash_pending
 
@@ -67,7 +85,12 @@ func _physics_process(delta: float) -> void:
 	if GameManager.current_state != GameManager.RoundState.PLAYING:
 		_desired_move = Vector2.ZERO
 		return
-	if player.is_dead:
+	# player.gd has no is_dead concept yet (removed in the weapon-system
+	# strip-down, not yet restored -- see player.gd's own header comment).
+	# Null-safe duck-typed read so a human-controlled test with any bots in
+	# the match doesn't crash; once Phase 2 adds is_dead back this reads it
+	# exactly as before with no further change needed here.
+	if player.get("is_dead") == true:
 		_desired_move = Vector2.ZERO
 		return
 
@@ -98,10 +121,16 @@ func _physics_process(delta: float) -> void:
 			_desired_aim = dir
 			return
 
+	# "Dart in hand" now means dart.state == HOLSTERED, not dart == null --
+	# see DART_STATE_HOLSTERED's comment above. player.dart itself is never
+	# null once player.gd's _ready() has run (persistent instance), but the
+	# null check is kept as a defensive guard in case this runs before that.
+	var dart_in_hand: bool = player.dart == null or player.dart.state == DART_STATE_HOLSTERED
+
 	match _state:
 		BotState.CHASE:
 			_desired_aim = dir
-			if player.dart != null or dist > THROW_RANGE[difficulty]:
+			if not dart_in_hand or dist > THROW_RANGE[difficulty]:
 				_set_desired_move(my_pos, dir * SPEED_MULT[difficulty])
 			else:
 				_desired_move = Vector2.ZERO
@@ -113,7 +142,7 @@ func _physics_process(delta: float) -> void:
 			var noise: float = randf_range(-1.0, 1.0) * deg_to_rad(AIM_NOISE_DEG[difficulty])
 			_desired_aim = Vector2.from_angle(dir.angle() + noise)
 			if _timer <= 0.0:
-				if player.dart == null:
+				if dart_in_hand:
 					_throw_pending = true
 				_state = BotState.RETREAT
 				_timer = RETREAT_TIME[difficulty]
@@ -121,10 +150,13 @@ func _physics_process(delta: float) -> void:
 		BotState.RETREAT:
 			_set_desired_move(my_pos, -_desired_aim * SPEED_MULT[difficulty])
 			if _timer <= 0.0:
-				# No rope to recall anymore -- if the dagger's still out
-				# (flying, or landed somewhere waiting for pickup), there's
-				# nothing to do here but go back to chasing; player.dart
-				# clears itself once the bot walks over its landed dagger.
+				# Recall the dart before going back to chase, mirroring how a
+				# human player uses Recall after a miss (GDD Combat: "Throw ->
+				# Miss -> Recall through enemies"). get_desired_recall()'s
+				# pulse is consumed by player.gd's _handle_recall_input(),
+				# which only acts on it while the dart is FLYING/EMBEDDED --
+				# harmless no-op otherwise (dart already back in hand).
+				_recall_pending = true
 				_state = BotState.CHASE
 
 
@@ -148,7 +180,14 @@ func _find_target():  # returns untyped player node for duck-typed access
 	var closest = null
 	var best_dist := INF
 	for p in get_tree().get_nodes_in_group("players"):
-		if p == player or p.is_dead or p.lives <= 0:
+		if p == player:
+			continue
+		# Same null-safe duck-typed read as _physics_process() above -- lives
+		# doesn't exist on player.gd yet either.
+		if p.get("is_dead") == true:
+			continue
+		var p_lives = p.get("lives")
+		if p_lives != null and p_lives <= 0:
 			continue
 		var d: float = player.get_pos_2d().distance_to(p.get_pos_2d())
 		if d < best_dist:

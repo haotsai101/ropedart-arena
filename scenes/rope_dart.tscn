@@ -1,0 +1,49 @@
+[gd_scene load_steps=8 format=3 uid="uid://dart_scene_01"]
+
+[ext_resource type="Script" path="res://scripts/rope_dart.gd" id="1_dart"]
+
+[sub_resource type="SphereShape3D" id="DartShape"]
+radius = 0.12
+
+[sub_resource type="CylinderMesh" id="HeadMesh"]
+top_radius = 0.0
+bottom_radius = 0.14
+height = 0.4
+
+[sub_resource type="StandardMaterial3D" id="HeadMat"]
+albedo_color = Color(0.15, 0.15, 0.18, 1)
+metallic = 0.6
+roughness = 0.35
+
+[sub_resource type="TorusMesh" id="LinkMesh"]
+inner_radius = 0.025
+outer_radius = 0.06
+rings = 6
+ring_segments = 8
+
+[sub_resource type="StandardMaterial3D" id="RopeMat"]
+albedo_color = Color(0.55, 0.42, 0.25, 1)
+roughness = 0.9
+metallic = 0.2
+
+[sub_resource type="MultiMesh" id="RopeMultiMesh"]
+transform_format = 1
+use_colors = false
+use_custom_data = false
+instance_count = 48
+visible_instance_count = 0
+mesh = SubResource("LinkMesh")
+
+[node name="RopeDart" type="CharacterBody3D"]
+script = ExtResource("1_dart")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="."]
+shape = SubResource("DartShape")
+
+[node name="Head" type="MeshInstance3D" parent="."]
+mesh = SubResource("HeadMesh")
+surface_material_override/0 = SubResource("HeadMat")
+
+[node name="RopeLine" type="MultiMeshInstance3D" parent="."]
+material_override = SubResource("RopeMat")
+multimesh = SubResource("RopeMultiMesh")

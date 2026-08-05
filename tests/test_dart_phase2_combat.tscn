@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://c8x2mhak3w4qr"]
+
+[ext_resource type="Script" path="res://tests/test_dart_phase2_combat.gd" id="1_combat"]
+
+[node name="TestDartPhase2Combat" type="Node"]
+script = ExtResource("1_combat")

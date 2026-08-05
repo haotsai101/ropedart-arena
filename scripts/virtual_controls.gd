@@ -2,29 +2,34 @@ extends CanvasLayer
 ## Virtual on-screen joystick overlay for touch devices.
 ## Left stick: movement (bottom-left), Right stick: aim (bottom-right),
 ## Throw button: above right stick, Slash button: to the left of throw.
+## Throw and Recall are the SAME input everywhere (keyboard/mouse, gamepad,
+## touch) -- see player.gd's _get_action_held() -- so there is deliberately
+## no separate Recall button here; get_recall_held() is a thin alias of
+## get_throw_held() kept only so player.gd doesn't need a touch-specific
+## special case.
 ## Exposed API: get_move() -> Vector2, get_aim() -> Vector2,
-## get_throw_held() -> bool, get_slash_held() -> bool.
+## get_throw_held() -> bool, get_slash_held() -> bool, get_recall_held() -> bool.
 
-const BASE_RADIUS  := 110.0
-const KNOB_RADIUS  :=  40.0
-const THROW_RADIUS :=  55.0
-const SLASH_RADIUS :=  42.0
-const MARGIN       :=  30.0
-const THROW_GAP    :=  20.0   # px gap between right stick top and throw button bottom
-const SLASH_GAP    :=  16.0   # px gap between throw button and slash button
+const BASE_RADIUS   := 110.0
+const KNOB_RADIUS   :=  40.0
+const THROW_RADIUS  :=  55.0
+const SLASH_RADIUS  :=  42.0
+const MARGIN        :=  30.0
+const THROW_GAP     :=  20.0   # px gap between right stick top and throw button bottom
+const SLASH_GAP     :=  16.0   # px gap between throw button and slash button
 
-const COLOR_BASE         := Color(0.1, 0.1, 0.1, 0.4)
-const COLOR_KNOB         := Color(0.8, 0.8, 0.8, 0.6)
-const COLOR_THROW        := Color(0.9, 0.4, 0.1, 0.7)
-const COLOR_THROW_ACTIVE := Color(1.0, 0.6, 0.2, 0.9)
-const COLOR_SLASH        := Color(0.2, 0.6, 0.9, 0.7)
-const COLOR_SLASH_ACTIVE := Color(0.3, 0.75, 1.0, 0.9)
+const COLOR_BASE          := Color(0.1, 0.1, 0.1, 0.4)
+const COLOR_KNOB          := Color(0.8, 0.8, 0.8, 0.6)
+const COLOR_THROW         := Color(0.9, 0.4, 0.1, 0.7)
+const COLOR_THROW_ACTIVE  := Color(1.0, 0.6, 0.2, 0.9)
+const COLOR_SLASH         := Color(0.2, 0.6, 0.9, 0.7)
+const COLOR_SLASH_ACTIVE  := Color(0.3, 0.75, 1.0, 0.9)
 
 # Computed screen positions
-var _left_base:    Vector2 = Vector2.ZERO
-var _right_base:   Vector2 = Vector2.ZERO
-var _throw_center: Vector2 = Vector2.ZERO
-var _slash_center: Vector2 = Vector2.ZERO
+var _left_base:     Vector2 = Vector2.ZERO
+var _right_base:    Vector2 = Vector2.ZERO
+var _throw_center:  Vector2 = Vector2.ZERO
+var _slash_center:  Vector2 = Vector2.ZERO
 
 # Touch state
 var _left_knob_offset:  Vector2 = Vector2.ZERO
@@ -33,10 +38,10 @@ var _throw_held:        bool    = false
 var _slash_held:        bool    = false
 
 # Finger ID tracking (-1 = not claimed)
-var _left_finger:  int = -1
-var _right_finger: int = -1
-var _throw_finger: int = -1
-var _slash_finger: int = -1
+var _left_finger:   int = -1
+var _right_finger:  int = -1
+var _throw_finger:  int = -1
+var _slash_finger:  int = -1
 
 var _canvas: Control = null
 
@@ -196,3 +201,10 @@ func get_throw_held() -> bool:
 ## Returns true while the slash button is held by a finger.
 func get_slash_held() -> bool:
 	return _slash_held
+
+
+## Returns true while the throw button is held -- Throw and Recall share the
+## same touch button now (see this file's header comment), so this is a thin
+## alias kept for player.gd call-site symmetry with get_throw_held().
+func get_recall_held() -> bool:
+	return _throw_held
