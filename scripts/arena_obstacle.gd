@@ -1,28 +1,24 @@
 extends StaticBody3D
-## Registers this node in the "obstacles" group so dagger.gd can stop a
-## thrown dagger against its footprint (see get_rect_2d(), a simple 2D
-## swept-rect test — no physics-engine query needed for that).
-
-## Layer 2 (named "rope_obstacles" in project.godot's [layer_names]) is added
-## on top of whatever collision_layer this node already has (normally the
-## default layer 1, left untouched so every existing raycast/query that hits
-## obstacles via the default layer keeps working unchanged) -- this is the
-## dedicated bit player.gd's real physics rope chain (see
-## _spawn_physics_rope() there) uses as its collision_mask, so the rope reacts
-## to real map geometry (pillars, trees/cacti) without ever being able to
-## detect/collide with players, the ground, or the dart head (none of which
-## carry this bit). No shared constant between the two scripts -- see
-## player.gd's ROPE_OBSTACLE_LAYER_BIT comment for this codebase's existing
-## precedent of tolerating small hand-synced duplication like this.
-const ROPE_OBSTACLE_LAYER_BIT: int = 1 << 1  # layer 2
+## Registers this node in the "obstacles" group -- basic map/arena collision
+## geometry (pillars, scattered trees/cacti via nature_scatter.gd). Exposes
+## get_rect_2d()/get_outline_2d(), a simple 2D footprint read with no
+## physics-engine query needed, for any gameplay system that wants a cheap
+## 2D collision test against these obstacles.
+##
+## WEAPON/COMBAT SYSTEM REMOVED (branch remove-weapon-system): this used to
+## also carry a dedicated "rope_obstacles" collision layer bit for the now-
+## deleted rope dart's physics chain (RigidBody3D segments reacting to real
+## obstacle geometry). That bit has been removed -- this node's
+## collision_layer is left exactly as authored (normally the default layer
+## 1) with no extra bit added.
 
 @export var half_size: Vector2 = Vector2(0.75, 0.75)
 
 ## Optional true footprint, as a polygon of LOCAL (X, Z) offsets from this
 ## obstacle's center, for a shape that isn't just an axis-aligned box — e.g. a
 ## tree trunk with root-flare notches. Currently unused by any gameplay
-## system (the dagger only ever tests against the coarse bounding box, see
-## get_rect_2d()) but kept available, and still populated by
+## system (nothing tests against anything finer than the coarse bounding box,
+## see get_rect_2d()) but kept available, and still populated by
 ## nature_scatter.gd per scattered object, for any future feature that wants
 ## a more precise per-object footprint than a plain box.
 @export var outline_points: PackedVector2Array = []
@@ -32,7 +28,6 @@ var _outline_hull: PackedVector2Array = []
 
 func _ready() -> void:
 	add_to_group("obstacles")
-	collision_layer = collision_layer | ROPE_OBSTACLE_LAYER_BIT
 	_compute_outline_hull()
 
 

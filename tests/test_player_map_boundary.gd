@@ -97,7 +97,6 @@ func _run_direction(player, label: String, dir: Vector2, speed: float = DASH_SPE
 	if player.is_falling:
 		player._reset_fall_visual()
 	player.is_falling = false
-	player.is_dead = false
 	player.collision_shape.disabled = false
 	player.velocity = Vector3.ZERO
 	player.global_position = Vector3(start_x, GameManager.PLAYER_HALF_HEIGHT, 0.0)

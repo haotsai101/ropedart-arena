@@ -1,16 +1,19 @@
 extends Node
 ## Round state machine autoload. Access globally as "GameManager".
+##
+## WEAPON/COMBAT SYSTEM REMOVED (branch remove-weapon-system): the round/match
+## win-condition machinery (lives_per_round, rounds_to_win, round_wins, the
+## ROUND_END/MATCH_END states, and the win-check that used to run when a
+## player was eliminated) is gone -- there is no combat outcome left to decide
+## a round or match winner. The state machine now only ever progresses
+## LOBBY -> COUNTDOWN -> PLAYING and stays in PLAYING (a "sandbox" match, not
+## a win/lose loop) -- see start_round()/_process() below.
 
-enum RoundState { LOBBY, COUNTDOWN, PLAYING, ROUND_END, MATCH_END }
+enum RoundState { LOBBY, COUNTDOWN, PLAYING }
 
 signal state_changed(new_state: int)
-signal round_ended(winner_index: int)
-signal match_ended(winner_index: int)
 
-@export var lives_per_round: int = 3
-@export var rounds_to_win: int = 3
 @export var countdown_duration: float = 3.0
-@export var round_end_delay: float = 3.5
 @export var total_players: int = 4
 @export var human_count: int = 1
 @export var bot_difficulty: int = 0   # 0=Easy 1=Medium 2=Hard
@@ -20,7 +23,6 @@ var is_online: bool = false   # set to true by lobby.gd when launching online ma
 var selected_map_scene: String = "res://scenes/main.tscn"   # set by lobby.gd before change_scene_to_file
 
 var current_state: int = RoundState.LOBBY
-var round_wins: Dictionary = {}
 var player_characters: Dictionary = {}   # player_index (int) → character id (String)
 ## "" means "use the base character's native accessory" (see CHARACTER_DEFS'
 ## native_headwear/native_cloth fields, resolved via resolve_headwear_id/
@@ -29,9 +31,7 @@ var player_characters: Dictionary = {}   # player_index (int) → character id (
 var player_headwear: Dictionary = {}     # player_index (int) → headwear id (String)
 var player_cloth: Dictionary = {}        # player_index (int) → cloth id (String)
 var _all_players: Array = []
-var _alive_players: Array = []
 var _timer: float = 0.0
-var _winner_index: int = -1
 
 const PLAYER_COLORS := [
 	Color(0.3, 0.6, 0.9),
@@ -129,20 +129,11 @@ func resolve_cloth_id(base_char_id: String, choice: String) -> String:
 
 const PLAYER_HALF_HEIGHT := 0.7  # half-height of the player capsule; added to spawn marker Y
 
-## ROUND 16 (2026-07-25): the RAW scenes/player.tscn CapsuleShape3D.height
-## value, mirrored here by hand (no way to read a .tscn sub-resource from a
-## const expression at compile time) -- same hand-sync convention this
-## codebase already uses for e.g. player.gd's HITBOX_DEBUG_RADIUS. Added per
-## explicit user correction of ROUND 15's own pick: ROUND 15 deliberately
-## chose PLAYER_HALF_HEIGHT*2.0 (1.4) over this raw capsule height (1.2) for
-## DART_ROPE_LENGTH's "6x character height" derivation, reasoning that two
-## other real gameplay systems already agreed on 1.4 -- but the user's actual
-## goal that round was "the rope is currently too long," and 6x1.4=8.4 is
-## LONGER than the pre-ROUND-15 8.0, which contradicted that goal. Directly
-## asked whether the raw capsule height (1.2, giving 6x1.2=7.2, genuinely
-## shorter) was intended instead; user's reply: "Change to 1.2." This
-## constant now exists so DART_ROPE_LENGTH/ROPE_LENGTH reference a named
-## value instead of a bare literal, per that same request.
+## The RAW scenes/player.tscn CapsuleShape3D.height value, mirrored here by
+## hand (no way to read a .tscn sub-resource from a const expression at
+## compile time). Originally introduced to derive the now-removed rope dart's
+## length ("6x character height") -- kept as a general character-size
+## constant in case a future weapon/combat system needs it again.
 const PLAYER_CAPSULE_HEIGHT := 1.2
 
 const _FALLBACK_SPAWNS := [
@@ -193,9 +184,6 @@ func _init_game_local(main: Node) -> void:
 		p.character_headwear_id = str(player_headwear.get(i, ""))
 		p.character_cloth_id = str(player_cloth.get(i, ""))
 		main.add_child(p)
-		round_wins[i] = 0
-		p.player_killed.connect(_on_player_killed)
-		p.player_eliminated.connect(_on_player_eliminated)
 		_all_players.append(p)
 		if p.is_bot:
 			var bc = bot_script.new()
@@ -244,9 +232,6 @@ func _init_game_online(main: Node) -> void:
 		p.character_headwear_id = str(player_headwear.get(i, ""))
 		p.character_cloth_id = str(player_cloth.get(i, ""))
 		main.add_child(p)
-		round_wins[i] = 0
-		p.player_killed.connect(_on_player_killed)
-		p.player_eliminated.connect(_on_player_eliminated)
 		_all_players.append(p)
 		if p.is_bot and multiplayer.is_server():
 			var bc = bot_script.new()
@@ -303,10 +288,6 @@ func _process(delta: float) -> void:
 			# Transition after a short "GO!" window so the HUD can display it
 			if _timer <= -0.5:
 				_set_state(RoundState.PLAYING)
-		RoundState.ROUND_END:
-			_timer -= delta
-			if _timer <= 0.0:
-				_check_match_end()
 
 
 func _set_state(new_state: int) -> void:
@@ -327,12 +308,10 @@ func _rpc_set_state(new_state: int) -> void:
 
 
 @rpc("authority", "call_local", "reliable")
-func _rpc_sync_settings(total: int, humans: int, difficulty: int, lives: int, rounds: int) -> void:
+func _rpc_sync_settings(total: int, humans: int, difficulty: int) -> void:
 	total_players = total
 	human_count = humans
 	bot_difficulty = difficulty
-	lives_per_round = lives
-	rounds_to_win = rounds
 
 
 func get_countdown_remaining() -> float:
@@ -345,7 +324,7 @@ func start_round() -> void:
 		return
 	# Sync match settings to all clients before starting countdown.
 	if is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server():
-		rpc("_rpc_sync_settings", total_players, human_count, bot_difficulty, lives_per_round, rounds_to_win)
+		rpc("_rpc_sync_settings", total_players, human_count, bot_difficulty)
 		if player_characters.is_empty():
 			assign_default_characters()
 		rpc("_rpc_sync_characters", player_characters)
@@ -354,8 +333,7 @@ func start_round() -> void:
 	for i in _all_players.size():
 		var p = _all_players[i]
 		var pos: Vector3 = spawn_positions[i % spawn_positions.size()]
-		p.reset_for_round(lives_per_round, pos)
-	_alive_players = _all_players.duplicate()
+		p.reset_for_round(pos)
 	_timer = countdown_duration
 	_set_state(RoundState.COUNTDOWN)
 
@@ -368,37 +346,3 @@ func _get_spawn_positions() -> Array:
 			positions.append(m.global_position + Vector3(0, PLAYER_HALF_HEIGHT, 0))
 		return positions
 	return _FALLBACK_SPAWNS
-
-
-func _on_player_killed(_player: Variant) -> void:
-	pass  # HUD handles lives display via player's own signal
-
-
-func _on_player_eliminated(player: Variant) -> void:
-	_alive_players.erase(player)
-	if _alive_players.size() <= 1 and current_state == RoundState.PLAYING:
-		if _alive_players.size() == 0:
-			_end_round(-1)  # Everyone dead at once — draw
-		else:
-			_end_round(_alive_players[0].player_index)
-
-
-func _end_round(winner_idx: int) -> void:
-	if winner_idx >= 0:
-		_winner_index = winner_idx
-		round_wins[_winner_index] = round_wins.get(_winner_index, 0) + 1
-		round_ended.emit(_winner_index)
-	else:
-		_winner_index = -1
-		round_ended.emit(-1)
-	_timer = round_end_delay
-	_set_state(RoundState.ROUND_END)
-
-
-func _check_match_end() -> void:
-	for idx: int in round_wins:
-		if round_wins[idx] >= rounds_to_win:
-			match_ended.emit(idx)
-			_set_state(RoundState.MATCH_END)
-			return
-	start_round()

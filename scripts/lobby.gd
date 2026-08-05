@@ -47,8 +47,6 @@ var _browser_refresh_timer: float = 0.0
 
 # Waiting screen (host settings)
 var _wait_settings_focus: int = 0   # 0 = max_players row, 1 = bot_difficulty row, 2 = map row
-var _lives_value: int = 3
-var _rounds_value: int = 3
 
 # Local config screen
 var _local_total_players: int = 4
@@ -1562,8 +1560,6 @@ func _commit_local_char_select() -> void:
 	GameManager.total_players = _local_total_players
 	GameManager.human_count = 1
 	GameManager.bot_difficulty = _local_bot_difficulty
-	GameManager.lives_per_round = 3
-	GameManager.rounds_to_win = 3
 	GameManager.selected_map_scene = MAP_SCENES[clampi(_local_map_id, 0, MAP_SCENES.size() - 1)]
 	get_tree().change_scene_to_file(GameManager.selected_map_scene)
 	GameManager.call_deferred("_init_game")
@@ -1578,8 +1574,6 @@ func _start_online_game() -> void:
 	GameManager.total_players = NetworkManager.room_settings.get("max_players", 4)
 	GameManager.bot_difficulty = NetworkManager.room_settings.get("bot_difficulty", 0)
 	GameManager.human_count = NetworkManager.room_players.size()
-	GameManager.lives_per_round = _lives_value
-	GameManager.rounds_to_win = _rounds_value
 	GameManager.lobby_mode = false
 	var map_id: int = NetworkManager.room_settings.get("map_id", 0)
 	GameManager.selected_map_scene = MAP_SCENES[clampi(map_id, 0, MAP_SCENES.size() - 1)]

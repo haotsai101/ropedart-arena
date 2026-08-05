@@ -157,7 +157,7 @@ func _add_obstacle_collision(t: Transform3D, native_footprint: Vector2) -> void:
 	## Spawns a StaticBody3D + arena_obstacle.gd + BoxShape3D at the same XZ
 	## position as the paired visual instance, mirroring the PillarA/PillarB
 	## pattern exactly (registers in "obstacles" group via arena_obstacle.gd's
-	## own _ready(), exposes get_rect_2d() for dagger.gd's swept-rect stop test).
+	## own _ready(), exposes get_rect_2d() as a cheap 2D footprint read).
 	##
 	## The collision body's basis is identity (never rotated) since
 	## arena_obstacle.gd's rect is always axis-aligned — but rather than

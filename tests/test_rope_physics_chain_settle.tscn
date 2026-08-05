@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://dxk1a2b3c4d5e"]
-
-[ext_resource type="Script" path="res://tests/test_rope_physics_chain_settle.gd" id="1_settle"]
-
-[node name="TestRopePhysicsChainSettle" type="Node"]
-script = ExtResource("1_settle")

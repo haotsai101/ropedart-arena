@@ -26,8 +26,11 @@ func _ready() -> void:
 
 
 func _process(delta: float) -> void:
-	var players := get_tree().get_nodes_in_group("players")
-	var active: Array = players.filter(func(p): return p.lives > 0 and not p.is_dead)
+	## WEAPON/COMBAT SYSTEM REMOVED (branch remove-weapon-system): players no
+	## longer have a lives/is_dead concept (see player.gd's own header
+	## comment) and there are no rope darts left to fly out of frame -- every
+	## player in the "players" group is simply always in-frame now.
+	var active := get_tree().get_nodes_in_group("players")
 	if active.is_empty():
 		return
 
@@ -37,14 +40,6 @@ func _process(delta: float) -> void:
 		var pos: Vector2 = p.get_pos_2d()
 		min_x = minf(min_x, pos.x); max_x = maxf(max_x, pos.x)
 		min_z = minf(min_z, pos.y); max_z = maxf(max_z, pos.y)
-
-	# Thrown rope darts can fly well past their owner (up to ROPE_LENGTH) and
-	# then sit there anchored until picked up -- without this, one lying out
-	# near the edge of a wide shot can end up outside the frame entirely.
-	for d in get_tree().get_nodes_in_group("darts"):
-		var dpos: Vector2 = d.head_2d
-		min_x = minf(min_x, dpos.x); max_x = maxf(max_x, dpos.x)
-		min_z = minf(min_z, dpos.y); max_z = maxf(max_z, dpos.y)
 
 	min_x = maxf(min_x - margin, -arena_clamp)
 	max_x = minf(max_x + margin,  arena_clamp)
