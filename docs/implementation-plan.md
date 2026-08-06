@@ -155,49 +155,64 @@ throw when the dart's in hand, recall when it's away — on desktop and touch.
 
 ---
 
-## Phase 3 — Kick
+## Phase 3 — Slash / Kick
 
-**Goal:** give the player something to do at melee range while the dart is
-away (Pillar #1 — "your attack options change").
+**Goal:** give the player a melee option at close range regardless of dart
+state (Pillar #1 — "your attack options change"), not just while the dart
+is away.
 
-- Kick input + hitbox on `player.gd`, gated to "dart not in hand" (usable
-  during `FLYING/EMBEDDED/SWINGING/RETURNING`, not `HOLSTERED/CHARGING`).
-- Knockback only, never lethal.
+- **Same button** for both, context-sensitive on `dart.state` — same
+  pattern as the Throw/Recall unification:
+  - Dart in hand (`HOLSTERED`/`CHARGING`): **Slash** — melee with the dart
+    itself. Always lethal on contact, same rule as the thrown dart.
+  - Dart away (`FLYING`/`EMBEDDED`/`SWINGING`/`RETURNING`): **Kick** —
+    unarmed melee. Knockback only, never lethal.
 - Remove the dead `SLASH_RANGE` / `get_desired_slash()` melee-slash remnants
-  in `bot_controller.gd` — Kick replaces melee-slash outright, per the GDD.
-- `virtual_controls.gd`: repoint the existing Slash button to Kick
-  (`get_slash_held()` → `get_kick_held()`) rather than adding a new button —
-  the touch layout already has a correctly-placed action button here.
+  in `bot_controller.gd` and replace with real Slash/Kick bot logic (bots
+  should threaten a kill at melee range when the human still has their dart
+  holstered, not just when it's away).
+- `virtual_controls.gd`: repoint the existing Slash button to this unified
+  Slash/Kick input rather than adding a new button — the touch layout
+  already has a correctly-placed action button here.
 
-**Manual test:** throw your dart away, walk up to an opponent, Kick —
-they're shoved back, not killed. Confirm Kick does nothing while the dart is
-still Holstered or Charging. Run on desktop **and** touch — confirm the
-repointed button reads as Kick, not the old slash.
+**Manual test:** with the dart still holstered, walk up to an opponent and
+Slash — it kills them, same as a thrown-dart hit. Throw your dart away,
+walk up to an opponent, and use the same button — now it Kicks them
+(shoved back, not killed). Run on desktop **and** touch.
 
 ---
 
-## Phase 4 — Weapon-swing + wrap-around
+## Phase 4 — Weapon-swing + wrap-around (DONE)
 
 **Goal:** the highest-risk phase — the `SWINGING` state exactly as scoped
 in the GDD, in isolation from round/bot complexity so it's easy to iterate
 on.
 
-- Replace Phase 1's straight-line constraint with a **segmented** one:
-  player → wrap point(s) → dart.
-- Wrap-point detection: when the straight player↔dart line crosses an
-  `ArenaObstacle`'s `get_outline_2d()`/`get_rect_2d()`, insert a wrap point
-  at the tangent and recompute the segmented path each frame.
-- Input: **Throw + aim direction while `EMBEDDED`** → unanchor, dart
-  arcs/swings toward the new direction, re-anchors into valid map geometry
-  on landing (back to `EMBEDDED`).
-- Chainable: repeat Throw+direction to redirect again and again. **Recall**
-  is the only way out into `RETURNING`.
-- Dart stays lethal on contact throughout (already true from Phase 2 — this
-  phase just has to hold that up under the new physics).
-- Touch input design for the redirect gesture (Throw + aim direction while
-  `EMBEDDED`, reusing the existing Throw button and aim stick) — verify the
-  tap-target and timing feel deliberate on a touchscreen given how often
-  it'll be used mid-fight, not just functionally identical to desktop.
+**Wrap-around: DONE**, pulled forward ahead of schedule and built out far
+more thoroughly than originally scoped here, across several follow-on
+fixes:
+- Segmented player → wrap-point(s) → dart constraint, replacing the
+  straight-line one, driven by `ArenaObstacle` rect/outline geometry.
+- Wrap tracking is **stateful/incremental** (not a fresh shortest-path
+  search every frame) so it doesn't snap to the opposite side of an
+  obstacle as the player walks around it.
+- Chain link visuals interlock properly and terminate at a tail ring on
+  the dart, following the same wrap-aware path.
+- `RETURNING`/Recall retraces the wrap path point by point (unwinding
+  around the obstacle) instead of beelining through it, including a fix
+  for recall's wrap memory starting blank and briefly picking the wrong
+  side on the very first tick after a long walk around an obstacle.
+
+**`SWINGING` mechanic: DONE.** Final input design (resolved after the
+Throw/Recall unification made the GDD's original "Throw + aim direction
+while Embedded" trigger ambiguous with Recall on the same button): while
+`EMBEDDED`, a **quick tap** still means Recall (no regression); a **hold,
+then release aiming a direction** means Redirect — the same hold-to-aim/
+release-to-throw gesture as the original throw, just triggered from the
+dart's current anchor. Chainable indefinitely; a quick-tap Recall is the
+only way out into `RETURNING`. Touch gets its own color-coded affordance
+once a hold crosses the redirect threshold, so a touch player can tell
+"release now = redirect" from "release now = recall."
 
 **Manual test:** embed the dart in a wall, stand near a pillar, trigger a
 swing-redirect that arcs past it — the rope should visibly bend around the

@@ -114,14 +114,23 @@ Right Stick / Mouse
 
 ---
 
-## Throw / Recall
+## Throw / Recall / Redirect
 
-**Same button** — Right Trigger / Left Mouse — context-sensitive on the dart's current state:
+**Same button** — Right Trigger / Left Mouse — context-sensitive on the dart's current state, disambiguated by gesture where a state has more than one meaning:
 
 * Dart in hand (Holstered/Charging): hold to charge, release to throw.
-* Dart away (Flying/Embedded): press to recall — pulls the dart back, speed increasing over time. Can damage enemies during recall.
+* Dart away, Embedded: two distinct gestures on the same button —
+  * **Quick tap** — Recall. Pulls the dart back to hand, speed increasing over time. Can damage enemies during recall.
+  * **Hold, then release aiming a direction** — Redirect (Swinging). Unanchors the dart and sends it toward the newly-aimed direction, re-anchoring where it lands. Chainable — hold+release again to redirect again. Same hold-to-aim/release-to-send gesture as the initial throw, just triggered from the dart's current anchor instead of your hand.
+* Dart away, Flying/Returning: press to recall (Redirect doesn't apply here — there's no anchor to redirect from).
 
-One input covers the whole throw-and-retrieve loop; there is no separate Recall binding.
+One input covers the whole throw/retrieve/redirect loop; there is no separate Recall or Redirect binding.
+
+**Movement is restricted during committed dart actions** (Pillar #1 — "your movement is affected" while the dart is committed):
+
+* **Charging**: movement is locked — can't translate, can still turn/aim in place.
+* **Holding to redirect** (Embedded, button held before release): same full lock as Charging — the redirect hold *is* a charge. Longer hold = the dart travels further once released.
+* **Swinging (mid-redirect flight, after release)**: forward movement is locked — can move backward or strafe sideways, but can't advance.
 
 ---
 
@@ -139,15 +148,14 @@ Used for:
 
 ---
 
-## Kick
+## Slash / Kick
 
-Face Button (Secondary) / E
+**Same button** — Face Button (Secondary) / E — context-sensitive on the dart's current state, same pattern as Throw/Recall:
 
-Melee knockback.
+* Dart in hand (Holstered/Charging): Slash — a melee swing with the dart itself. Always lethal on contact, same as the thrown dart.
+* Dart away (Flying/Embedded/Swinging/Returning): Kick — unarmed melee. Knockback only, never lethal.
 
-Only usable while the dart is not in hand (unavailable Holstered or Charging; available Flying, Embedded, Swinging, Returning).
-
-Replaces the old melee-slash mechanic.
+Between the two, there is always a melee option available regardless of dart state. Replaces the old melee-slash-only mechanic.
 
 ---
 
@@ -157,7 +165,7 @@ Each player always has:
 
 * Rope Dart
 * Dash
-* Kick
+* Slash / Kick (context-sensitive melee, see Controls)
 
 No weapon pickups required.
 
@@ -209,15 +217,17 @@ Cannot exceed rope length.
 
 **v1 mechanic — weapon-swing.**
 
-Triggered by Throw + aim direction while Embedded.
+Triggered by hold-then-release, aiming a direction, while Embedded — **the hold is a charge, the same as the initial throw's charge**: movement is fully locked while holding (not just forward — no movement at all, matching Charging), and the longer the hold, the further the dart travels once released.
 
 The dart unanchors, swings/arcs toward the new aimed direction, and re-anchors into valid map geometry when it lands.
 
 The swing path wraps around map obstacles (pillars, trees) via the segmented rope chain.
 
-Chainable: Throw + direction again redirects into another swing. Recall is the only way to exit into Returning.
+Chainable: hold+release again redirects into another swing. A quick tap (Recall) is the only way to exit into Returning.
 
 The dart is always lethal on contact, regardless of swing speed.
+
+During the flight leg itself (after release, before it lands), the player can move backward or strafe but can't advance forward — see Controls' movement-restriction note.
 
 *(Player-mobility pendulum-swinging around a fixed anchor is a separate, bonus mechanic — see Mobility.)*
 
@@ -235,7 +245,7 @@ The dart is always lethal on contact while returning.
 
 ## Embedded
 
-The dart sticks into valid surfaces.
+The dart sticks into valid surfaces. Stationary and **not lethal to touch** while anchored — see Combat's "Dart Contact" section.
 
 Player may:
 
@@ -264,9 +274,9 @@ Damage is determined by **hit type**, not speed or hit location.
 
 ## Dart Contact
 
-Always lethal.
+Lethal whenever the dart is actively moving or wielded — Flying, Swinging, Returning, or a melee Slash while still in hand (Holstered, Charging).
 
-Applies in every dart state: Flying, Embedded landing, Swinging, Returning.
+**Embedded is the exception: a stationary anchored dart is not lethal to touch.** Once it lands and sticks, it's just a planted anchor point, not an active threat — walking into it (or near it) doesn't kill you. Rope contact remains trip/slow only, unaffected by this.
 
 ---
 
@@ -278,7 +288,7 @@ The rope itself trips and slows — never lethal.
 
 ## Kick
 
-Knockback only. Only usable while the dart is not in hand.
+Knockback only, never lethal. Only usable while the dart is not in hand — the unarmed counterpart to Slash.
 
 ---
 
