@@ -7,6 +7,31 @@ extends CanvasLayer
 ## no separate Recall button here; get_recall_held() is a thin alias of
 ## get_throw_held() kept only so player.gd doesn't need a touch-specific
 ## special case.
+##
+## Phase 3: the Slash button is likewise repointed to the unified Slash/Kick
+## input (player.gd's _get_melee_action_held()) rather than getting its own
+## new button -- get_slash_held() itself, and the button's screen position/
+## visuals, are unchanged; only what player.gd DOES with the signal changed
+## (Slash with the dart in hand, Kick with it away, same context-sensitive
+## pattern as Throw/Recall). No touch-side code needed for that repoint.
+##
+## Phase 4: the Throw button is ALSO how a touch player redirects a swing
+## (tap while EMBEDDED = Recall, hold-then-release aiming with the right
+## stick = Redirect -- see player.gd's _handle_dart_away_input()). The raw
+## held/not-held signal this file exposes is mechanically identical for
+## touch and desktop (both just feed the same level signal into player.gd's
+## own hold-duration tracking), so no new input plumbing is needed here --
+## but unlike a mouse click, a touch player gets no natural physical
+## "click"/"hold" feedback from the hardware itself, and this button doubles
+## as BOTH Throw-charge and Recall/Redirect depending on dart state, so a
+## clear in-UI affordance for "you have now held long enough that releasing
+## will redirect, not tap-recall" matters more here than on desktop, given
+## how often this fires mid-fight. _throw_held_time/HOLD_REDIRECT_THRESHOLD
+## below drive a third, distinct button color once held past that point --
+## purely cosmetic, mirrors (not reads) player.gd's own
+## SWING_REDIRECT_HOLD_THRESHOLD so what the player SEES matches what
+## actually happens on release without this file needing to know anything
+## about dart.state itself.
 ## Exposed API: get_move() -> Vector2, get_aim() -> Vector2,
 ## get_throw_held() -> bool, get_slash_held() -> bool, get_recall_held() -> bool.
 
@@ -22,8 +47,23 @@ const COLOR_BASE          := Color(0.1, 0.1, 0.1, 0.4)
 const COLOR_KNOB          := Color(0.8, 0.8, 0.8, 0.6)
 const COLOR_THROW         := Color(0.9, 0.4, 0.1, 0.7)
 const COLOR_THROW_ACTIVE  := Color(1.0, 0.6, 0.2, 0.9)
+## Distinct third color once a held press has crossed HOLD_REDIRECT_THRESHOLD
+## -- see this file's own header comment on why touch needs this cue that
+## desktop doesn't. Deliberately a different hue (yellow-white), not just a
+## brighter/darker version of COLOR_THROW_ACTIVE, so it reads as a distinct
+## MODE rather than "the same button pressed harder".
+const COLOR_THROW_HOLDING := Color(1.0, 0.9, 0.15, 0.95)
 const COLOR_SLASH         := Color(0.2, 0.6, 0.9, 0.7)
 const COLOR_SLASH_ACTIVE  := Color(0.3, 0.75, 1.0, 0.9)
+
+## Mirrors player.gd's own SWING_REDIRECT_HOLD_THRESHOLD constant BY VALUE
+## (hand-kept in sync, same convention already used elsewhere in this project
+## for cross-script constants -- e.g. MELEE_RANGE between player.gd and
+## bot_controller.gd) -- used ONLY to decide when to swap this button's own
+## drawn color below. Never gates any real gameplay decision itself; the
+## actual tap-vs-hold call is made in player.gd from the plain held signal
+## this file already exposes via get_throw_held()/get_recall_held().
+const HOLD_REDIRECT_THRESHOLD: float = 0.1
 
 # Computed screen positions
 var _left_base:     Vector2 = Vector2.ZERO
@@ -36,6 +76,12 @@ var _left_knob_offset:  Vector2 = Vector2.ZERO
 var _right_knob_offset: Vector2 = Vector2.ZERO
 var _throw_held:        bool    = false
 var _slash_held:        bool    = false
+
+## How long the throw button has been continuously held, in seconds --
+## purely for the COLOR_THROW_HOLDING cosmetic swap in _on_canvas_draw()
+## (see HOLD_REDIRECT_THRESHOLD's own comment); reset to 0 the instant the
+## finger lifts (_handle_touch()'s release branch below).
+var _throw_held_time: float = 0.0
 
 # Finger ID tracking (-1 = not claimed)
 var _left_finger:   int = -1
@@ -56,6 +102,19 @@ func _ready() -> void:
 	add_child(_canvas)
 	get_viewport().size_changed.connect(_update_layout)
 	_update_layout()
+
+
+## Advances _throw_held_time while the button is held, purely to drive the
+## COLOR_THROW_HOLDING cosmetic threshold crossing in _on_canvas_draw() (see
+## that const's own comment) -- queues a redraw right when the color would
+## actually change, not every frame, since draw_circle's own color otherwise
+## only needs to change once per press/release cycle.
+func _process(delta: float) -> void:
+	if _throw_held:
+		var was_past: bool = _throw_held_time >= HOLD_REDIRECT_THRESHOLD
+		_throw_held_time += delta
+		if not was_past and _throw_held_time >= HOLD_REDIRECT_THRESHOLD and _canvas != null:
+			_canvas.queue_redraw()
 
 
 func _update_layout() -> void:
@@ -85,8 +144,12 @@ func _on_canvas_draw() -> void:
 	_canvas.draw_circle(_right_base, BASE_RADIUS, COLOR_BASE)
 	_canvas.draw_circle(_right_base + _right_knob_offset, KNOB_RADIUS, COLOR_KNOB)
 
-	# --- Throw button ---
-	var btn_color: Color = COLOR_THROW_ACTIVE if _throw_held else COLOR_THROW
+	# --- Throw button --- (see HOLD_REDIRECT_THRESHOLD's own comment: the
+	# distinct COLOR_THROW_HOLDING tint is purely cosmetic feedback for "held
+	# long enough that releasing now will Redirect, not tap-Recall")
+	var btn_color: Color = COLOR_THROW
+	if _throw_held:
+		btn_color = COLOR_THROW_HOLDING if _throw_held_time >= HOLD_REDIRECT_THRESHOLD else COLOR_THROW_ACTIVE
 	_canvas.draw_circle(_throw_center, THROW_RADIUS, btn_color)
 	var fallback_font: Font = ThemeDB.fallback_font
 	if fallback_font != null:
@@ -137,6 +200,7 @@ func _handle_touch(event: InputEventScreenTouch) -> void:
 		elif _throw_finger == -1 and pos.distance_to(_throw_center) <= THROW_RADIUS + 20.0:
 			_throw_finger = event.index
 			_throw_held = true
+			_throw_held_time = 0.0
 			get_viewport().set_input_as_handled()
 		elif _slash_finger == -1 and pos.distance_to(_slash_center) <= SLASH_RADIUS + 20.0:
 			_slash_finger = event.index
@@ -159,6 +223,7 @@ func _handle_touch(event: InputEventScreenTouch) -> void:
 		if event.index == _throw_finger:
 			_throw_finger = -1
 			_throw_held = false
+			_throw_held_time = 0.0
 			get_viewport().set_input_as_handled()
 		if event.index == _slash_finger:
 			_slash_finger = -1
@@ -198,7 +263,9 @@ func get_throw_held() -> bool:
 	return _throw_held
 
 
-## Returns true while the slash button is held by a finger.
+## Returns true while the Slash/Kick button is held by a finger -- read by
+## player.gd's unified _get_melee_action_held() (Slash with the dart in
+## hand, Kick with it away, see this file's own header comment).
 func get_slash_held() -> bool:
 	return _slash_held
 

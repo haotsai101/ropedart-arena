@@ -1,8 +1,10 @@
 extends Node
 ## Regression test for Phase 2 of the post-GDD-rewrite rebuild (see
 ## docs/implementation-plan.md's Phase 2): rope_dart.gd's RETURNING state and
-## player-hit detection (dart contact = always lethal in every away-state;
-## rope-LINE contact = trip/slow only, never lethal).
+## player-hit detection (dart contact = lethal in every away-state EXCEPT
+## EMBEDDED, a stationary anchored dart is not lethal to touch -- Task #16;
+## rope-LINE contact = trip/slow only, never lethal, unaffected by the
+## EMBEDDED dart-head exception).
 ##
 ## Drives rope_dart.gd's real state machine and player.gd's real
 ## _physics_process through the actual scene tree (add_child + real physics
@@ -86,10 +88,16 @@ func _test_flying_kills_bystander() -> void:
 	await get_tree().physics_frame
 
 
-## B: a stationary EMBEDDED dart is still lethal on contact -- a player who
-## walks (or is placed) onto a landed dart dies.
+## B: a stationary EMBEDDED dart is NOT lethal on contact (design change,
+## docs/project.md's Combat "Dart Contact" section: "Embedded is the
+## exception: a stationary anchored dart is not lethal to touch") -- a player
+## who walks (or is placed) onto a landed dart survives touching the dart
+## head itself. Placed exactly at the dart's own position, the bystander also
+## sits exactly on the tail end of the rope's own hand->dart path, so this
+## doubles as confirmation that rope-LINE contact is unaffected by the
+## dart-head exception and still trips/slows even while EMBEDDED.
 func _test_embedded_kills_bystander() -> void:
-	var label := "B: EMBEDDED kills bystander on contact"
+	var label := "B: EMBEDDED does not kill bystander on contact (rope-line trip still applies)"
 	var owner_p = _make_player(Vector3(0, 0.7, 0), Vector3(0, 0.7, 0))
 	owner_p.aim_dir = Vector2(0, 1)
 	owner_p.dart.begin_charge()
@@ -112,17 +120,27 @@ func _test_embedded_kills_bystander() -> void:
 
 	frames = 0
 	var killed := false
+	var trip_seen := false
 	while frames < TIMEOUT_FRAMES:
 		await get_tree().physics_frame
 		frames += 1
-		if bystander.global_position.distance_to(Vector3(40, 0.7, 40)) < 0.5:
+		if bystander._trip_timer > 0.0:
+			trip_seen = true
+		if bystander.is_dead or bystander.global_position.distance_to(Vector3(40, 0.7, 40)) < 0.5:
 			killed = true
+			break
+		# Rope-line trip is enough to confirm the exception is correctly
+		# scoped once we've also run long enough to be sure no death is
+		# merely delayed -- stop once both have had a fair chance to fire.
+		if trip_seen and frames >= 30:
 			break
 
 	if killed:
-		_pass(label, "respawned after %d frames of standing on the embedded dart" % frames)
+		_fail(label, "bystander standing on the embedded dart head was killed -- EMBEDDED dart contact must not be lethal")
+	elif not trip_seen:
+		_fail(label, "bystander standing on the embedded dart never tripped -- rope-line contact should still apply while EMBEDDED")
 	else:
-		_fail(label, "bystander placed exactly on the embedded dart was never killed")
+		_pass(label, "bystander survived %d frames standing on the embedded dart head, still tripped by rope-line contact" % frames)
 
 	owner_p.queue_free()
 	bystander.queue_free()

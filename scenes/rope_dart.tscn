@@ -1,4 +1,4 @@
-[gd_scene load_steps=8 format=3 uid="uid://dart_scene_01"]
+[gd_scene load_steps=10 format=3 uid="uid://dart_scene_01"]
 
 [ext_resource type="Script" path="res://scripts/rope_dart.gd" id="1_dart"]
 
@@ -15,6 +15,17 @@ albedo_color = Color(0.15, 0.15, 0.18, 1)
 metallic = 0.6
 roughness = 0.35
 
+[sub_resource type="TorusMesh" id="TailRingMesh"]
+inner_radius = 0.045
+outer_radius = 0.095
+rings = 8
+ring_segments = 10
+
+[sub_resource type="StandardMaterial3D" id="TailRingMat"]
+albedo_color = Color(0.62, 0.62, 0.68, 1)
+metallic = 0.85
+roughness = 0.25
+
 [sub_resource type="TorusMesh" id="LinkMesh"]
 inner_radius = 0.025
 outer_radius = 0.06
@@ -30,7 +41,7 @@ metallic = 0.2
 transform_format = 1
 use_colors = false
 use_custom_data = false
-instance_count = 48
+instance_count = 160
 visible_instance_count = 0
 mesh = SubResource("LinkMesh")
 
@@ -43,6 +54,11 @@ shape = SubResource("DartShape")
 [node name="Head" type="MeshInstance3D" parent="."]
 mesh = SubResource("HeadMesh")
 surface_material_override/0 = SubResource("HeadMat")
+
+[node name="TailRing" type="MeshInstance3D" parent="Head"]
+transform = Transform3D(1, 0, 0, 0, 0, 1, 0, -1, 0, 0, -0.28, 0)
+mesh = SubResource("TailRingMesh")
+surface_material_override/0 = SubResource("TailRingMat")
 
 [node name="RopeLine" type="MultiMeshInstance3D" parent="."]
 material_override = SubResource("RopeMat")
