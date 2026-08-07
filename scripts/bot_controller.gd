@@ -19,6 +19,7 @@ enum BotState { CHASE, AIM, RETREAT }
 ## state. Used below to tell "dart in hand" apart from "dart away".
 const DART_STATE_HOLSTERED = 0
 const DART_STATE_FLYING = 2
+const DART_STATE_EMBEDDED = 3
 const DART_STATE_SWINGING = 4
 const DART_STATE_RETURNING = 5
 
@@ -27,6 +28,29 @@ const AIM_DURATION  := [1.4, 0.7, 0.25]
 const AIM_NOISE_DEG := [35.0, 15.0, 3.0]
 const RETREAT_TIME  := [1.2, 0.9, 0.6]
 const SPEED_MULT    := [0.65, 0.85, 1.0]
+
+## Task #32: Hard-bot swing-redirect. Per docs/implementation-plan.md's
+## Phase 6 note ("Hard bots attempt redirects, Easy/Medium don't -- flag as a
+## judgment call"), only Difficulty.HARD ever triggers this.
+##
+## player.gd's _handle_dart_away_input() disambiguates the shared Throw/
+## Recall/Redirect button purely by hold DURATION while dart.state ==
+## EMBEDDED: a quick tap (button false again before
+## SWING_REDIRECT_HOLD_THRESHOLD, 0.25s) is Recall; a sustained hold that
+## clears SWING_REDIRECT_PICKUP_HOLD_TIME (0.4s) before release is Redirect
+## (anything held past the 0.25s threshold but short of 0.4s resolves to a
+## "pointless micro-hop" recall instead -- see that function's own comment).
+## A bot's normal get_desired_recall() is a ONE-SHOT pulse (true for exactly
+## one tick, then consumed) specifically so it always reads as a tap -- see
+## that function's own header comment -- so it can never clear either
+## threshold on its own. REDIRECT_HOLD_DURATION is simulated separately (see
+## _redirect_hold_active below) and picked to clear BOTH thresholds with a
+## real margin (0.1s / 6 physics ticks past the 0.4s floor, well past the
+## 0.25s tap boundary) without going all the way to player.gd's own 0.6s
+## max-charge ceiling (SWING_REDIRECT_MAX_CHARGE_TIME) -- charge_ratio for
+## this hold works out to 0.5 / 0.6 ~= 0.83, a strong, decisive redirect
+## speed without needing to tune a full max-charge hold on every attempt.
+const REDIRECT_HOLD_DURATION: float = 0.5
 
 # Ring-out safety: must match player.gd's ARENA_HALF. Bots stop steering
 # further outward once within EDGE_MARGIN of the platform edge (dodge/retreat
@@ -57,6 +81,18 @@ var _dash_pending: bool = false
 var _melee_pending: bool = false  # one-shot pulse, same contract as _throw_pending et al.
 var _melee_cooldown_timer: float = 0.0
 var _dodge_dir: Vector2 = Vector2.ZERO  # committed dodge direction; reset when threat clears
+## Task #32: true while this (Hard-only) bot is simulating a sustained
+## button hold to trigger a swing-redirect -- see REDIRECT_HOLD_DURATION's
+## own header comment for the whole mechanism this drives. Read directly by
+## get_desired_recall() below (returns true every tick this stays active,
+## unlike the one-shot _recall_pending pulse), and ticked down once per
+## physics frame in _physics_process(), which also re-aims at the live
+## target and fully owns the tick (skips melee/dodge/the CHASE-AIM-RETREAT
+## state machine) for as long as this stays true -- mirrors a real player's
+## own full movement lock while holding to redirect (docs/project.md:
+## "movement is restricted during committed dart actions").
+var _redirect_hold_active: bool = false
+var _redirect_hold_timer: float = 0.0
 ## Task #23: AIM's own aim-imperfection offset, rolled ONCE when entering
 ## BotState.AIM (see the CHASE->AIM transition below) and held fixed for the
 ## whole AIM_DURATION window, rather than re-rolled from scratch every single
@@ -101,11 +137,25 @@ func get_desired_dash() -> bool:
 		return true
 	return false
 
-## Same one-shot "pulse, not held" contract as get_desired_throw() above --
-## player.gd's _handle_recall_input() only needs a rising edge to call
-## rope_dart.gd's begin_recall(), same as _handle_throw_input() does for
-## begin_charge()/release_throw().
+## Two different contracts depending on what this bot is currently doing,
+## both consumed by the SAME call site (player.gd's _get_recall_held(), one
+## level up from _handle_dart_away_input()'s hold-duration tracking):
+##  - Plain recall: one-shot "pulse, not held", same contract as
+##    get_desired_throw() above -- player.gd's _handle_dart_away_input()
+##    only needs a press-then-release-next-tick to read as a tap and call
+##    rope_dart.gd's begin_recall(), same as _handle_throw_input() does for
+##    begin_charge()/release_throw().
+##  - Task #32 redirect-hold: while _redirect_hold_active is true (see its
+##    own header comment), this returns true continuously, tick after tick,
+##    for as long as that flag stays set -- a genuine sustained "held" signal
+##    rather than a pulse. _physics_process() flips the flag back to false
+##    on the tick the simulated hold should end, so the very next call here
+##    naturally reads as the falling edge (button released) player.gd's own
+##    hold-then-release gesture detection needs, with no separate "release"
+##    signal required.
 func get_desired_recall() -> bool:
+	if _redirect_hold_active:
+		return true
 	if _recall_pending:
 		_recall_pending = false
 		return true
@@ -154,6 +204,41 @@ func _physics_process(delta: float) -> void:
 	var dir: Vector2 = to_target.normalized() if dist > 0.01 else Vector2.ZERO
 
 	_timer -= delta
+
+	# Task #32: a redirect-hold in progress fully owns this and every
+	# subsequent tick until it releases -- see _redirect_hold_active's own
+	# header comment for why (mirrors a real player's full movement lock
+	# while holding to redirect). Keep re-aiming at the target's live
+	# position every tick (same target-direction logic BotState.AIM already
+	# uses below) so the eventual release throws toward where the target
+	# actually is, not a stale snapshot from the tick the hold started.
+	# get_desired_recall() reads _redirect_hold_active directly and returns
+	# true every tick this stays active; flipping it false here on the
+	# release tick is what produces the falling edge player.gd's
+	# _handle_dart_away_input() needs to resolve the sustained hold into an
+	# actual Redirect instead of a tap Recall.
+	if _redirect_hold_active:
+		_redirect_hold_timer -= delta
+		_desired_move = Vector2.ZERO
+		_desired_aim = dir
+		if _redirect_hold_timer <= 0.0:
+			_redirect_hold_active = false
+			# Back to RETREAT (not CHASE): the dart just landed at a fresh
+			# EMBEDDED anchor via the redirect leg that just completed, so
+			# the SAME RETREAT-exit decision below (chain another redirect
+			# vs. fall back to a plain recall) is exactly what should
+			# re-evaluate next, based on whatever the game state actually
+			# looks like once this new RETREAT_TIME window elapses --
+			# mirrors the GDD's own "chainable: hold+release again redirects
+			# into another swing" framing for a human player. Landing this
+			# in CHASE instead would strand the bot: CHASE only ever moves
+			# toward dart_in_hand, and nothing here recalls the dart on its
+			# own outside of RETREAT's own exit branch -- the bot would just
+			# walk around with an embedded dart forever, never attacking
+			# again.
+			_state = BotState.RETREAT
+			_timer = RETREAT_TIME[difficulty]
+		return
 
 	# Opportunistic melee: threaten a kill at melee range whenever the target
 	# is close enough, regardless of CHASE/AIM/RETREAT state -- mirrors how
@@ -208,14 +293,37 @@ func _physics_process(delta: float) -> void:
 		BotState.RETREAT:
 			_set_desired_move(my_pos, -_desired_aim * SPEED_MULT[difficulty])
 			if _timer <= 0.0:
-				# Recall the dart before going back to chase, mirroring how a
-				# human player uses Recall after a miss (GDD Combat: "Throw ->
-				# Miss -> Recall through enemies"). get_desired_recall()'s
-				# pulse is consumed by player.gd's _handle_recall_input(),
-				# which only acts on it while the dart is FLYING/EMBEDDED --
-				# harmless no-op otherwise (dart already back in hand).
-				_recall_pending = true
-				_state = BotState.CHASE
+				# Task #32: Hard bots with an EMBEDDED dart and a live target
+				# still in range prefer redirecting straight at the target
+				# over the plain recall-then-rethrow cycle below -- swinging
+				# from an existing anchor is faster/more aggressive than a
+				# full recall-recharge-rethrow loop (per this task's own
+				# framing). THROW_RANGE[difficulty] reuses the same
+				# per-difficulty range tuning CHASE already uses to decide
+				# "close enough to throw" -- no point committing a hold-based
+				# gesture at a target so far the redirect leg (which always
+				# targets the dart's full rope_length, see player.gd's
+				# _compute_redirect_charge_ratio()/Task #30 comment) couldn't
+				# meaningfully close on anyway. Easy/Medium never take this
+				# branch (difficulty check below), matching the plan's
+				# original Hard-only suggestion -- they always fall through
+				# to the pre-existing plain recall pulse, unchanged.
+				var dart_embedded: bool = player.dart != null and is_instance_valid(player.dart) and player.dart.state == DART_STATE_EMBEDDED
+				if difficulty == Difficulty.HARD and dart_embedded and dist <= THROW_RANGE[difficulty]:
+					_redirect_hold_active = true
+					_redirect_hold_timer = REDIRECT_HOLD_DURATION
+					_desired_aim = dir
+					_desired_move = Vector2.ZERO
+				else:
+					# Recall the dart before going back to chase, mirroring how
+					# a human player uses Recall after a miss (GDD Combat:
+					# "Throw -> Miss -> Recall through enemies").
+					# get_desired_recall()'s pulse is consumed by player.gd's
+					# _handle_recall_input(), which only acts on it while the
+					# dart is FLYING/EMBEDDED -- harmless no-op otherwise (dart
+					# already back in hand).
+					_recall_pending = true
+					_state = BotState.CHASE
 
 
 func _set_desired_move(pos: Vector2, move: Vector2) -> void:

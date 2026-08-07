@@ -268,6 +268,26 @@ again.
 - Decide swing-redirect usage per difficulty (e.g. Hard bots attempt
   redirects, Easy/Medium don't) — flag as a judgment call, not a hard
   requirement, since bot swing-aim may need its own tuning pass.
+  **Resolved by Task #32 (bots dashed/threw/recalled but never redirected —
+  a real, later-confirmed gap, not just a deferred nice-to-have):**
+  `bot_controller.gd` gained a dedicated `_redirect_hold_active`/
+  `_redirect_hold_timer` mechanism so a Hard bot can simulate a genuine
+  multi-tick hold-then-release on the shared Throw/Recall/Redirect button —
+  the one-shot `_recall_pending` pulse every other bot decision uses can
+  only ever read as a tap (see `get_desired_recall()`'s own header comment),
+  so it could never clear `player.gd`'s hold-duration gesture thresholds on
+  its own. Only `Difficulty.HARD`, and only when `RETREAT`'s exit timer
+  fires with the dart already `EMBEDDED` and a live target still within
+  `THROW_RANGE`, triggers a redirect-hold (aimed at the target's live
+  position, held ~0.5s — comfortably past both `SWING_REDIRECT_HOLD_
+  THRESHOLD` and `SWING_REDIRECT_PICKUP_HOLD_TIME`, short of `player.gd`'s
+  own 0.6s max-charge) instead of the plain recall pulse; releasing lands
+  back in `RETREAT` (not `CHASE`) so the same decision re-evaluates and can
+  chain another redirect, matching the GDD's "chainable" framing. Verified
+  via `run_project` (real match, not headless): Hard bots visibly chain
+  multiple redirects per life with no errors; Medium bots (tested at the
+  same difficulty gate) never redirect, confirming no regression to their
+  existing tap-recall-only behavior.
 
 **Manual test:** play a full local match vs 3 bots at each difficulty;
 confirm they throw, dodge, and kick sensibly with no errors in the debug
