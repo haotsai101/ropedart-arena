@@ -217,7 +217,7 @@ Cannot exceed rope length.
 
 **v1 mechanic — weapon-swing.**
 
-Triggered by hold-then-release, aiming a direction, while Embedded — **the hold is a charge, the same as the initial throw's charge**: movement is fully locked while holding (not just forward — no movement at all, matching Charging), and the longer the hold, the further the dart travels once released.
+Triggered by hold-then-release, aiming a direction, while Embedded — **the hold is a charge, the same as the initial throw's charge**: movement is fully locked while holding (not just forward — no movement at all, matching Charging), and the longer the hold, the faster the dart swings once released. Distance is not charge-scaled — a redirect always travels as far as the chain allows in the aimed direction (or until it hits something), same range logic as a normal throw. Charge affects speed only, mirroring exactly how the initial throw's own charge works.
 
 The dart unanchors, swings/arcs toward the new aimed direction, and re-anchors into valid map geometry when it lands.
 
