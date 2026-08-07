@@ -32,16 +32,27 @@ extends CanvasLayer
 ## SWING_REDIRECT_HOLD_THRESHOLD so what the player SEES matches what
 ## actually happens on release without this file needing to know anything
 ## about dart.state itself.
+##
+## Phase 4.5: Dash button, following the exact same finger-tracking/drawing
+## pattern as Throw/Slash above -- a plain level signal (held/not-held), no
+## tap-vs-hold distinction needed since player.gd's own _get_dash_pressed()
+## already does simple rising-edge detection on whatever level signal it
+## receives (see that function + _prev_dash in player.gd). Positioned above
+## the Slash button (same x, offset up) so it doesn't overlap either the
+## Slash or Throw buttons.
 ## Exposed API: get_move() -> Vector2, get_aim() -> Vector2,
-## get_throw_held() -> bool, get_slash_held() -> bool, get_recall_held() -> bool.
+## get_throw_held() -> bool, get_slash_held() -> bool, get_recall_held() -> bool,
+## get_dash_held() -> bool.
 
 const BASE_RADIUS   := 110.0
 const KNOB_RADIUS   :=  40.0
 const THROW_RADIUS  :=  55.0
 const SLASH_RADIUS  :=  42.0
+const DASH_RADIUS   :=  38.0
 const MARGIN        :=  30.0
 const THROW_GAP     :=  20.0   # px gap between right stick top and throw button bottom
 const SLASH_GAP     :=  16.0   # px gap between throw button and slash button
+const DASH_GAP      :=  16.0   # px gap between slash button and dash button (stacked above it)
 
 const COLOR_BASE          := Color(0.1, 0.1, 0.1, 0.4)
 const COLOR_KNOB          := Color(0.8, 0.8, 0.8, 0.6)
@@ -55,6 +66,8 @@ const COLOR_THROW_ACTIVE  := Color(1.0, 0.6, 0.2, 0.9)
 const COLOR_THROW_HOLDING := Color(1.0, 0.9, 0.15, 0.95)
 const COLOR_SLASH         := Color(0.2, 0.6, 0.9, 0.7)
 const COLOR_SLASH_ACTIVE  := Color(0.3, 0.75, 1.0, 0.9)
+const COLOR_DASH          := Color(0.2, 0.8, 0.3, 0.7)
+const COLOR_DASH_ACTIVE   := Color(0.3, 0.95, 0.4, 0.9)
 
 ## Mirrors player.gd's own SWING_REDIRECT_HOLD_THRESHOLD constant BY VALUE
 ## (hand-kept in sync, same convention already used elsewhere in this project
@@ -70,12 +83,14 @@ var _left_base:     Vector2 = Vector2.ZERO
 var _right_base:    Vector2 = Vector2.ZERO
 var _throw_center:  Vector2 = Vector2.ZERO
 var _slash_center:  Vector2 = Vector2.ZERO
+var _dash_center:   Vector2 = Vector2.ZERO
 
 # Touch state
 var _left_knob_offset:  Vector2 = Vector2.ZERO
 var _right_knob_offset: Vector2 = Vector2.ZERO
 var _throw_held:        bool    = false
 var _slash_held:        bool    = false
+var _dash_held:         bool    = false
 
 ## How long the throw button has been continuously held, in seconds --
 ## purely for the COLOR_THROW_HOLDING cosmetic swap in _on_canvas_draw()
@@ -88,6 +103,7 @@ var _left_finger:   int = -1
 var _right_finger:  int = -1
 var _throw_finger:  int = -1
 var _slash_finger:  int = -1
+var _dash_finger:   int = -1
 
 var _canvas: Control = null
 
@@ -130,6 +146,11 @@ func _update_layout() -> void:
 	_slash_center = Vector2(
 		_throw_center.x - THROW_RADIUS - SLASH_GAP - SLASH_RADIUS,
 		_throw_center.y
+	)
+	# Dash button sits directly above the slash button, same x
+	_dash_center = Vector2(
+		_slash_center.x,
+		_slash_center.y - SLASH_RADIUS - DASH_GAP - DASH_RADIUS
 	)
 	if _canvas != null:
 		_canvas.queue_redraw()
@@ -180,6 +201,21 @@ func _on_canvas_draw() -> void:
 			Color.WHITE
 		)
 
+	# --- Dash button ---
+	var dash_color: Color = COLOR_DASH_ACTIVE if _dash_held else COLOR_DASH
+	_canvas.draw_circle(_dash_center, DASH_RADIUS, dash_color)
+	if fallback_font != null:
+		var dash_label_pos: Vector2 = _dash_center + Vector2(0.0, 7.0)
+		_canvas.draw_string(
+			fallback_font,
+			dash_label_pos,
+			"»",
+			HORIZONTAL_ALIGNMENT_CENTER,
+			-1,
+			22,
+			Color.WHITE
+		)
+
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
@@ -206,6 +242,10 @@ func _handle_touch(event: InputEventScreenTouch) -> void:
 			_slash_finger = event.index
 			_slash_held = true
 			get_viewport().set_input_as_handled()
+		elif _dash_finger == -1 and pos.distance_to(_dash_center) <= DASH_RADIUS + 20.0:
+			_dash_finger = event.index
+			_dash_held = true
+			get_viewport().set_input_as_handled()
 		elif _right_finger == -1 and pos.distance_to(_right_base) <= BASE_RADIUS:
 			_right_finger = event.index
 			_right_knob_offset = (pos - _right_base).limit_length(BASE_RADIUS)
@@ -228,6 +268,10 @@ func _handle_touch(event: InputEventScreenTouch) -> void:
 		if event.index == _slash_finger:
 			_slash_finger = -1
 			_slash_held = false
+			get_viewport().set_input_as_handled()
+		if event.index == _dash_finger:
+			_dash_finger = -1
+			_dash_held = false
 			get_viewport().set_input_as_handled()
 	if _canvas != null:
 		_canvas.queue_redraw()
@@ -275,3 +319,9 @@ func get_slash_held() -> bool:
 ## alias kept for player.gd call-site symmetry with get_throw_held().
 func get_recall_held() -> bool:
 	return _throw_held
+
+
+## Returns true while the Dash button is held by a finger -- read by
+## player.gd's _get_dash_pressed() (see this file's header comment, Phase 4.5).
+func get_dash_held() -> bool:
+	return _dash_held
