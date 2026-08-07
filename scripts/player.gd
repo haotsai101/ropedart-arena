@@ -13,10 +13,14 @@ extends CharacterBody3D
 ## param, Task #16) and _trip_timer + apply_rope_trip() (rope-line contact,
 ## movement debuff only, never lethal, unaffected by the EMBEDDED exception)
 ## — both called from rope_dart.gd's own _check_player_hits(), not from here.
-## No lives/round-outcome tracking exists yet (Phase 5) — a "kill" is just an
-## instant teleport to spawn_pos, same minimal shape the ring-out fall
-## already used (_start_fall/_on_fall_finished) before this rebuild, just
-## without the fall animation.
+## Phase 5 turned that into a real lives/round-outcome system: take_dart_hit()
+## now decrements `lives` and only teleports-to-spawn_pos (the old
+## unconditional Phase 2 behavior) while lives remain; hitting 0 eliminates
+## the player for the rest of the round instead (_eliminate() — model hidden,
+## collision disabled, input stopped) until GameManager.start_round()'s
+## reset_for_round() call revives them for the next round. See take_dart_hit()
+## and _eliminate()'s own comments, and game_manager.gd's header comment for
+## the round/match state machine this feeds into.
 ##
 ## Phase 4 (this pass) adds SWINGING: _handle_dart_away_input() below is the
 ## single place that disambiguates the unified Throw/Recall button's meaning
@@ -200,7 +204,31 @@ var _embedded_hold_active: bool = false
 ## per docs/project.md's Throw/Recall/Redirect section, a redirect-hold is a
 ## snap mid-fight decision, not a full charge-up, so even a small nonzero
 ## hold should already read as "holding to redirect" rather than "tapped".
-const SWING_REDIRECT_HOLD_THRESHOLD: float = 0.1
+##
+## Task #26 correction: the original 0.1s (100ms) value was measured, via a
+## direct user bug report ("I was trying to retrieve the dart but it thinks I
+## was trying to redirect and snapped to halfway") plus a headless probe
+## driving the real _handle_dart_away_input() across a range of press
+## durations through real Input.parse_input_event() KEY_SPACE press/release
+## (see this task's own verification), to be far tighter than any realistic
+## human "quick tap" -- a deliberate tap commonly measures 150-300ms+
+## depending on input device/reflexes/frame timing, and at the old 0.1s
+## threshold every one of those legitimate taps already qualified as a "hold"
+## (crossing SWING_REDIRECT_PICKUP_HOLD_TIME too, by ~200ms, producing a real
+## partial-charge redirect -- exactly the reported "snapped to halfway").
+## _embedded_hold_time itself was audited and found to be an accurate
+## same-tick measurement of real hold duration (starts at exactly 0.0 on the
+## first held tick rather than double-counting, _prev_recall_held's
+## rising/falling edges track a real single continuous press correctly, no
+## stale-state leakage across EMBEDDED transitions) -- this was a pure tuning
+## gap, not a mechanical bug. Raised to 0.25s (250ms): comfortably above the
+## whole realistic "quick tap" range (confirmed by the same probe: 80-200ms
+## presses all resolve to Recall at this value) while still small relative to
+## SWING_REDIRECT_MAX_CHARGE_TIME (0.6s) and rope_dart.gd's own
+## max_charge_time (0.7s, the original throw's full charge-up) -- a 250ms
+## press is still clearly a "snap decision", not a full charge, consistent
+## with this constant's own original design intent above.
+const SWING_REDIRECT_HOLD_THRESHOLD: float = 0.25
 
 ## Task #18/#20: charge-scaled max DISTANCE FROM THE OWNER for a redirect leg
 ## (docs/project.md's Swinging section -- "the hold is a charge ... the
@@ -248,13 +276,23 @@ const SWING_REDIRECT_MAX_CHARGE_TIME: float = 0.6
 
 ## Task #20: a hold that's technically past SWING_REDIRECT_HOLD_THRESHOLD
 ## (so NOT a tap -- Recall doesn't apply) but still short enough that it
-## doesn't read as a deliberate charge for a real redirect. Set to roughly
-## 1.8x the tap/hold threshold -- enough headroom above it that this can't be
-## crossed by input-polling jitter around the tap/hold boundary itself, while
-## still being a small fraction of SWING_REDIRECT_MAX_CHARGE_TIME (0.6s), so
-## it only catches genuinely brief holds, not ordinary short-to-medium ones.
-## See _redirect_is_pointless_micro_hop().
-const SWING_REDIRECT_PICKUP_HOLD_TIME: float = 0.18
+## doesn't read as a deliberate charge for a real redirect. See
+## _redirect_is_pointless_micro_hop().
+##
+## Task #26 correction: raised from 0.18s to 0.4s alongside
+## SWING_REDIRECT_HOLD_THRESHOLD's own 0.1s->0.25s raise (see that constant's
+## comment for the full user-report/probe-measurement reasoning -- both
+## constants were too tight for realistic press-release timing, not just this
+## one). Kept as a fixed ~150ms buffer above the (now much larger) hold
+## threshold rather than preserving the old ~1.8x multiplicative ratio --
+## multiplying 0.25s by 1.8 would land at 0.45s, leaving almost no
+## SWING_REDIRECT_MAX_CHARGE_TIME (0.6s) headroom for the charge_ratio lerp in
+## _compute_redirect_travel_distance() to actually distinguish a "just past
+## pointless" redirect from a max-charge one. A fixed 150ms gap is still far
+## more than enough headroom above the tap/hold boundary to absorb any
+## realistic input-polling jitter (a single physics tick is ~16ms) while
+## leaving a genuine 200ms window (0.4s-0.6s) for the charge scale to matter.
+const SWING_REDIRECT_PICKUP_HOLD_TIME: float = 0.4
 
 ## Task #20: minimum forward progress -- how far this leg's predicted
 ## landing point (see _redirect_is_pointless_micro_hop(), Task #21) sits from
@@ -274,11 +312,28 @@ const SWING_REDIRECT_MIN_TRAVEL: float = 0.75
 
 # Combat (Phase 2 -- see rope_dart.gd's _check_player_hits()). Dart contact
 # is always lethal in every away-state; rope-line contact only trips/slows.
-# No lives/round tracking yet (Phase 5) -- a "kill" here is just an instant
-# teleport back to spawn_pos, same minimal-consequence shape as the ring-out
-# fall already uses (_start_fall/_on_fall_finished), just without the fall
-# animation since a dart kill doesn't need one.
+# Phase 5 (docs/implementation-plan.md) turned that into a real lives/round
+# system: take_dart_hit() decrements `lives` (reset each round by
+# reset_for_round()) and only respawns-to-spawn_pos if lives remain --
+# reaching 0 eliminates the player for the rest of the round (see
+# _eliminate()) instead. GameManager._check_round_win() discovers "how many
+# players still have lives > 0" by directly reading this duck-typed `lives`
+# field off each of its _all_players entries every PLAYING frame (a group
+# query + a lives>0 check, per this task's own suggested wiring) -- no signal
+# needed, matching this file's existing "GameManager polls player state"
+# convention rather than inventing a push-based one.
 var is_dead: bool = false
+## Round-scoped, reset to GameManager.lives_per_round by reset_for_round().
+## Defaults to a nonzero value here (not 0) so ad hoc player nodes
+## instantiated directly by regression tests -- which construct player.tscn
+## by hand and never call reset_for_round() (see tests/test_dart_phase2_combat.gd's
+## _make_player()) -- still show the exact same single-hit "kill ->
+## teleport-to-spawn_pos" behavior those tests already assert, rather than
+## being instantly eliminated on their very first hit.
+var lives: int = 3
+## True once `lives` reaches 0 this round -- no more respawn until the next
+## reset_for_round() revives this player. See _eliminate().
+var is_eliminated: bool = false
 const RESPAWN_INVULN_TIME: float = 0.3  ## brief window after respawn where
 ## this player can't be re-targeted/re-killed the same tick they teleport in
 ## (guards against a degenerate case where spawn_pos itself sits inside a
@@ -560,6 +615,12 @@ func _process(delta: float) -> void:
 		return
 	if is_falling:
 		return
+	if is_eliminated:
+		# Out for the rest of the round -- player_mesh is hidden (see
+		# _eliminate()), so there's nothing useful for this frame's
+		# locomotion-animation/facing/bob logic to do until reset_for_round()
+		# revives this player.
+		return
 
 	var is_moving: bool = _move_speed_smooth > 0.1 and not _is_dashing
 
@@ -608,6 +669,16 @@ func _process(delta: float) -> void:
 
 func _physics_process(delta: float) -> void:
 	if is_falling:
+		return
+	if is_eliminated:
+		# Out for the rest of the round (see _eliminate()) -- stop processing
+		# input entirely, same "scripted state overrides the normal per-tick
+		# pipeline" shape is_falling's own early-return above already uses.
+		# Collision is disabled (_eliminate()) so move_and_slide() here is a
+		# harmless no-op, kept only so the physics engine still registers this
+		# body each tick like every other early-return branch below does.
+		velocity = Vector3.ZERO
+		move_and_slide()
 		return
 	if GameManager.current_state != GameManager.RoundState.PLAYING:
 		velocity = Vector3.ZERO
@@ -767,6 +838,11 @@ func _get_dash_pressed() -> bool:
 	if is_bot and bot_controller != null:
 		return bot_controller.get_desired_dash()
 	if player_index == 0:
+		# Virtual Dash button takes priority, same pattern as
+		# _get_move_input()/_get_aim_input()/_get_throw_held() above --
+		# see virtual_controls.gd's Phase 4.5 header comment.
+		if _virtual_controls != null and _virtual_controls.get_dash_held():
+			return true
 		return Input.is_key_pressed(KEY_SHIFT)
 	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_LEFT_SHOULDER)
 
@@ -1210,9 +1286,19 @@ func _apply_swing_forward_lock() -> void:
 ## Called by rope_dart.gd's _check_player_hits() when the dart HEAD overlaps
 ## this player in any away-state -- always lethal (GDD Combat: "Dart Contact
 ## ... Always lethal. Applies in every dart state: Flying, Embedded landing,
-## Swinging, Returning"). Minimal Phase 2 kill: teleport to spawn_pos, no
-## VFX/lives/round tracking (that's Phase 5 -- see this file's header
-## comment and docs/implementation-plan.md's Phase 2 section).
+## Swinging, Returning"). Phase 5: this is now lives-gated rather than an
+## unconditional respawn -- decrements `lives`; if any remain, teleports back
+## to spawn_pos exactly as before (Phase 2's original minimal behavior,
+## unchanged for that case -- see this task's own definition of done); once
+## `lives` hits 0, the player is eliminated for the rest of the round instead
+## (see _eliminate()), no teleport.
+##
+## Guarded on GameManager.current_state == PLAYING, same "only meaningful
+## while the round is actually live" convention _check_boundary_fall() already
+## uses -- without this, a dart still mid-flight/EMBEDDED into the brief
+## ROUND_END pause (rope_dart.gd's own _physics_process is NOT itself
+## state-gated -- only player.gd's input handlers are) could register a kill
+## against a round that's already been decided.
 ##
 ## Task #10: the teleport alone used to leave the player's OWN dart (this
 ## player's persistent rope_dart.gd instance, referenced by `dart`) exactly
@@ -1222,12 +1308,40 @@ func _apply_swing_forward_lock() -> void:
 ## _reset_movement_and_dart_state() so the dart's force_holster() snaps to
 ## the NEW spawn-local hand position, not the pre-death one.
 func take_dart_hit() -> void:
-	if is_dead:
+	if is_dead or is_eliminated:
+		return
+	if GameManager.current_state != GameManager.RoundState.PLAYING:
 		return
 	is_dead = true
-	_invuln_timer = RESPAWN_INVULN_TIME
 	_trip_timer = 0.0
+	lives -= 1
+	if lives <= 0:
+		_eliminate()
+		return
+	_invuln_timer = RESPAWN_INVULN_TIME
 	global_position = spawn_pos
+	_reset_movement_and_dart_state()
+
+
+## Phase 5: `lives` reached 0 -- out for the rest of the round, no more
+## respawn until the next reset_for_round() revives this player. Deliberately
+## leaves `is_dead` == true (set by the caller, take_dart_hit(), before this
+## runs) rather than adding a second flag every OTHER "skip dead players" call
+## site would need to also check -- every existing is_dead == true guard
+## (bot_controller.gd's target-skip/dodge, _perform_slash()/_perform_kick()'s
+## own is_dead checks above) already correctly treats an eliminated player as
+## untargetable with zero further changes. Hides the character model and
+## disables collision (task's own "visual eliminated state" requirement) and
+## stops processing input via _physics_process()/_process()'s own
+## is_eliminated early-returns above, rather than doing that here.
+func _eliminate() -> void:
+	is_eliminated = true
+	_invuln_timer = 0.0
+	if player_mesh != null:
+		player_mesh.visible = false
+	if aim_indicator != null:
+		aim_indicator.visible = false
+	collision_shape.disabled = true
 	_reset_movement_and_dart_state()
 
 
@@ -1235,7 +1349,7 @@ func take_dart_hit() -> void:
 ## dart head) overlaps this player -- never lethal, just a brief movement
 ## debuff (GDD Combat: "Rope Contact ... trips and slows -- never lethal").
 func apply_rope_trip() -> void:
-	if is_dead:
+	if is_dead or is_eliminated:
 		return
 	_trip_timer = TRIP_DURATION
 
@@ -1403,6 +1517,14 @@ func reset_for_round(start_pos: Vector3) -> void:
 	## state across the round boundary. global_position is set BEFORE
 	## _reset_movement_and_dart_state() for the same reason as
 	## take_dart_hit() -- so the dart force_holsters to the NEW spawn point.
+	##
+	## Phase 5: this is also the ONLY place `lives`/is_eliminated get reset
+	## (take_dart_hit() only ever decrements/eliminates, never revives) --
+	## called once per round by GameManager.start_round(), so an eliminated
+	## player from the PREVIOUS round comes back with a full life count and
+	## their model/collision restored for the new one. GameManager.lives_per_round
+	## is read fresh here (not cached) so a mid-session config change would
+	## take effect starting next round.
 	if is_falling:
 		is_falling = false
 		_reset_fall_visual()
@@ -1410,6 +1532,12 @@ func reset_for_round(start_pos: Vector3) -> void:
 	global_position = start_pos
 	collision_shape.disabled = false
 	is_dead = false
+	is_eliminated = false
+	lives = GameManager.lives_per_round
+	if player_mesh != null:
+		player_mesh.visible = true
+	if aim_indicator != null:
+		aim_indicator.visible = true
 	_invuln_timer = 0.0
 	_trip_timer = 0.0
 	_reset_movement_and_dart_state()
