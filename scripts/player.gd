@@ -230,44 +230,38 @@ var _embedded_hold_active: bool = false
 ## with this constant's own original design intent above.
 const SWING_REDIRECT_HOLD_THRESHOLD: float = 0.25
 
-## Task #18/#20: charge-scaled max DISTANCE FROM THE OWNER for a redirect leg
-## (docs/project.md's Swinging section -- "the hold is a charge ... the
-## longer the hold, the further the dart travels once released"). Mirroring
-## the ORIGINAL throw's own charge (release_throw()'s charge_ratio, which
-## scales SPEED) does NOT work here: the redirect leg reuses rope_dart.gd's
-## _process_flying(), the same range-capped travel logic FLYING already uses
-## -- a faster dart launched into that same range-bounded endpoint just
-## reaches it sooner, not further (measured/confirmed during Task #18, see
-## rope_dart.gd's begin_swing_redirect() header comment). So instead of
-## scaling speed, this scales the dart's own range-cap-from-owner budget
-## directly, passed into begin_swing_redirect() and enforced by
-## rope_dart.gd's own _process_flying() as this leg's own range_cap (the
-## SMALLER of rope_length and this value), reusing the exact same
-## owner-relative "flying_clamp" wrap-aware constraint FLYING itself always
-## uses -- see that function's own comment.
+## Task #18/#20 (SUPERSEDED by Task #30 -- kept as history, see below):
+## originally a charge-scaled max DISTANCE FROM THE OWNER for a redirect leg.
+## Task #18 first tried mirroring the ORIGINAL throw's own charge
+## (release_throw()'s charge_ratio, which scales SPEED) and found it doesn't
+## work for a range-capped leg: the redirect reuses rope_dart.gd's
+## _process_flying(), the same range-capped travel logic FLYING already
+## uses -- a faster dart launched into that same range-bounded endpoint just
+## reaches it sooner, not further. So Task #18/#20 scaled the dart's
+## range-cap-from-owner budget directly instead, via a helper
+## (_compute_redirect_travel_distance(), since removed) that lerped a
+## SWING_REDIRECT_MIN_DISTANCE floor up to the dart's own rope_length as
+## _embedded_hold_time approached SWING_REDIRECT_MAX_CHARGE_TIME.
 ##
-## Task #20 correction: this used to be measured from the dart's OWN launch
-## position (Task #18's original design) rather than the owner -- flagged by
-## direct user report as inconsistent with every OTHER distance constraint in
-## this system (FLYING's clamp, the EMBEDDED leash, rope_length itself), all
-## of which are owner-relative. Fixed by having rope_dart.gd apply this value
-## as an owner-relative range cap instead of a separate launch-point-relative
-## one -- see rope_dart.gd's _swing_effective_range and _process_flying()'s
-## range_cap for the receiving side of this change.
-##
-## _compute_redirect_travel_distance() lerps SWING_REDIRECT_MIN_DISTANCE (a
-## quick hold right at SWING_REDIRECT_HOLD_THRESHOLD -- "hold" as opposed to
-## "tap" -- caps this leg to only this far from the owner) up to the dart's
-## own full rope_length (a max-charge hold) as _embedded_hold_time approaches
-## SWING_REDIRECT_MAX_CHARGE_TIME. rope_length is deliberately used as the
-## ceiling rather than some smaller number: _process_flying()'s existing
-## owner-relative rope_length clamp is enforced unconditionally regardless of
-## what's passed here, so a max-charge redirect never travels further than
-## that budget already would have allowed anyway -- this cap only ever
-## actually BITES (i.e. is smaller than plain rope_length) for a
-## short-to-medium hold, exactly the intended "quick hold = short reach,
-## longer hold = full reach" curve.
-const SWING_REDIRECT_MIN_DISTANCE: float = 2.0
+## Task #30 (design pivot, direct user request -- docs/project.md's Swinging
+## section, "hold increase[s] swing speed but not the distance"): this whole
+## distance-scaling model is now REVERSED. Distance for a redirect leg is no
+## longer charge-dependent at all -- it's always the full owner-relative
+## range (rope_length, or wherever obstacle/wrap routing stops it first),
+## the same range logic a plain FLYING throw already uses (player.gd no
+## longer computes or passes a distance budget to begin_swing_redirect() at
+## all). Hold duration now scales SPEED instead, exactly mirroring how
+## release_throw()'s own charge_ratio already works -- see rope_dart.gd's
+## begin_swing_redirect()/swing_speed_min_mult/swing_speed_max_mult for the
+## receiving side. SWING_REDIRECT_MAX_CHARGE_TIME below is reused, unchanged
+## in value, as the ceiling for THIS new charge_ratio-on-speed computation
+## (see _compute_redirect_charge_ratio()) -- the original Task #18/#20
+## irony (that the SPEED-scaling approach "doesn't work" for a range-capped
+## leg) no longer applies now that speed scaling is applied to a full-range
+## leg rather than a range-capped-by-charge one: a faster dart still
+## reaches the SAME (now charge-independent) endpoint sooner, which is
+## exactly the intended effect this time, not the dead end Task #18 found it
+## to be under the old distance-scaling model.
 ## Deliberately shorter than CHARGING's own max_charge_time (0.7s, in
 ## rope_dart.gd) -- same "a redirect-hold is a snap mid-fight decision, not a
 ## full charge-up" reasoning SWING_REDIRECT_HOLD_THRESHOLD's own comment
@@ -286,9 +280,11 @@ const SWING_REDIRECT_MAX_CHARGE_TIME: float = 0.6
 ## one). Kept as a fixed ~150ms buffer above the (now much larger) hold
 ## threshold rather than preserving the old ~1.8x multiplicative ratio --
 ## multiplying 0.25s by 1.8 would land at 0.45s, leaving almost no
-## SWING_REDIRECT_MAX_CHARGE_TIME (0.6s) headroom for the charge_ratio lerp in
-## _compute_redirect_travel_distance() to actually distinguish a "just past
-## pointless" redirect from a max-charge one. A fixed 150ms gap is still far
+## SWING_REDIRECT_MAX_CHARGE_TIME (0.6s) headroom for the charge_ratio lerp
+## (as of Task #30, _compute_redirect_charge_ratio() -- speed-scaling; was
+## _compute_redirect_travel_distance() when this scaled distance instead) to
+## actually distinguish a "just past pointless" redirect from a max-charge
+## one. A fixed 150ms gap is still far
 ## more than enough headroom above the tap/hold boundary to absorb any
 ## realistic input-polling jitter (a single physics tick is ~16ms) while
 ## leaving a genuine 200ms window (0.4s-0.6s) for the charge scale to matter.
@@ -309,6 +305,25 @@ const SWING_REDIRECT_PICKUP_HOLD_TIME: float = 0.4
 ## quantity (a real predicted travel DISTANCE, not the flawed owner-relative
 ## subtraction Task #20 originally used).
 const SWING_REDIRECT_MIN_TRAVEL: float = 0.75
+
+## Task #28's SWING_REDIRECT_FULL_CHARGE_RATIO constant/exemption (a special
+## case letting a near-max-charge hold skip _redirect_is_pointless_micro_hop()'s
+## distance check entirely) is REMOVED as of Task #30, not just renamed:
+## that exemption existed specifically because, under the old
+## charge-scales-DISTANCE model, a max-charge hold aimed the same direction
+## as a dart already sitting near rope_length could still compute a
+## near-zero predicted_travel (the charge-scaled request and the dart's
+## existing position converged at the same ceiling) and get wrongly vetoed
+## to a pickup despite being the most deliberate possible input -- see
+## _redirect_is_pointless_micro_hop()'s own header comment (git history) for
+## the full original bug report. As of Task #30, effective_range for the
+## distance check is always the full rope_length for EVERY hold long enough
+## to not be an unconditional pickup (SWING_REDIRECT_PICKUP_HOLD_TIME) --
+## there's no longer a "short-hold-computed-a-small-request" case for a
+## bigger charge to be wrongly caught by, so the exemption has nothing left
+## to guard against. The one real edge case that survives is now a fixed
+## geometric fact independent of hold length -- see
+## _redirect_is_pointless_micro_hop()'s current header comment.
 
 # Combat (Phase 2 -- see rope_dart.gd's _check_player_hits()). Dart contact
 # is always lethal in every away-state; rope-line contact only trips/slows.
@@ -915,12 +930,14 @@ func _get_recall_held() -> bool:
 ##     means Redirect (begin_swing_redirect(aim_dir), into SWINGING) -- UNLESS
 ##     (Task #20) the hold/resulting redirect would be a near-zero-distance,
 ##     pointless micro-hop (see _redirect_is_pointless_micro_hop()), in which
-##     case it resolves to an instant pickup (dart.force_holster()) instead of
-##     attempting the tiny swing. This is deliberately a THIRD outcome,
-##     distinct from tap-Recall -- Recall travels back over time through
-##     RETURNING; this pickup is an immediate hard snap to HOLSTERED, for a
-##     hold that was clearly an attempted (if pointless) Redirect, not a
-##     Recall gesture.
+##     case it resolves to a Recall (dart.begin_recall(), Task #29 -- was an
+##     instant dart.force_holster() pickup, which direct playtesting still
+##     read as an unwanted hard "snap" even after Task #27/#28's geometric
+##     fixes; the instant nature of force_holster() itself, not just which
+##     threshold triggered it, was the remaining issue) instead of attempting
+##     the tiny swing. A hold too short/pointless to redirect is now treated
+##     exactly like a tap-Recall -- both travel back smoothly through
+##     RETURNING, no separate instant-pickup outcome remains.
 ## _embedded_hold_active gates on "was this hold already being tracked", not
 ## strictly a rising edge of the physical button -- deliberately, so a player
 ## who never lets go of the button across a whole SWINGING flight (held
@@ -930,23 +947,24 @@ func _get_recall_held() -> bool:
 ## press. Both _embedded_hold_time/_embedded_hold_active are reset whenever
 ## the dart isn't EMBEDDED so a hold that started before a state change never
 ## leaks into a decision it shouldn't govern.
-## Task #18: see SWING_REDIRECT_MIN_DISTANCE/SWING_REDIRECT_MAX_CHARGE_TIME's
-## own comments above for the full reasoning -- this just evaluates the lerp.
-## charge_ratio is deliberately NOT re-based off SWING_REDIRECT_HOLD_THRESHOLD
-## (i.e. not `(hold_time - threshold) / (max - threshold)`) -- a plain
+## Task #30 (replaces Task #18/#20's _compute_redirect_travel_distance(),
+## which lerped a DISTANCE budget -- see SWING_REDIRECT_MAX_CHARGE_TIME's own
+## comment above for why that model was reversed): returns the charge
+## fraction (0.0-1.0) this hold maps to for rope_dart.gd's
+## begin_swing_redirect() SPEED lerp, exactly the same shape release_throw()
+## already uses for its own charge_ratio (_charge_time / max_charge_time,
+## clamped) -- just reading player.gd's own _embedded_hold_time/
+## SWING_REDIRECT_MAX_CHARGE_TIME instead of rope_dart.gd's _charge_time/
+## max_charge_time, since a redirect hold is tracked here (see
+## _embedded_hold_time's own header comment for why). charge_ratio is
+## deliberately NOT re-based off SWING_REDIRECT_HOLD_THRESHOLD (i.e. not
+## `(hold_time - threshold) / (max - threshold)`) -- a plain
 ## `hold_time / SWING_REDIRECT_MAX_CHARGE_TIME` already starts near the
-## MINIMUM at the tap/hold boundary (threshold=0.1 is small relative to
-## max_charge_time=0.6, so ratio~0.17 there), which is the intended "just
-## barely a hold" read, without needing a second derived constant.
-## Task #20: this now returns a max distance FROM THE OWNER for this leg
-## (not from the dart's own current/launch position -- see
-## SWING_REDIRECT_MIN_DISTANCE's own comment for the full correction
-## reasoning), handed to rope_dart.gd's begin_swing_redirect() as
-## max_travel_distance and applied there as an owner-relative range_cap.
-func _compute_redirect_travel_distance() -> float:
-	var ceiling: float = dart.rope_length if (dart != null and is_instance_valid(dart)) else SWING_REDIRECT_MIN_DISTANCE
-	var charge_ratio: float = clampf(_embedded_hold_time / SWING_REDIRECT_MAX_CHARGE_TIME, 0.0, 1.0)
-	return lerp(SWING_REDIRECT_MIN_DISTANCE, ceiling, charge_ratio)
+## MINIMUM at the tap/hold boundary (threshold=0.25 is well under
+## max_charge_time=0.6), which is the intended "just barely a hold" read,
+## without needing a second derived constant.
+func _compute_redirect_charge_ratio() -> float:
+	return clampf(_embedded_hold_time / SWING_REDIRECT_MAX_CHARGE_TIME, 0.0, 1.0)
 
 
 ## Task #20: true if a hold-then-release redirect attempt at EMBEDDED would
@@ -956,12 +974,11 @@ func _compute_redirect_travel_distance() -> float:
 ##     (SWING_REDIRECT_HOLD_THRESHOLD) without ever becoming a real charge
 ##     (< SWING_REDIRECT_PICKUP_HOLD_TIME), regardless of geometry; or
 ##   - the predicted landing point for this leg (dart.
-##     predict_redirect_landing_point(), given aim_dir and this leg's
-##     charge-scaled owner-relative effective_range -- see
-##     _compute_redirect_travel_distance()) sits too close to the dart's
-##     CURRENT position -- i.e. rope_dart.gd's own owner-relative range_cap
-##     for this leg would immediately re-embed the dart within a step or two
-##     of its existing anchor.
+##     predict_redirect_landing_point(), given aim_dir and the dart's own
+##     rope_length -- see the Task #30 note below) sits too close to the
+##     dart's CURRENT position -- i.e. rope_dart.gd's own owner-relative
+##     range_cap for this leg would immediately re-embed the dart within a
+##     step or two of its existing anchor.
 ##
 ## Task #21 fix: the second condition above used to subtract the dart's
 ## CURRENT owner-relative distance from effective_range (this leg's FINAL
@@ -979,12 +996,41 @@ func _compute_redirect_travel_distance() -> float:
 ## SWINGING branch itself applies) to find where the dart would land, then
 ## this compares THAT against the dart's CURRENT position -- a real
 ## displacement, not a subtraction of two unrelated owner-relative ranges.
-func _redirect_is_pointless_micro_hop(effective_range: float) -> bool:
+##
+## Task #28 (now REMOVED, not just superseded -- see SWING_REDIRECT_FULL_
+## CHARGE_RATIO's own comment above for why its exemption no longer applies)
+## fixed a bug where a max-charge hold aimed at a dart already parked near
+## rope_length still read as "pointless" and got wrongly force_holster()'d,
+## because under the OLD charge-scales-DISTANCE model a max-charge hold's
+## own REQUESTED range could itself converge on the dart's current position
+## (both approaching the same rope_length ceiling), producing a near-zero
+## predicted_travel purely as an artifact of the charge-scaled request, not
+## a real "nowhere to go" situation.
+##
+## Task #30 fix/simplification: distance is no longer charge-scaled at all
+## -- effective_range for the distance check below is now always the dart's
+## own rope_length (the same full range every real redirect always targets),
+## for every hold long enough to clear SWING_REDIRECT_PICKUP_HOLD_TIME. That
+## means the Task #28 bug's root cause (a charge-DEPENDENT requested range
+## converging on the dart's position) can no longer happen -- there is no
+## more "short-hold-computed-a-smaller-request" case for a longer hold to be
+## wrongly compared against. What remains is a fixed geometric fact
+## independent of hold length: if the dart is already sitting at/near
+## rope_length from the owner in very nearly the aimed direction, EVERY
+## qualifying hold (any length >= SWING_REDIRECT_PICKUP_HOLD_TIME) predicts
+## the same near-zero travel, and it's correct for all of them to fall
+## through to a pickup-via-Recall rather than a redirect -- there's
+## genuinely nowhere further to go, which is exactly what this whole
+## function exists to detect. No charge-ratio exemption is needed to
+## special-case a "should have been let through" hold, because there no
+## longer is one: the geometric fact is the same regardless of how long the
+## button was held.
+func _redirect_is_pointless_micro_hop() -> bool:
 	if _embedded_hold_time < SWING_REDIRECT_PICKUP_HOLD_TIME:
 		return true
 	if dart == null or not is_instance_valid(dart):
 		return true
-	var landing: Vector2 = dart.predict_redirect_landing_point(get_pos_2d(), aim_dir, effective_range)
+	var landing: Vector2 = dart.predict_redirect_landing_point(get_pos_2d(), aim_dir, dart.rope_length)
 	var predicted_travel: float = dart.pos_2d.distance_to(landing)
 	return predicted_travel < SWING_REDIRECT_MIN_TRAVEL
 
@@ -1015,11 +1061,30 @@ func _handle_dart_away_input(delta: float) -> void:
 	elif _embedded_hold_active:
 		_embedded_hold_active = false
 		if _embedded_hold_time >= SWING_REDIRECT_HOLD_THRESHOLD:
-			var effective_range: float = _compute_redirect_travel_distance()
-			if _redirect_is_pointless_micro_hop(effective_range):
-				dart.force_holster()
+			if _redirect_is_pointless_micro_hop():
+				# Task #29: was dart.force_holster() -- an instant, snap-like
+				# teleport straight to HOLSTERED with no travel time. Direct
+				# user report: "It might be when the hold is too short, it
+				# should be retrieve instead of snap back in hand." A hold
+				# that doesn't clear _redirect_is_pointless_micro_hop()'s bar
+				# (threshold/geometry logic unchanged by this fix) should
+				# read exactly like a quick-tap Recall -- a smooth pull
+				# through RETURNING -- not a hard instant pickup.
+				# begin_recall() already accepts EMBEDDED as a valid starting
+				# state (checked at its own top), so this is a straight
+				# call-site swap.
+				dart.begin_recall()
 			else:
-				dart.begin_swing_redirect(aim_dir, effective_range)
+				# Task #30: distance is no longer charge-scaled -- this leg
+				# always targets the dart's own full owner-relative range
+				# (begin_swing_redirect()'s default max_travel_distance <= 0.0
+				# already resolves to rope_length, so nothing is passed for
+				# it here). Hold duration instead scales SPEED, via
+				# charge_ratio -- see _compute_redirect_charge_ratio()'s own
+				# comment and rope_dart.gd's begin_swing_redirect()/
+				# swing_speed_min_mult/swing_speed_max_mult for the receiving
+				# side of this lerp.
+				dart.begin_swing_redirect(aim_dir, -1.0, _compute_redirect_charge_ratio())
 		else:
 			dart.begin_recall()
 

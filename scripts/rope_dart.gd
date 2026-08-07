@@ -59,24 +59,32 @@ extends CharacterBody3D
 ## same _embed_in_place() a fresh throw uses. Chainable (EMBEDDED ->
 ## SWINGING -> EMBEDDED -> SWINGING -> ...); Recall is the only way out of
 ## either EMBEDDED or SWINGING into RETURNING (see begin_recall()'s own
-## state guard). Task #20 corrected SWINGING's own charge-scaled travel-
-## distance cap (player.gd's _compute_redirect_travel_distance()) to be
-## measured from the OWNER, same as every other distance constraint here,
-## instead of Task #18's original launch-point-relative version -- see
-## _swing_effective_range's own header comment. Task #20 also added a
-## pre-check on player.gd's side (too-short-hold OR too-close-to-owner)
-## that skips SWINGING entirely in favor of an instant pickup
-## (force_holster()) rather than attempting a near-zero-distance redirect.
+## state guard). Task #20 corrected SWINGING's own (then charge-scaled)
+## travel-distance cap to be measured from the OWNER, same as every other
+## distance constraint here, instead of Task #18's original launch-point-
+## relative version -- see _swing_effective_range's own header comment.
 ## Task #22 corrected WHERE that leg actually travels TO: begin_swing_
 ## redirect() used to launch in the raw aim_dir compass heading from the
 ## dart's own (possibly off-ray) current position; per direct user spec, it
 ## now launches straight at a specific point on the ray from the OWNER
 ## through aim_dir -- owner_pos + aim_dir * charge_scaled_distance -- so a
-## redirect always lands "between the character and the aim direction's max
-## chain length, at a distance controlled by charge time," regardless of
+## redirect always lands on the character's aim-direction ray, at a
+## distance controlled by (as of Tasks #18-#28) charge time, regardless of
 ## where the dart happened to be sitting before the redirect. See
 ## begin_swing_redirect()'s own header comment and predict_redirect_
 ## landing_point()'s matching Task #22 update below.
+##
+## Task #30 (design pivot -- docs/project.md's Swinging section): hold
+## duration no longer scales DISTANCE at all -- charge_scaled_distance below
+## is now a historical name for what's always just the full owner-relative
+## range (rope_length, or wherever obstacle/wrap routing stops it first),
+## same range logic a plain FLYING throw already uses. Hold duration now
+## scales SPEED instead, exactly mirroring how release_throw()'s own charge
+## already works -- see begin_swing_redirect()'s charge_ratio param and
+## swing_speed_min_mult/swing_speed_max_mult above. Tasks #18/#20/#22's
+## owner-relative-point targeting logic is unchanged by this pivot (still
+## the right way to compute WHERE a redirect at a given range lands); only
+## WHAT varies with hold duration changed.
 
 enum State { HOLSTERED, CHARGING, FLYING, EMBEDDED, SWINGING, RETURNING }
 
@@ -85,6 +93,31 @@ signal state_changed(new_state: int)
 @export var travel_speed: float = 16.0
 @export var max_charge_time: float = 0.7
 @export var max_charge_speed_mult: float = 1.6
+## Task #30 (design pivot, docs/project.md's Swinging section -- "hold
+## increases swing speed, not distance"): SWINGING's own travel-speed range,
+## charge-scaled by begin_swing_redirect()'s charge_ratio param exactly the
+## way release_throw()'s own charge_ratio already lerps travel_speed ->
+## travel_speed*max_charge_speed_mult for a plain throw. Replaces Task #29's
+## flat swing_speed_mult (1.4x regardless of hold length) -- distance is no
+## longer charge-scaled (see begin_swing_redirect()'s own header comment), so
+## hold duration needs a real axis to matter on, and per the design pivot
+## that axis is now speed, mirroring the original throw's charge instead of
+## the old (Task #18-#28) distance-scaling model.
+## swing_speed_min_mult=1.0 mirrors release_throw()'s own zero-charge
+## baseline exactly (charge_ratio=0 -> plain unscaled travel_speed, same as
+## release_throw()'s lerp base) -- a bare-minimum qualifying hold (just past
+## SWING_REDIRECT_PICKUP_HOLD_TIME in player.gd, since anything shorter is
+## vetoed to Recall before ever reaching here) gets no speed bonus over a
+## plain throw, same as a plain zero-charge throw gets none.
+## swing_speed_max_mult=1.4 is Task #29's old flat value, kept as the fast
+## end of the new range rather than re-picked from scratch -- it was already
+## tuned by eye via run_project (see that task's own comment) as "measurably
+## faster than FLYING, reads as a whip", so a max-charge redirect now
+## reproduces exactly the speed Task #29 shipped, and only holds below max
+## charge are slower than that -- rather than the old model where EVERY
+## redirect (regardless of hold) was already at 1.4x.
+@export var swing_speed_min_mult: float = 1.0
+@export var swing_speed_max_mult: float = 1.4
 ## Mirrors the old (deleted) rope_dart.gd's own tuning: originally derived as
 ## 6x GameManager.PLAYER_CAPSULE_HEIGHT (then 1.2) = 7.2. As of Task #7
 ## (2026-08-05), PLAYER_CAPSULE_HEIGHT was corrected from a stale 1.2
@@ -204,6 +237,18 @@ const ROPE_LINK_MAX_COUNT: int = 160
 ## around Y would be invisible; this instead alternates which axis the ring
 ## opens along).
 const ROPE_LINK_TILT: float = PI * 0.5
+## Task #29: purely cosmetic whip/arc bow applied to the rendered chain path
+## ONLY while state == State.SWINGING and ONLY when that path is still a
+## plain unwrapped two-point straight line (hand -> tail) -- see
+## _apply_swing_bow()'s own header comment. SWING_BOW_RATIO is the max
+## sideways bow as a fraction of the current hand-to-dart distance (applied
+## at the midpoint of a quadratic Bezier, tapering to zero at both
+## endpoints); SWING_BOW_SAMPLE_COUNT is how many extra polyline points are
+## inserted along that curve for _update_rope_visual()'s existing
+## walk-the-polyline link placement to follow -- both picked by eye via
+## run_project screenshots, not derived from any specific formula.
+const SWING_BOW_RATIO: float = 0.28
+const SWING_BOW_SAMPLE_COUNT: int = 10
 ## Offset from pos_2d (the dart body's CENTER, which is what FLYING/EMBEDDED
 ## collision and _check_player_hits()'s rope-line trip check actually use as
 ## the dart-side endpoint) back to the tail/pommel end opposite the tip,
@@ -465,24 +510,40 @@ func _embed_in_place() -> void:
 ## too-close pickup (-> force_holster(), Task #20) -- this function trusts
 ## that decision and doesn't re-derive it.
 ## redirect_dir is the player's aim direction at the moment of release, same
-## role throw_dir plays in release_throw(). max_travel_distance (Task #18,
-## reinterpreted by Task #20) is the charge-scaled max distance budget for
-## this leg FROM THE OWNER -- computed by player.gd's
-## _compute_redirect_travel_distance() from its own tracked hold duration and
-## passed in here; a value <= 0.0 (the default) means "no extra cap beyond
-## the plain rope_length clamp", kept only so any other/future caller (e.g.
-## a test calling this directly with just a direction) doesn't need to always
-## supply one.
+## role throw_dir plays in release_throw(). charge_ratio (Task #30) is
+## player.gd's own hold-duration-derived charge fraction (0.0-1.0,
+## _embedded_hold_time / SWING_REDIRECT_MAX_CHARGE_TIME, clamped) -- the
+## SPEED axis now scales with hold duration, computed here exactly the way
+## release_throw()'s own charge_ratio -> _flight_speed lerp already works,
+## just with player.gd's EMBEDDED-hold tracking standing in for CHARGING's
+## own _charge_time (a redirect hold happens in a different dart state, with
+## its own tap/hold gesture disambiguation on player.gd's side, so the hold
+## duration itself is tracked there rather than in a new dart-side timer --
+## see player.gd's _embedded_hold_time header comment). max_travel_distance
+## (Task #18, reinterpreted by Task #20, reinterpreted again by Task #30) is
+## the max distance budget for this leg FROM THE OWNER; a value <= 0.0 (the
+## default) means "no extra cap beyond the plain rope_length clamp", which
+## is now what every real caller always passes -- Task #30's design pivot
+## made DISTANCE always the full owner-relative range (no longer
+## charge-scaled by player.gd), so this param is kept only as a generic
+## override hook for any future/test caller that wants a genuinely shorter
+## leg, not as the charge-scaled budget it used to carry.
 ##
 ## Unanchors the dart from its CURRENT pos_2d (no repositioning -- unlike
 ## release_throw(), which jumps the dart to a fresh spot near the owner's
 ## hand, a redirect starts exactly where the dart already is) and relaunches
-## it toward redirect_dir at full travel_speed (no charge-ramp ON SPEED: this
-## is a snap mid-fight decision, not a held charge-up -- see docs/project.md's
-## Throw/Recall/Redirect section and player.gd's own hold-threshold comment;
-## the hold DOES scale travel DISTANCE instead, see max_travel_distance
-## above and _process_flying()'s owner-relative range_cap for why distance,
-## not speed, is the right axis to scale for this specific leg of travel).
+## it toward redirect_dir at a charge-scaled speed between
+## travel_speed*swing_speed_min_mult and travel_speed*swing_speed_max_mult
+## (Task #30 -- replaces Task #29's flat travel_speed*swing_speed_mult; see
+## swing_speed_min_mult/swing_speed_max_mult's own header comment for the
+## exact constants and reasoning). This is now the SAME shape of charge-ramp
+## release_throw() already applies to its own speed -- see docs/project.md's
+## Swinging section ("Charge affects speed only, mirroring exactly how the
+## initial throw's own charge works"). Distance for this leg is NOT
+## charge-scaled -- see max_travel_distance above and _process_flying()'s
+## owner-relative range_cap; a redirect always travels as far as the chain
+## (or an obstacle) allows in the aimed direction, same range logic a plain
+## FLYING throw already uses.
 ## SWINGING's own physics_process branch calls the exact same
 ## _process_flying()/_check_player_hits() FLYING already uses, and
 ## _process_flying() itself lands back in EMBEDDED via _embed_in_place()
@@ -497,9 +558,11 @@ func _embed_in_place() -> void:
 ## corresponding to the charging time"), the intended target is a specific
 ## POINT defined relative to the OWNER -- owner_pos + aim_dir *
 ## charge_scaled_distance, i.e. a point on the ray from the character
-## through the aim direction, at a distance controlled by charge time (see
-## SWING_REDIRECT_MIN_DISTANCE's own comment in player.gd) -- not a compass
-## heading from the dart's own arbitrary prior position. dir_2d is now
+## through the aim direction, at a distance that was (Tasks #18-#28)
+## controlled by charge time and is now (Task #30) always the full
+## owner-relative range -- see SWING_REDIRECT_MAX_CHARGE_TIME's own comment
+## in player.gd for the full history -- not a compass heading from the
+## dart's own arbitrary prior position. dir_2d is now
 ## computed as the direction FROM the dart's current position TOWARD that
 ## target point, so the actual straight-line travel heads at the correct
 ## point regardless of where the dart started. _process_flying()'s existing
@@ -508,22 +571,49 @@ func _embed_in_place() -> void:
 ## that field's own header comment -- it should be a near no-op in the
 ## common case now, since target_point already sits within (at most exactly
 ## on the boundary of) that same range budget.
-func begin_swing_redirect(redirect_dir: Vector2, max_travel_distance: float = -1.0) -> void:
+func begin_swing_redirect(redirect_dir: Vector2, max_travel_distance: float = -1.0, charge_ratio: float = 0.0) -> void:
 	if state != State.EMBEDDED:
 		return
 	var aim_dir: Vector2 = redirect_dir.normalized() if redirect_dir.length() > 0.01 else Vector2(0.0, 1.0)
-	_flight_speed = travel_speed
-	_swing_effective_range = max_travel_distance if max_travel_distance > 0.0 else INF
-	# charge_scaled_distance: the same value _swing_effective_range holds,
-	# clamped to rope_length in case a caller ever passes something larger
-	# (mirrors _process_flying()'s own minf(rope_length, _swing_effective_range)
-	# range_cap) -- falls back to plain rope_length when no cap was supplied
-	# (max_travel_distance <= 0.0, i.e. _swing_effective_range == INF).
-	var charge_scaled_distance: float = minf(rope_length, _swing_effective_range) if is_finite(_swing_effective_range) else rope_length
+	# Task #30: SWINGING's speed now scales with hold duration (charge_ratio),
+	# the same lerp shape release_throw() already applies to its own
+	# charge_ratio -> _flight_speed -- see swing_speed_min_mult/
+	# swing_speed_max_mult's own header comment. Replaces Task #29's flat
+	# travel_speed * swing_speed_mult.
+	var clamped_charge_ratio: float = clampf(charge_ratio, 0.0, 1.0)
+	_flight_speed = lerp(travel_speed * swing_speed_min_mult, travel_speed * swing_speed_max_mult, clamped_charge_ratio)
+	# charge_scaled_distance: kept as a variable name for continuity with the
+	# Task #18-#28 history in this file's comments, but as of Task #30 it is
+	# no longer actually charge-scaled by any real caller -- clamped to
+	# rope_length in case a caller ever passes something larger (mirrors
+	# _process_flying()'s own minf(rope_length, _swing_effective_range)
+	# range_cap) -- falls back to plain rope_length (the full owner-relative
+	# range, per the Task #30 design pivot) when no cap was supplied
+	# (max_travel_distance <= 0.0, i.e. every real caller today).
+	var charge_scaled_distance: float = minf(rope_length, max_travel_distance) if max_travel_distance > 0.0 else rope_length
 	var target_point: Vector2 = pos_2d
 	if owner_player != null and is_instance_valid(owner_player):
 		var owner_pos: Vector2 = owner_player.get_pos_2d()
+		# Task #27's fix (see _redirect_forward_safe_range()'s own header
+		# comment) still runs here for generality/safety, but is now
+		# provably a no-op along the normal path: charge_scaled_distance is
+		# always rope_length (the max possible value) for every real caller
+		# post-Task #30, and the dart's current owner-relative projection
+		# can never exceed rope_length either, so
+		# maxf(charge_scaled_distance, current_proj) always resolves to
+		# charge_scaled_distance unchanged. Left in place only as a
+		# structural guarantee for the max_travel_distance override hook
+		# above, should any future/test caller ever pass a genuinely
+		# smaller leg distance.
+		charge_scaled_distance = _redirect_forward_safe_range(owner_pos, pos_2d, aim_dir, charge_scaled_distance)
 		target_point = owner_pos + aim_dir * charge_scaled_distance
+	# _swing_effective_range must track whatever range this leg actually
+	# targets (not just the raw charge-scaled request) -- _process_flying()'s
+	# own range_cap reads _swing_effective_range directly every subsequent
+	# tick, so leaving it at the smaller raw value here would immediately
+	# clamp the dart back toward the owner on its very first SWINGING tick,
+	# reproducing the exact same backward-snap bug one frame later.
+	_swing_effective_range = charge_scaled_distance
 	var to_target: Vector2 = target_point - pos_2d
 	dir_2d = to_target.normalized() if to_target.length() > 0.01 else aim_dir
 	# _process_flying()'s wrap-aware range clamp keys its own incremental wrap
@@ -833,6 +923,11 @@ func _update_rope_visual() -> void:
 	# state (see _compute_rope_path_2d()'s own header comment on why state
 	# must never leak between independent from/to endpoint pairs).
 	var path: PackedVector2Array = _compute_rope_path_2d(hand_2d, tail_2d, "hand_dart_visual")
+	# Task #29: purely visual whip/arc bow while SWINGING -- see
+	# _apply_swing_bow()'s own header comment. Only ever reshapes this local
+	# `path` array (chain-link placement); gameplay (pos_2d, dir_2d, wrap
+	# routing, hit detection) is untouched.
+	path = _apply_swing_bow(path)
 
 	var total_len := 0.0
 	for i in path.size() - 1:
@@ -876,6 +971,71 @@ func _update_rope_visual() -> void:
 			link_basis = link_basis * Basis(Vector3.RIGHT, ROPE_LINK_TILT)
 
 		multimesh.set_instance_transform(link_i, Transform3D(link_basis, world_pos - global_position))
+
+
+## Task #29: direct user request -- the chain visual only ever bends at
+## explicit wrap points around obstacles (_compute_rope_path_2d() below); in
+## open space with nothing to wrap around it renders as a rigid straight
+## line hand -> dart, including during a SWINGING leg, which reads as a
+## stiff rod rather than a whip. Purely cosmetic: reshapes the local `path`
+## array _update_rope_visual() walks to place chain links, nothing else --
+## does not touch pos_2d, dir_2d, _wrap_state, wrap routing, or any hit
+## detection (_check_player_hits() has its own separate "hand_dart"
+## straight-line query, entirely unaffected by this).
+##
+## Deliberately only fires on a plain 2-point (unwrapped) path -- if the
+## rope is already bending around an obstacle (path.size() > 2, from
+## _compute_rope_path_2d()'s own wrap routing), leave those segments alone
+## rather than layering a bow on top, which could visually push the rendered
+## chain back into the very geometry the wrap routing exists to route
+## around.
+##
+## Bows the straight hand->tail line into a quadratic Bezier, control point
+## offset perpendicular to that line at the midpoint, then samples
+## SWING_BOW_SAMPLE_COUNT extra points along the curve for the walk-the-
+## polyline placement above to follow. Bow direction is picked to match
+## whichever side the dart's own current travel heading (dir_2d) is sweeping
+## toward (the perpendicular component of dir_2d relative to the hand-dart
+## line), so the arc reads as trailing behind the dart's actual motion
+## rather than an arbitrary fixed side that could visually fight the swing.
+## Magnitude scales with _flight_speed relative to a plain throw's
+## travel_speed -- as of Task #30, _flight_speed while SWINGING varies with
+## charge_ratio (swing_speed_min_mult..swing_speed_max_mult, see
+## begin_swing_redirect()'s own comment) rather than Task #29's flat
+## swing_speed_mult, so this bow now reads the charge level indirectly
+## through speed: a fuller-charge (faster) redirect arcs more than a
+## bare-minimum-hold (slower) one, still consistent with "Momentum Is A
+## Weapon" -- no change needed to this function's own math, since it already
+## keyed off _flight_speed rather than a specific constant.
+func _apply_swing_bow(path: PackedVector2Array) -> PackedVector2Array:
+	if state != State.SWINGING or path.size() != 2:
+		return path
+	var from: Vector2 = path[0]
+	var to: Vector2 = path[1]
+	var straight: Vector2 = to - from
+	var length: float = straight.length()
+	if length < 0.01:
+		return path
+	var line_dir: Vector2 = straight / length
+	var perp: Vector2 = Vector2(-line_dir.y, line_dir.x)
+	var side: float = perp.dot(dir_2d)
+	var side_sign: float = 1.0 if side >= 0.0 else -1.0
+	var speed_ratio: float = clampf(_flight_speed / maxf(travel_speed, 0.01), 0.5, 2.0)
+	var bow_amount: float = length * SWING_BOW_RATIO * speed_ratio * side_sign
+	var control: Vector2 = (from + to) * 0.5 + perp * bow_amount
+	var curved := PackedVector2Array()
+	curved.append(from)
+	for i in range(1, SWING_BOW_SAMPLE_COUNT):
+		var t: float = float(i) / float(SWING_BOW_SAMPLE_COUNT)
+		# Quadratic Bezier via De Casteljau: lerp(lerp(from,control,t),
+		# lerp(control,to,t), t) -- tapers naturally to zero offset at both
+		# endpoints (t=0 -> from, t=1 -> to) without needing a separate
+		# falloff term.
+		var a: Vector2 = from.lerp(control, t)
+		var b: Vector2 = control.lerp(to, t)
+		curved.append(a.lerp(b, t))
+	curved.append(to)
+	return curved
 
 
 ## Builds a Basis whose local Y axis points along dir (world-space) -- used
@@ -1202,9 +1362,13 @@ func _clamp_along_wrap_path(from_pos: Vector2, target: Vector2, max_len: float, 
 
 ## Task #21 fix: predicts where a hold-then-release SWINGING redirect leg
 ## would actually land, given the dart's CURRENT position, the player's aim
-## direction, and this leg's charge-scaled effective_range (player.gd's
-## _compute_redirect_travel_distance() -- an owner-relative max distance
-## budget, NOT a travel distance -- see that const's own header comment).
+## direction, and this leg's effective_range -- an owner-relative max
+## distance budget, NOT a travel distance. As of Task #30, player.gd's only
+## caller (_redirect_is_pointless_micro_hop()) always passes dart.rope_length
+## here (distance is no longer charge-scaled -- see begin_swing_redirect()'s
+## own header comment); the effective_range param itself is left generic
+## (not hardcoded to rope_length inside this function) so a future/test
+## caller can still probe a smaller hypothetical range if ever needed.
 ## Used by player.gd's _redirect_is_pointless_micro_hop() to measure the
 ## REAL predicted travel distance of this leg (this landing point minus the
 ## dart's CURRENT pos_2d), instead of the Task #20 bug: subtracting two
@@ -1248,9 +1412,70 @@ func _clamp_along_wrap_path(from_pos: Vector2, target: Vector2, max_len: float, 
 ## begin_swing_redirect() uses -- owner_pos + aim_dir * range_cap, a point
 ## directly on the aim ray from the OWNER -- and clamps that (wrap-aware,
 ## same as before) rather than an off-ray reach past it. Must stay in sync
-## with begin_swing_redirect() any time that formula changes.
+## with begin_swing_redirect() any time that formula changes -- both now
+## route the actual range computation through _redirect_forward_safe_range()
+## so they can't drift out of sync (Task #27).
 func predict_redirect_landing_point(owner_pos: Vector2, aim_dir: Vector2, effective_range: float) -> Vector2:
 	var dir: Vector2 = aim_dir.normalized() if aim_dir.length() > 0.01 else Vector2(0.0, 1.0)
-	var range_cap: float = minf(rope_length, effective_range)
+	var requested_range: float = minf(rope_length, effective_range)
+	var range_cap: float = _redirect_forward_safe_range(owner_pos, pos_2d, dir, requested_range)
 	var target_point: Vector2 = owner_pos + dir * range_cap
 	return _clamp_along_wrap_path(owner_pos, target_point, range_cap, "redirect_preview")
+
+
+## Task #27 fix: shared by begin_swing_redirect() and
+## predict_redirect_landing_point() so the two can't drift out of sync (both
+## header comments already required staying in sync manually -- this makes
+## it structural instead).
+##
+## Direct user report: "When the redirect is the same direction as of
+## original throw, it snaps to the new place or back in hand. Check the
+## logic for redirect especially when the hold was short." Root cause
+## (confirmed via a direct headless probe before this fix): both callers'
+## target_point formula -- owner_pos + aim_dir * requested_range, Task #22's
+## fix -- places the target at an ABSOLUTE distance from the owner along the
+## aim ray. That's correct/intended when aim_dir points somewhere genuinely
+## different from where the dart currently sits (Task #22's own scenario --
+## "pick a nearby spot" off the dart's existing position is exactly the
+## point). But when aim_dir is roughly the SAME direction the dart is
+## already sitting in from the owner (a player continuing outward on a
+## second hold-and-release, aiming the same way as their first throw), a
+## SHORT hold's requested_range can be smaller than the dart's own CURRENT
+## owner-relative distance along that same ray -- landing target_point
+## BEHIND the dart's existing position even though the input aim direction
+## was unchanged. begin_swing_redirect() then computes dir_2d as the
+## direction FROM the dart's current position TOWARD that (now-behind)
+## target, i.e. directly backward relative to what the player actually
+## aimed -- read by the user as the dart "snapping" to the new (nearer,
+## behind-it) spot, or as an instant pickup if the resulting hop is small
+## enough to trip the pointless-micro-hop check.
+##
+## Fix: never let this leg's own range sit below how far along aim_dir the
+## dart is ALREADY sitting (current_proj, its current owner-relative
+## position projected onto the aim ray) -- a short hold in the same
+## direction now means "at least don't retreat", not "snap backward". This
+## is a pure no-op for every other case Task #22/#20/#21 already covered:
+## - A genuinely different aim direction: current_proj is small or negative
+##   (the dart isn't sitting anywhere near that ray), so
+##   maxf(requested_range, current_proj) == requested_range unchanged.
+## - A charge long enough to already clear the dart's current position:
+##   requested_range already exceeds current_proj, so the max() picks
+##   requested_range unchanged.
+## Only kicks in exactly where the bug report says it should: aim roughly
+## aligned with the dart's existing position, hold short enough that the
+## raw requested_range would otherwise undershoot it.
+##
+## Task #30 note: since distance is no longer charge-scaled, both real
+## callers (begin_swing_redirect(), predict_redirect_landing_point()) now
+## always pass requested_range == rope_length (the max possible value) --
+## current_proj can never exceed rope_length either, so
+## maxf(requested_range, current_proj) is now provably always
+## requested_range, making this a structural no-op along the live path.
+## Left in place rather than removed/inlined: it's still the correct,
+## cheap, generically-safe formula for ANY requested_range (including a
+## smaller max_travel_distance override, still a supported param on both
+## callers), so keeping it here costs nothing and preserves the guarantee
+## if that override is ever actually used by a future caller.
+func _redirect_forward_safe_range(owner_pos: Vector2, current_pos: Vector2, dir: Vector2, requested_range: float) -> float:
+	var current_proj: float = (current_pos - owner_pos).dot(dir)
+	return minf(rope_length, maxf(requested_range, current_proj))
