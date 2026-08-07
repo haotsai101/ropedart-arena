@@ -51,6 +51,24 @@ var _dash_pending: bool = false
 var _melee_pending: bool = false  # one-shot pulse, same contract as _throw_pending et al.
 var _melee_cooldown_timer: float = 0.0
 var _dodge_dir: Vector2 = Vector2.ZERO  # committed dodge direction; reset when threat clears
+## Task #23: AIM's own aim-imperfection offset, rolled ONCE when entering
+## BotState.AIM (see the CHASE->AIM transition below) and held fixed for the
+## whole AIM_DURATION window, rather than re-rolled from scratch every single
+## physics tick. Confirmed by a headless probe driving a real bot_controller
+## through CHASE->AIM against a stationary target and sampling
+## owner_player.aim_dir every physics tick: the old per-tick reroll (fresh
+## randf_range(-1,1)*AIM_NOISE_DEG every tick, snapped straight into
+## _desired_aim/aim_dir with no smoothing) produced a real angle delta EVERY
+## SINGLE TICK for the whole sustained AIM window (non-zero every tick, not
+## just a one-time settle) -- exactly the visible dart spin/jitter reported:
+## rope_dart.gd's _process() tracks owner_player.aim_dir live every frame
+## while HOLSTERED/CHARGING, so a re-randomized aim_dir each tick reads as
+## the held dart spinning in the bot's hand. With this fix, the same probe
+## shows a per-tick angle delta of 0.0000 deg for the rest of a sustained AIM
+## window (after the state settles) -- rolling once per AIM cycle keeps the
+## intentional aim-imperfection (still fully in play at throw time) but the
+## noise itself no longer changes tick-to-tick.
+var _aim_noise: float = 0.0
 
 
 func _ready() -> void:
@@ -167,11 +185,14 @@ func _physics_process(delta: float) -> void:
 				_desired_move = Vector2.ZERO
 				_state = BotState.AIM
 				_timer = AIM_DURATION[difficulty]
+				# Roll the aim-imperfection offset once per AIM cycle -- see
+				# _aim_noise's own header comment for why this moved out of
+				# the per-tick branch below.
+				_aim_noise = randf_range(-1.0, 1.0) * deg_to_rad(AIM_NOISE_DEG[difficulty])
 
 		BotState.AIM:
 			_desired_move = Vector2.ZERO
-			var noise: float = randf_range(-1.0, 1.0) * deg_to_rad(AIM_NOISE_DEG[difficulty])
-			_desired_aim = Vector2.from_angle(dir.angle() + noise)
+			_desired_aim = Vector2.from_angle(dir.angle() + _aim_noise)
 			if _timer <= 0.0:
 				if dart_in_hand:
 					_throw_pending = true

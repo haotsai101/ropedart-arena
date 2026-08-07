@@ -418,8 +418,43 @@ func _process_flying(delta: float) -> void:
 		_embed_in_place()
 
 
+## Task #23: re-orients the dart to point AWAY FROM THE OWNER at the instant
+## it embeds, regardless of whatever dir_2d (the raw travel-direction heading)
+## happened to be at the moment of impact -- a grazing wall hit, an open-air
+## max-range embed, or a SWINGING redirect landing can all leave dir_2d
+## pointing some arbitrary way that has nothing to do with "outward" (per
+## direct user spec: "the dart should always point outward when anchored").
+## "Outward" is defined as away from the owner's position (the tip points
+## away from the player, the tail/ring points toward the player) -- the
+## robust, always-computable definition; deriving a true surface normal from
+## generic AABB/rect obstacle geometry isn't reliably available here.
+##
+## Computed ONCE here, at the moment of embedding, then left untouched for
+## the rest of EMBEDDED -- not re-derived every frame from the player's
+## CURRENT position. A continuously-reorienting stationary object would read
+## as visually wrong/uncanny (the dart spinning in place as the owner walks a
+## circle around it); a one-time snapshot at embed time is the natural
+## reading of "always point outward when anchored" for a physical object that
+## just stuck into a surface and stopped moving.
+##
+## This is the single choke point every EMBEDDED transition passes through --
+## _process_flying()'s two embed exits (wall/obstacle collision, open-air
+## max-range) call this directly, and SWINGING's redirect leg reuses
+## _process_flying() verbatim (see begin_swing_redirect()'s own header
+## comment), so a post-redirect landing goes through here too. No other
+## function ever sets state = State.EMBEDDED.
+##
+## Bonus consistency win: _update_rope_visual()'s tail_2d (the rope's visual
+## attachment point on the dart, pos_2d - dir_2d * HEAD_TAIL_OFFSET) now also
+## lands on the owner-facing side once embedded, since it reads this same
+## dir_2d -- the rope endpoint sits on the near/tail side of the dart instead
+## of wherever the stale travel-direction tail happened to fall.
 func _embed_in_place() -> void:
 	state = State.EMBEDDED
+	if owner_player != null and is_instance_valid(owner_player):
+		var away_from_owner: Vector2 = pos_2d - owner_player.get_pos_2d()
+		if away_from_owner.length() > 0.01:
+			dir_2d = away_from_owner.normalized()
 	state_changed.emit(state)
 
 
