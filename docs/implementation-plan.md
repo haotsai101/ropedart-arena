@@ -255,7 +255,7 @@ multiple rounds reaches a match win.
 
 ---
 
-## Phase 6 — Bots at full parity
+## Phase 6 — Bots at full parity (DONE)
 
 **Goal:** `bot_controller.gd` predates Kick and Swinging entirely — bring it
 up to the full new kit so solo/local-vs-bots is a real test environment

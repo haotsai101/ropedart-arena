@@ -7,14 +7,20 @@ enum BotState { CHASE, AIM, RETREAT }
 
 @export var difficulty: int = Difficulty.EASY
 
-const DART_STATE_FLYING = 0  # mirrors Dagger.State.FLYING ordinal
-## Mirrors rope_dart.gd's State.HOLSTERED ordinal (0 in both the old deleted
-## Dagger enum and the current rope_dart.gd enum, coincidentally the same
-## value). Used below to tell "dart in hand" apart from "dart away" now that
-## dart is a persistent node whose STATE changes on throw, not a field that
-## goes null (see player.gd's own header comment on this) -- unlike
-## DART_STATE_FLYING above, this one is live code, not dead/no-op code.
+## Task #31: mirrors rope_dart.gd's real State enum ordinals (HOLSTERED=0,
+## CHARGING=1, FLYING=2, EMBEDDED=3, SWINGING=4, RETURNING=5), cross-checked
+## against player.gd's own DART_STATE_* consts (which mirror the same enum
+## by hand for the same duck-typing reason) rather than assumed. The old
+## DART_STATE_FLYING=0 here was a stale leftover from the pre-rebuild deleted
+## Dagger enum -- harmless while _get_dodge_dir() read the dead "darts" group
+## (see that function's own header comment, superseded below), but wrong
+## against the CURRENT rope_dart.gd (FLYING is ordinal 2, not 0) and would
+## have silently never matched anything once dodge started reading real dart
+## state. Used below to tell "dart in hand" apart from "dart away".
 const DART_STATE_HOLSTERED = 0
+const DART_STATE_FLYING = 2
+const DART_STATE_SWINGING = 4
+const DART_STATE_RETURNING = 5
 
 const THROW_RANGE   := [4.0, 5.5, 7.0]
 const AIM_DURATION  := [1.4, 0.7, 0.25]
@@ -248,20 +254,42 @@ func _find_target():  # returns untyped player node for duck-typed access
 	return closest
 
 
+## Task #31 rewrite: the old version iterated get_tree().get_nodes_in_group
+## ("darts"), which rope_dart.gd deliberately never joins (see that file's
+## own header comment) -- a permanent no-op, not a real dodge. Real threats
+## now come from every OTHER player's own persistent `dart` reference
+## (player.gd's `dart` field, never null once that player's _ready() has run
+## -- same pattern _find_target() already uses to walk the "players" group).
+##
+## Per this task's own correction to docs/implementation-plan.md's Phase 6
+## framing: EMBEDDED is deliberately NOT treated as a threat here (a
+## stationary anchored dart is non-lethal to touch, docs/project.md's Combat
+## "Dart Contact" section) -- only FLYING, SWINGING, and RETURNING are real,
+## contact-lethal threats worth committing a dodge to. dart.pos_2d/dir_2d
+## (rope_dart.gd's real fields) stand in for the old dead code's
+## head_2d/dir_2d -- rope_dart.gd never exposed head_2d at all, pos_2d is the
+## dart's actual gameplay position (dart-contact hit detection itself
+## measures against pos_2d, see rope_dart.gd's _check_player_hits()).
 func _get_dodge_dir(my_pos: Vector2) -> Vector2:
-	for dart in get_tree().get_nodes_in_group("darts"):
-		if not is_instance_valid(dart):
+	for p in get_tree().get_nodes_in_group("players"):
+		if p == player:
 			continue
-		if dart.owner_player == player or dart.state != DART_STATE_FLYING:
+		var threat_dart = p.get("dart")
+		if threat_dart == null or not is_instance_valid(threat_dart):
 			continue
-		var to_me: Vector2 = my_pos - (dart.head_2d as Vector2)
+		var threat_state: int = threat_dart.state
+		if threat_state != DART_STATE_FLYING and threat_state != DART_STATE_SWINGING and threat_state != DART_STATE_RETURNING:
+			continue
+		var dart_pos: Vector2 = threat_dart.pos_2d
+		var dart_dir: Vector2 = threat_dart.dir_2d
+		var to_me: Vector2 = my_pos - dart_pos
 		if to_me.length() > 8.0:
 			continue
-		if (dart.dir_2d as Vector2).dot(to_me.normalized()) > cos(deg_to_rad(40.0)):
+		if dart_dir.dot(to_me.normalized()) > cos(deg_to_rad(40.0)):
 			# Commit to a side on first detection; keep it until the threat clears
 			if _dodge_dir == Vector2.ZERO:
 				var side: float = 1.0 if randf() > 0.5 else -1.0
-				_dodge_dir = (dart.dir_2d as Vector2).rotated(PI * 0.5 * side)
+				_dodge_dir = dart_dir.rotated(PI * 0.5 * side)
 				_dash_pending = true  # burst out of the way instead of just sidestepping
 			return _dodge_dir
 	_dodge_dir = Vector2.ZERO  # no threat — reset so next dart picks fresh side
