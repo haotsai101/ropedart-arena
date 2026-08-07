@@ -222,7 +222,7 @@ should feel equally reliable to trigger on both.
 
 ---
 
-## Phase 4.5 — Touch parity: Dash button
+## Phase 4.5 — Touch parity: Dash button (DONE)
 
 **Goal:** close the one input gap that isn't tied to a new combat mechanic —
 Dash currently has no touch binding at all (see Target Platforms), so it's
@@ -238,7 +238,7 @@ without a keyboard or gamepad attached.
 
 ---
 
-## Phase 5 — Round/match loop restoration
+## Phase 5 — Round/match loop restoration (DONE)
 
 **Goal:** now that death means something, turn the sandbox `PLAYING` state
 back into a real match.
