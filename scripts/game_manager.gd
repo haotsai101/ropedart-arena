@@ -1,15 +1,18 @@
 extends Node
 ## Round state machine autoload. Access globally as "GameManager".
 ##
-## WEAPON/COMBAT SYSTEM REMOVED (branch remove-weapon-system): the round/match
-## win-condition machinery (lives_per_round, rounds_to_win, round_wins, the
-## ROUND_END/MATCH_END states, and the win-check that used to run when a
-## player was eliminated) is gone -- there is no combat outcome left to decide
-## a round or match winner. The state machine now only ever progresses
-## LOBBY -> COUNTDOWN -> PLAYING and stays in PLAYING (a "sandbox" match, not
-## a win/lose loop) -- see start_round()/_process() below.
+## Phase 5 (docs/implementation-plan.md) restored the round/match win-loop
+## that WEAPON/COMBAT SYSTEM REMOVAL (branch remove-weapon-system) had
+## stripped out: RoundState now includes ROUND_END/MATCH_END, and
+## lives_per_round/rounds_to_win/round_wins drive a real FFA win condition
+## (no team modes exist yet -- a round ends the instant only one tracked
+## player still has lives > 0, see _check_round_win()). The state machine
+## now runs LOBBY -> COUNTDOWN -> PLAYING -> (ROUND_END -> COUNTDOWN)* ->
+## MATCH_END, where the ROUND_END loop repeats until someone reaches
+## rounds_to_win. MATCH_END is a deliberate dead end (see _apply_round_result()
+## for the "no further action" judgment call, flagged there and in hud.gd).
 
-enum RoundState { LOBBY, COUNTDOWN, PLAYING }
+enum RoundState { LOBBY, COUNTDOWN, PLAYING, ROUND_END, MATCH_END }
 
 signal state_changed(new_state: int)
 
@@ -17,12 +20,35 @@ signal state_changed(new_state: int)
 @export var total_players: int = 4
 @export var human_count: int = 1
 @export var bot_difficulty: int = 0   # 0=Easy 1=Medium 2=Hard
+## Lives each player starts a round with (player.gd's `lives`, decremented by
+## take_dart_hit() -- reaching 0 eliminates that player for the rest of the
+## round, see player.gd's _eliminate()).
+@export var lives_per_round: int = 3
+## Round-wins (round_wins below) needed to end the whole match, not just a
+## round -- see _apply_round_result().
+@export var rounds_to_win: int = 2
+## Brief pause after a round ends (ROUND_END state) before the next round's
+## COUNTDOWN begins, so the HUD's round-end banner (hud.gd) has time to be
+## read before the arena resets.
+@export var round_end_pause_duration: float = 2.5
 
 var lobby_mode: bool = true   # set to false by lobby.gd before transitioning
 var is_online: bool = false   # set to true by lobby.gd when launching online match
 var selected_map_scene: String = "res://scenes/main.tscn"   # set by lobby.gd before change_scene_to_file
 
 var current_state: int = RoundState.LOBBY
+## player_index (int) -> round-win count (int), persists across rounds within
+## ONE match; reset to empty at the start of a fresh match (_init_game_local/
+## _init_game_online below), not at the start of each round (start_round()
+## deliberately leaves this untouched -- see its own comment).
+var round_wins: Dictionary = {}
+## Winner of the most recently finished round (-1 if none yet, or in the rare
+## simultaneous-elimination draw case -- see _check_round_win()) / of the
+## match once MATCH_END is reached. hud.gd polls these (same "poll
+## GameManager state every frame" convention _process() below already uses
+## for current_state) to build its round-end/match-end banner text.
+var last_round_winner_index: int = -1
+var match_winner_index: int = -1
 var player_characters: Dictionary = {}   # player_index (int) → character id (String)
 ## "" means "use the base character's native accessory" (see CHARACTER_DEFS'
 ## native_headwear/native_cloth fields, resolved via resolve_headwear_id/
@@ -199,6 +225,7 @@ func _init_game() -> void:
 
 
 func _init_game_local(main: Node) -> void:
+	_reset_match_state()
 	if player_characters.is_empty():
 		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
@@ -226,6 +253,7 @@ func _init_game_online(main: Node) -> void:
 	# All peers spawn all player nodes so scene state is consistent, but each
 	# player node's set_multiplayer_authority() limits which peer drives movement.
 	# Slots without a connected human peer become host-driven bots.
+	_reset_match_state()
 	if player_characters.is_empty():
 		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
@@ -316,6 +344,15 @@ func _process(delta: float) -> void:
 			# Transition after a short "GO!" window so the HUD can display it
 			if _timer <= -0.5:
 				_set_state(RoundState.PLAYING)
+		RoundState.PLAYING:
+			_check_round_win()
+		RoundState.ROUND_END:
+			_timer -= delta
+			if _timer <= 0.0:
+				# Only the host actually restarts the loop; on clients start_round()
+				# is a no-op guard (see its own check) since the host's own
+				# _rpc_set_state(COUNTDOWN) already told them the next round began.
+				start_round()
 
 
 func _set_state(new_state: int) -> void:
@@ -357,6 +394,10 @@ func start_round() -> void:
 			assign_default_characters()
 		rpc("_rpc_sync_characters", player_characters)
 		rpc("_rpc_sync_accessories", player_headwear, player_cloth)
+	# NOTE: round_wins/last_round_winner_index/match_winner_index are
+	# deliberately NOT touched here -- they persist across rounds within a
+	# match (see round_wins' own comment); only _reset_match_state() (a whole
+	# NEW match starting) clears them.
 	var spawn_positions := _get_spawn_positions()
 	for i in _all_players.size():
 		var p = _all_players[i]
@@ -364,6 +405,87 @@ func start_round() -> void:
 		p.reset_for_round(pos)
 	_timer = countdown_duration
 	_set_state(RoundState.COUNTDOWN)
+
+
+func _reset_match_state() -> void:
+	## A genuinely NEW match starting (called from _init_game_local/
+	## _init_game_online, both of which only ever run once per scene load) --
+	## clears round_wins and the last-winner trackers so a replayed session
+	## within the same process (GameManager is a persistent autoload, unlike
+	## the scene tree) doesn't carry a stale winner/pip count into a fresh
+	## match. Deliberately NOT called from start_round() itself, which also
+	## runs at the start of every ROUND within a match and must leave this data
+	## alone (see start_round()'s own comment).
+	round_wins.clear()
+	last_round_winner_index = -1
+	match_winner_index = -1
+
+
+## FFA-only win check (per the GDD's default mode -- no team modes exist yet):
+## a round ends the instant at most one tracked player still has lives > 0.
+## Runs every PLAYING frame off _all_players (the match's real roster, NOT the
+## "players" group -- ad hoc player nodes instantiated by regression tests
+## outside GameManager's own _init_game_local/_init_game_online never populate
+## _all_players, so this is naturally a no-op in that context and can't
+## interfere with those tests) -- cheap at the <=6-player scale this game
+## supports, same "poll every frame" convention COUNTDOWN's own _timer
+## countdown above already uses rather than an event-driven callback.
+func _check_round_win() -> void:
+	if is_online and multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		return  # only the host decides; _rpc_round_result below propagates it
+	if _all_players.size() < 2:
+		return
+	var alive: Array = []
+	for p in _all_players:
+		if not is_instance_valid(p):
+			continue
+		if p.get("lives") == null or p.lives > 0:
+			alive.append(p)
+	if alive.size() > 1:
+		return
+	var winner_idx: int = alive[0].player_index if alive.size() == 1 else -1
+	_end_round(winner_idx)
+
+
+## winner_idx == -1 covers the rare simultaneous-elimination draw (the last
+## two-or-more players' lives both hit 0 on the exact same _check_round_win()
+## poll) -- no round_wins increment happens for a draw, and the match simply
+## proceeds to another round rather than crediting anyone.
+func _end_round(winner_idx: int) -> void:
+	var new_round_wins: Dictionary = round_wins.duplicate()
+	if winner_idx >= 0:
+		new_round_wins[winner_idx] = int(new_round_wins.get(winner_idx, 0)) + 1
+	var match_winner: int = -1
+	if winner_idx >= 0 and int(new_round_wins.get(winner_idx, 0)) >= rounds_to_win:
+		match_winner = winner_idx
+	if is_online and multiplayer.multiplayer_peer != null:
+		rpc("_rpc_round_result", new_round_wins, winner_idx, match_winner)
+	else:
+		_apply_round_result(new_round_wins, winner_idx, match_winner)
+
+
+@rpc("authority", "call_local", "reliable")
+func _rpc_round_result(new_round_wins: Dictionary, winner_idx: int, match_winner: int) -> void:
+	_apply_round_result(new_round_wins, winner_idx, match_winner)
+
+
+## Judgment call (flagged per this task's own instructions, see hud.gd's
+## MATCH_END overlay for the other half of this): once rounds_to_win is
+## reached, MATCH_END is a deliberate dead end -- no auto-return to the lobby,
+## no "rematch" button, just a static banner. There's no existing
+## post-match-flow precedent anywhere else in this project to follow (lobby.gd
+## only ever flows INTO a match, never back out of one), and the task's own
+## instructions say to pick the simplest reasonable option when genuinely
+## undecided rather than invent new lobby-return plumbing here.
+func _apply_round_result(new_round_wins: Dictionary, winner_idx: int, match_winner: int) -> void:
+	round_wins = new_round_wins
+	last_round_winner_index = winner_idx
+	if match_winner >= 0:
+		match_winner_index = match_winner
+		_set_state(RoundState.MATCH_END)
+	else:
+		_timer = round_end_pause_duration
+		_set_state(RoundState.ROUND_END)
 
 
 func _get_spawn_positions() -> Array:
