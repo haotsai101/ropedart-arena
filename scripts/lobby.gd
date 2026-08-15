@@ -36,8 +36,6 @@ var _screen: String = "username"
 
 # Username screen
 var _typed_username: String = ""
-var _cursor_timer: float = 0.0
-var _cursor_blink: bool = true
 
 # Browser screen
 var _browser_rooms: Array = []
@@ -74,7 +72,7 @@ var _error_message: String = ""
 # ---------------------------------------------------------------------------
 # Live-update label references (set during _rebuild_ui, nulled before rebuild)
 # ---------------------------------------------------------------------------
-var _username_input_lbl: Label = null      # username screen input display
+var _username_line_edit: LineEdit = null   # username screen input field (touch/mouse + keyboard)
 
 var _browser_status_lbl: Label = null      # "Loading..." or ""
 var _browser_rooms_vbox: VBoxContainer = null
@@ -154,7 +152,7 @@ func _set_screen(screen_name: String) -> void:
 
 func _rebuild_ui() -> void:
 	# Null out all live-update refs before freeing children
-	_username_input_lbl = null
+	_username_line_edit = null
 	_browser_status_lbl = null
 	_browser_rooms_vbox = null
 	_wait_players_vbox = null
@@ -197,12 +195,6 @@ func _rebuild_ui() -> void:
 
 func _process(delta: float) -> void:
 	match _screen:
-		"username":
-			_cursor_timer += delta
-			if _cursor_timer >= 0.5:
-				_cursor_timer = 0.0
-				_cursor_blink = not _cursor_blink
-				_update_username_cursor()
 		"browser":
 			if not _browser_loading:
 				_browser_refresh_timer += delta
@@ -229,7 +221,7 @@ func _build_username_screen() -> void:
 	var vw: float = vp_size.x
 	var vh: float = vp_size.y
 	var panel_w: float = vw * 0.52
-	var panel_h: float = vh * 0.28
+	var panel_h: float = vh * 0.34
 
 	var panel := _make_panel(int(panel_w), int(panel_h), 0)
 	add_child(panel)
@@ -247,17 +239,35 @@ func _build_username_screen() -> void:
 	panel.add_child(vbox)
 
 	var hint := Label.new()
-	hint.text = "A-Z  0-9  _   Backspace to delete   Enter to confirm"
+	hint.text = "A-Z  0-9  _   Tap the field or type   Enter/Continue to confirm"
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_font_size_override("font_size", _fs(15))
 	hint.add_theme_color_override("font_color", COLOR_DIM)
 	vbox.add_child(hint)
 
-	_username_input_lbl = Label.new()
-	_username_input_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_username_input_lbl.add_theme_font_size_override("font_size", _fs(36))
-	_username_input_lbl.add_theme_color_override("font_color", COLOR_VALUE)
-	vbox.add_child(_username_input_lbl)
+	# Real LineEdit -- gives touch/mouse users a tappable field (triggers the
+	# OS virtual keyboard automatically on touch platforms) while keyboard
+	# users keep typing directly into it exactly as before. This REPLACES the
+	# old manual per-keystroke InputEventKey capture (_input_username) as the
+	# actual typing mechanism, but the Enter-to-confirm behavior is preserved
+	# via text_submitted below -- so keyboard users see no behavior change.
+	_username_line_edit = LineEdit.new()
+	_username_line_edit.text = _typed_username
+	_username_line_edit.placeholder_text = "USERNAME"
+	_username_line_edit.max_length = 16
+	_username_line_edit.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_username_line_edit.custom_minimum_size = Vector2(vw * 0.30, vh * 0.09)
+	_username_line_edit.add_theme_font_size_override("font_size", _fs(30))
+	_username_line_edit.add_theme_color_override("font_color", COLOR_VALUE)
+	_username_line_edit.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	_username_line_edit.text_changed.connect(_on_username_text_changed)
+	_username_line_edit.text_submitted.connect(_on_username_text_submitted)
+	vbox.add_child(_username_line_edit)
+
+	var confirm_btn := _make_lobby_button("CONTINUE", _try_confirm_username)
+	confirm_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	confirm_btn.custom_minimum_size = Vector2(vw * 0.20, vh * 0.07)
+	vbox.add_child(confirm_btn)
 
 	var min_hint := Label.new()
 	min_hint.text = "2 – 16 characters"
@@ -266,14 +276,43 @@ func _build_username_screen() -> void:
 	min_hint.add_theme_color_override("font_color", COLOR_DIM)
 	vbox.add_child(min_hint)
 
-	_update_username_cursor()
+	_username_line_edit.grab_focus()
+	_username_line_edit.caret_column = _username_line_edit.text.length()
 
 
-func _update_username_cursor() -> void:
-	if _username_input_lbl == null:
-		return
-	var cursor: String = "_" if _cursor_blink else " "
-	_username_input_lbl.text = "> " + _typed_username + cursor
+func _on_username_text_changed(new_text: String) -> void:
+	## Mirrors the old manual capture's validation (A-Z/0-9/_, uppercase,
+	## max 16) but applied to LineEdit's own text so touch/mouse typists get
+	## the exact same accepted-character set as the old keyboard-only path.
+	var caret: int = _username_line_edit.caret_column
+	var filtered: String = ""
+	for i: int in new_text.length():
+		var ch: String = new_text[i].to_upper()
+		var code: int = ch.unicode_at(0)
+		var valid: bool = (
+			(code >= 65 and code <= 90) or  # A-Z
+			(code >= 48 and code <= 57) or  # 0-9
+			code == 95                       # _
+		)
+		if valid:
+			filtered += ch
+	filtered = filtered.left(16)
+	_typed_username = filtered
+	if filtered != new_text:
+		var removed: int = new_text.length() - filtered.length()
+		_username_line_edit.text = filtered
+		_username_line_edit.caret_column = clampi(caret - removed, 0, filtered.length())
+
+
+func _on_username_text_submitted(_text: String) -> void:
+	_try_confirm_username()
+
+
+func _try_confirm_username() -> void:
+	var candidate: String = _typed_username.strip_edges()
+	if candidate.length() >= 2:
+		UsernameManager.save(candidate)
+		_set_screen("browser")
 
 
 # ===========================================================================
@@ -338,12 +377,31 @@ func _build_browser_screen() -> void:
 	_browser_rooms_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(_browser_rooms_vbox)
 
-	# Bottom actions bar
-	var bottom := _make_browser_row_label("[R] Refresh     [N] New Game     [B] Play with Bots     [Enter/A] Join", false)
-	bottom.add_theme_color_override("font_color", COLOR_PROMPT)
-	bottom.add_theme_font_size_override("font_size", _fs(16))
-	bottom.custom_minimum_size = Vector2(0, vh * 0.065)
-	root_vbox.add_child(bottom)
+	# Bottom actions bar — real Buttons (tap/click) alongside the unchanged
+	# keyboard/gamepad shortcuts (KEY_R/N/B, JOY_BUTTON_Y/X, still handled in
+	# _input()/_input_browser() below). Tap a room row itself to join it.
+	var bottom_vbox := VBoxContainer.new()
+	bottom_vbox.add_theme_constant_override("separation", 4)
+	bottom_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(bottom_vbox)
+
+	var bottom_hbox := HBoxContainer.new()
+	bottom_hbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	bottom_hbox.add_theme_constant_override("separation", 12)
+	bottom_hbox.custom_minimum_size = Vector2(0, vh * 0.06)
+	bottom_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bottom_vbox.add_child(bottom_hbox)
+
+	bottom_hbox.add_child(_make_lobby_button("REFRESH  [R]", _on_refresh_pressed))
+	bottom_hbox.add_child(_make_lobby_button("NEW GAME  [N]", _begin_host))
+	bottom_hbox.add_child(_make_lobby_button("PLAY WITH BOTS  [B]", _begin_local_game))
+
+	var join_hint := _make_browser_row_label("Tap a room to join     •     [Enter/A] Join selected", false)
+	join_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	join_hint.add_theme_color_override("font_color", COLOR_PROMPT)
+	join_hint.add_theme_font_size_override("font_size", _fs(14))
+	join_hint.custom_minimum_size = Vector2(0, vh * 0.035)
+	bottom_vbox.add_child(join_hint)
 
 	# Trigger initial fetch
 	_browser_loading = true
@@ -394,26 +452,50 @@ func _refresh_browser_list() -> void:
 		var diff: int = int(room.get("bot_difficulty", 0))
 		var diff_str: String = DIFFICULTY_LABELS[clampi(diff, 0, 2)]
 
-		var row := Panel.new()
-		row.custom_minimum_size = Vector2(0, get_viewport_rect().size.y * 0.065)
-		row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var row_style := StyleBoxFlat.new()
-		row_style.bg_color = COLOR_ROW_SELECTED if i == _browser_selected else COLOR_ROW_NORMAL
-		row_style.corner_radius_top_left = 4
-		row_style.corner_radius_top_right = 4
-		row_style.corner_radius_bottom_left = 4
-		row_style.corner_radius_bottom_right = 4
-		row.add_theme_stylebox_override("panel", row_style)
-		_browser_rooms_vbox.add_child(row)
+		_browser_rooms_vbox.add_child(_make_room_row_button(code, host_name, pc, mp, diff_str, i))
 
-		var lbl := Label.new()
-		lbl.text = "  %-10s   %-18s   %d / %-4d   %s" % [code, host_name.left(16), pc, mp, diff_str]
-		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		lbl.add_theme_font_size_override("font_size", _fs(18))
-		lbl.add_theme_color_override("font_color", COLOR_ACCENT if i == _browser_selected else COLOR_TEXT)
-		lbl.set_anchors_preset(Control.PRESET_FULL_RECT)
-		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		row.add_child(lbl)
+
+func _make_room_row_button(code: String, host_name: String, pc: int, mp: int, diff_str: String, index: int) -> Button:
+	## A real Button standing in for the old Panel+Label row -- tapping/
+	## clicking it joins that room directly (see _on_room_row_tapped), while
+	## the existing Up/Down (keyboard/gamepad) selection + Enter/A join path
+	## through _input_browser()/_browser_try_join() keeps working unchanged.
+	var is_sel: bool = (index == _browser_selected)
+	var btn := Button.new()
+	btn.text = "  %-10s   %-18s   %d / %-4d   %s" % [code, host_name.left(16), pc, mp, diff_str]
+	btn.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	btn.focus_mode = Control.FOCUS_NONE
+	btn.custom_minimum_size = Vector2(0, get_viewport_rect().size.y * 0.065)
+	btn.add_theme_font_size_override("font_size", _fs(18))
+
+	var style := StyleBoxFlat.new()
+	style.bg_color = COLOR_ROW_SELECTED if is_sel else COLOR_ROW_NORMAL
+	style.corner_radius_top_left = 4
+	style.corner_radius_top_right = 4
+	style.corner_radius_bottom_left = 4
+	style.corner_radius_bottom_right = 4
+	var style_hover: StyleBoxFlat = style.duplicate()
+	style_hover.bg_color = COLOR_ROW_FOCUSED
+
+	btn.add_theme_stylebox_override("normal", style)
+	btn.add_theme_stylebox_override("hover", style_hover)
+	btn.add_theme_stylebox_override("pressed", style_hover)
+	btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	btn.add_theme_color_override("font_color", COLOR_ACCENT if is_sel else COLOR_TEXT)
+	btn.add_theme_color_override("font_hover_color", COLOR_ACCENT)
+
+	btn.pressed.connect(func(): _on_room_row_tapped(index))
+	return btn
+
+
+func _on_room_row_tapped(index: int) -> void:
+	_browser_selected = index
+	_browser_try_join()
+
+
+func _on_refresh_pressed() -> void:
+	_browser_refresh_timer = 0.0
+	_do_fetch_rooms()
 
 
 func _do_fetch_rooms() -> void:
@@ -559,11 +641,14 @@ func _build_waiting_screen() -> void:
 	var is_taken: bool = _is_char_taken_by_other(my_char_id)
 	var char_value_text: String = str(my_char_def.get("display_name", "?")) + (" (taken!)" if is_taken else "")
 
-	var base_row := _make_settings_row("Character", char_value_text, char_area_focused and _wait_char_slot == 0, true, 0.042)
+	var base_row := _make_settings_row("Character", char_value_text, char_area_focused and _wait_char_slot == 0, true, 0.042,
+			func(): _set_wait_char_row(0, -1), func(): _set_wait_char_row(0, 1))
 	char_rows_vbox.add_child(base_row)
-	var headwear_row := _make_settings_row("Headwear", str(my_headwear_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 1, true, 0.042)
+	var headwear_row := _make_settings_row("Headwear", str(my_headwear_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 1, true, 0.042,
+			func(): _set_wait_char_row(1, -1), func(): _set_wait_char_row(1, 1))
 	char_rows_vbox.add_child(headwear_row)
-	var cloth_row := _make_settings_row("Cloth / Cape", str(my_cloth_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 2, true, 0.042)
+	var cloth_row := _make_settings_row("Cloth / Cape", str(my_cloth_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 2, true, 0.042,
+			func(): _set_wait_char_row(2, -1), func(): _set_wait_char_row(2, 1))
 	char_rows_vbox.add_child(cloth_row)
 
 	var preview_size := Vector2(vw * 0.11, vh * 0.135)
@@ -607,13 +692,19 @@ func _build_waiting_screen() -> void:
 	if _error_message != "":
 		_wait_error_lbl.text = _error_message
 
-	var leave_lbl := Label.new()
-	leave_lbl.text = "[Esc / B] Leave room"
-	leave_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	leave_lbl.add_theme_font_size_override("font_size", _fs(15))
-	leave_lbl.add_theme_color_override("font_color", COLOR_DIM)
-	leave_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root_vbox.add_child(leave_lbl)
+	# Bottom action row — tappable Start (host only) + Leave, alongside the
+	# unchanged Enter/A-to-start and Esc/B-to-leave shortcuts handled in
+	# _input_waiting()/_input_waiting_host() above.
+	var wait_actions_hbox := HBoxContainer.new()
+	wait_actions_hbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	wait_actions_hbox.add_theme_constant_override("separation", 12)
+	wait_actions_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(wait_actions_hbox)
+
+	if NetworkManager.is_host:
+		wait_actions_hbox.add_child(_make_lobby_button("START  [Enter]", _start_online_game))
+
+	wait_actions_hbox.add_child(_make_lobby_button("LEAVE ROOM  [Esc]", _leave_waiting_room))
 
 	_update_wait_prompt()
 
@@ -629,7 +720,8 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 		"Total Players",
 		str(max_p),
 		_wait_settings_focus == 0 and is_host,
-		false, 0.052
+		false, 0.052,
+		func(): _set_wait_setting_row(0, -1), func(): _set_wait_setting_row(0, 1)
 	)
 	_wait_settings_max_lbl = row0.get_node_or_null("ValueLabel")
 	parent.add_child(row0)
@@ -639,7 +731,8 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 		"Bot Difficulty",
 		DIFFICULTY_LABELS[clampi(diff, 0, 2)],
 		_wait_settings_focus == 1 and is_host,
-		false, 0.052
+		false, 0.052,
+		func(): _set_wait_setting_row(1, -1), func(): _set_wait_setting_row(1, 1)
 	)
 	_wait_settings_diff_lbl = row1.get_node_or_null("ValueLabel")
 	parent.add_child(row1)
@@ -649,13 +742,14 @@ func _build_settings_rows(parent: VBoxContainer) -> void:
 		"Map",
 		MAP_LABELS[clampi(map_id, 0, MAP_LABELS.size() - 1)],
 		_wait_settings_focus == 2 and is_host,
-		false, 0.052
+		false, 0.052,
+		func(): _set_wait_setting_row(2, -1), func(): _set_wait_setting_row(2, 1)
 	)
 	_wait_settings_map_lbl = row2.get_node_or_null("ValueLabel")
 	parent.add_child(row2)
 
 
-func _make_settings_row(label_text: String, value_text: String, focused: bool, force_arrows: bool = false, height_ratio: float = 0.065) -> Panel:
+func _make_settings_row(label_text: String, value_text: String, focused: bool, force_arrows: bool = false, height_ratio: float = 0.065, on_left: Callable = Callable(), on_right: Callable = Callable()) -> Panel:
 	var row := Panel.new()
 	row.custom_minimum_size = Vector2(0, get_viewport_rect().size.y * height_ratio)
 	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -692,13 +786,7 @@ func _make_settings_row(label_text: String, value_text: String, focused: bool, f
 	hbox.add_child(name_lbl)
 
 	if NetworkManager.is_host or force_arrows:
-		var arrow_l := Label.new()
-		arrow_l.text = "◀"
-		arrow_l.add_theme_font_size_override("font_size", _fs(18))
-		arrow_l.add_theme_color_override("font_color", COLOR_DIM if not focused else COLOR_VALUE)
-		arrow_l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		arrow_l.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		hbox.add_child(arrow_l)
+		hbox.add_child(_make_arrow_button("◀", focused, on_left))
 
 	var val_lbl := Label.new()
 	val_lbl.name = "ValueLabel"
@@ -712,13 +800,7 @@ func _make_settings_row(label_text: String, value_text: String, focused: bool, f
 	hbox.add_child(val_lbl)
 
 	if NetworkManager.is_host or force_arrows:
-		var arrow_r := Label.new()
-		arrow_r.text = "▶"
-		arrow_r.add_theme_font_size_override("font_size", _fs(18))
-		arrow_r.add_theme_color_override("font_color", COLOR_DIM if not focused else COLOR_VALUE)
-		arrow_r.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		arrow_r.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		hbox.add_child(arrow_r)
+		hbox.add_child(_make_arrow_button("▶", focused, on_right))
 
 	return row
 
@@ -836,6 +918,78 @@ func _add_subtitle(text: String, font_size: int) -> void:
 	lbl.offset_bottom = vh * 0.20
 	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(lbl)
+
+
+func _make_lobby_button(text: String, callback: Callable) -> Button:
+	## Real, tappable Button — fires on both mouse click and touch tap for
+	## free (standard Godot `pressed` behavior). Used for every primary lobby
+	## action (New Game, Play with Bots, Refresh, username Continue) so mouse
+	## and touch users have a path in alongside the existing keyboard/gamepad
+	## shortcuts, which are left completely untouched elsewhere in this file.
+	var btn := Button.new()
+	btn.text = text
+	# FOCUS_NONE keeps these buttons from stealing Control focus, so pressing
+	# the "ui_accept" action (Enter/gamepad A) continues to hit this screen's
+	# own _unhandled_input handlers exactly as before, not a focused Button.
+	btn.focus_mode = Control.FOCUS_NONE
+	btn.custom_minimum_size = Vector2(get_viewport_rect().size.x * 0.16, get_viewport_rect().size.y * 0.06)
+	btn.add_theme_font_size_override("font_size", _fs(16))
+
+	var style_normal := StyleBoxFlat.new()
+	style_normal.bg_color = COLOR_ROW_NORMAL
+	style_normal.border_color = COLOR_BORDER_NORMAL
+	style_normal.border_width_left = 2
+	style_normal.border_width_right = 2
+	style_normal.border_width_top = 2
+	style_normal.border_width_bottom = 2
+	style_normal.corner_radius_top_left = 6
+	style_normal.corner_radius_top_right = 6
+	style_normal.corner_radius_bottom_left = 6
+	style_normal.corner_radius_bottom_right = 6
+	var style_hover: StyleBoxFlat = style_normal.duplicate()
+	style_hover.bg_color = COLOR_ROW_FOCUSED
+	style_hover.border_color = COLOR_BORDER_FOCUSED
+	var style_pressed: StyleBoxFlat = style_normal.duplicate()
+	style_pressed.bg_color = COLOR_ROW_SELECTED
+	style_pressed.border_color = COLOR_BORDER_FOCUSED
+
+	btn.add_theme_stylebox_override("normal", style_normal)
+	btn.add_theme_stylebox_override("hover", style_hover)
+	btn.add_theme_stylebox_override("pressed", style_pressed)
+	btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	btn.add_theme_color_override("font_color", COLOR_TEXT)
+	btn.add_theme_color_override("font_hover_color", COLOR_ACCENT)
+	btn.add_theme_color_override("font_pressed_color", COLOR_ACCENT)
+
+	btn.pressed.connect(callback)
+	return btn
+
+
+func _make_arrow_button(arrow_text: String, focused: bool, callback: Callable) -> Control:
+	## Used inside _make_settings_row() for the ◀ ▶ value cyclers. Falls back
+	## to a plain (non-interactive) Label if no callback is supplied, so any
+	## future caller that doesn't need tap support still gets the old visual.
+	if not callback.is_valid():
+		var lbl := Label.new()
+		lbl.text = arrow_text
+		lbl.add_theme_font_size_override("font_size", _fs(18))
+		lbl.add_theme_color_override("font_color", COLOR_DIM if not focused else COLOR_VALUE)
+		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		return lbl
+
+	var btn := Button.new()
+	btn.text = arrow_text
+	btn.flat = true
+	btn.focus_mode = Control.FOCUS_NONE
+	btn.custom_minimum_size = Vector2(_fs(34), _fs(34))
+	btn.add_theme_font_size_override("font_size", _fs(18))
+	btn.add_theme_color_override("font_color", COLOR_DIM if not focused else COLOR_VALUE)
+	btn.add_theme_color_override("font_hover_color", COLOR_ACCENT)
+	btn.add_theme_color_override("font_pressed_color", COLOR_ACCENT)
+	btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	btn.pressed.connect(callback)
+	return btn
 
 
 func _make_panel(w: int, h: int, v_offset: int) -> Panel:
@@ -958,8 +1112,6 @@ func _input(event: InputEvent) -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	match _screen:
-		"username":
-			_input_username(event)
 		"browser":
 			_input_browser(event)
 		"waiting":
@@ -968,36 +1120,6 @@ func _unhandled_input(event: InputEvent) -> void:
 			_input_local_config(event)
 		"char_select_local":
 			_input_char_select_local(event)
-
-
-func _input_username(event: InputEvent) -> void:
-	if not event is InputEventKey:
-		return
-	var ke := event as InputEventKey
-	if not ke.pressed:
-		return
-
-	match ke.keycode:
-		KEY_ENTER, KEY_KP_ENTER:
-			if _typed_username.strip_edges().length() >= 2:
-				UsernameManager.save(_typed_username.strip_edges())
-				_set_screen("browser")
-		KEY_BACKSPACE:
-			if _typed_username.length() > 0:
-				_typed_username = _typed_username.left(_typed_username.length() - 1)
-			_update_username_cursor()
-		_:
-			if _typed_username.length() < 16 and ke.unicode > 0:
-				var ch: String = char(ke.unicode).to_upper()
-				var code: int = ch.unicode_at(0)
-				var valid: bool = (
-					(code >= 65 and code <= 90) or  # A-Z
-					(code >= 48 and code <= 57) or  # 0-9
-					code == 95                       # _
-				)
-				if valid:
-					_typed_username += ch
-					_update_username_cursor()
 
 
 func _input_browser(event: InputEvent) -> void:
@@ -1033,6 +1155,16 @@ func _input_browser(event: InputEvent) -> void:
 				_browser_try_join()
 
 
+func _leave_waiting_room() -> void:
+	## Shared by the Esc/B keyboard-gamepad shortcut and the new "LEAVE ROOM"
+	## Button (see _build_waiting_screen) -- both paths do exactly the same
+	## thing, so tapping the button is not a new/parallel behavior.
+	NetworkManager.disconnect_from_room()
+	_error_timer = 0.0
+	_error_message = ""
+	_set_screen("browser")
+
+
 func _input_waiting(event: InputEvent) -> void:
 	# Esc / B = leave
 	var is_escape := (event is InputEventKey and (event as InputEventKey).pressed
@@ -1040,10 +1172,7 @@ func _input_waiting(event: InputEvent) -> void:
 	var is_b := (event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed
 			and (event as InputEventJoypadButton).button_index == JOY_BUTTON_B)
 	if is_escape or is_b:
-		NetworkManager.disconnect_from_room()
-		_error_timer = 0.0
-		_error_message = ""
-		_set_screen("browser")
+		_leave_waiting_room()
 		return
 
 	if NetworkManager.is_host:
@@ -1085,6 +1214,15 @@ func _cycle_wait_slot(delta: int) -> void:
 			_wait_cloth_cursor = (_wait_cloth_cursor + delta + cloth_count) % cloth_count
 			NetworkManager.send_cloth_choice(str((GameManager.CLOTH_DEFS[_wait_cloth_cursor] as Dictionary).get("id", "none")))
 	_rebuild_ui()
+
+
+func _set_wait_char_row(slot: int, delta: int) -> void:
+	## Tap handler for the ◀ ▶ buttons on the online char-picker rows (see
+	## _make_settings_row's on_left/on_right) -- selects that row then applies
+	## the same _cycle_wait_slot() logic a keyboard Left/Right press would.
+	_wait_area = 1
+	_wait_char_slot = slot
+	_cycle_wait_slot(delta)
 
 
 func _sync_wait_accessory_defaults() -> void:
@@ -1146,6 +1284,18 @@ func _change_wait_setting(delta: int) -> void:
 
 	NetworkManager.update_settings(max_p, diff, map_id)
 	_rebuild_settings_only()
+
+
+func _set_wait_setting_row(row_idx: int, delta: int) -> void:
+	## Tap handler for the ◀ ▶ buttons on the host settings rows (see
+	## _make_settings_row's on_left/on_right). The buttons are only ever built
+	## while NetworkManager.is_host is true (see _build_settings_rows), so
+	## this guard is just defense-in-depth, not the primary gate.
+	if not NetworkManager.is_host:
+		return
+	_wait_area = 0
+	_wait_settings_focus = row_idx
+	_change_wait_setting(delta)
 
 
 func _rebuild_settings_only() -> void:
@@ -1303,7 +1453,8 @@ func _build_local_config_screen() -> void:
 		"Total Players",
 		str(_local_total_players),
 		_local_focus == 0,
-		true
+		true, 0.065,
+		func(): _set_local_row(0, -1), func(): _set_local_row(0, 1)
 	)
 	_local_total_lbl = row0.get_node_or_null("HBoxContainer/ValueLabel")
 	root_vbox.add_child(row0)
@@ -1312,7 +1463,8 @@ func _build_local_config_screen() -> void:
 		"Bot Difficulty",
 		DIFFICULTY_LABELS[clampi(_local_bot_difficulty, 0, 2)],
 		_local_focus == 1,
-		true
+		true, 0.065,
+		func(): _set_local_row(1, -1), func(): _set_local_row(1, 1)
 	)
 	_local_diff_lbl = row1.get_node_or_null("HBoxContainer/ValueLabel")
 	root_vbox.add_child(row1)
@@ -1321,7 +1473,8 @@ func _build_local_config_screen() -> void:
 		"Map",
 		MAP_LABELS[clampi(_local_map_id, 0, MAP_LABELS.size() - 1)],
 		_local_focus == 2,
-		true
+		true, 0.065,
+		func(): _set_local_row(2, -1), func(): _set_local_row(2, 1)
 	)
 	_local_map_lbl = row2.get_node_or_null("HBoxContainer/ValueLabel")
 	root_vbox.add_child(row2)
@@ -1331,13 +1484,14 @@ func _build_local_config_screen() -> void:
 	sep.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root_vbox.add_child(sep)
 
-	var prompt_lbl := Label.new()
-	prompt_lbl.text = "Enter = Start   Esc = Back"
-	prompt_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	prompt_lbl.add_theme_font_size_override("font_size", _fs(19))
-	prompt_lbl.add_theme_color_override("font_color", COLOR_PROMPT)
-	prompt_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root_vbox.add_child(prompt_lbl)
+	var actions_hbox := HBoxContainer.new()
+	actions_hbox.alignment = BoxContainer.ALIGNMENT_CENTER
+	actions_hbox.add_theme_constant_override("separation", 12)
+	actions_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root_vbox.add_child(actions_hbox)
+
+	actions_hbox.add_child(_make_lobby_button("BACK  [Esc]", func(): _set_screen("browser")))
+	actions_hbox.add_child(_make_lobby_button("START  [Enter]", _start_local_game))
 
 
 func _change_local_setting(delta: int) -> void:
@@ -1350,6 +1504,12 @@ func _change_local_setting(delta: int) -> void:
 	else:
 		_local_map_id = clampi(_local_map_id + delta, 0, MAP_LABELS.size() - 1)
 	_rebuild_ui()
+
+
+func _set_local_row(row_idx: int, delta: int) -> void:
+	## Tap handler for the ◀ ▶ buttons on the local-config settings rows.
+	_local_focus = row_idx
+	_change_local_setting(delta)
 
 
 func _input_local_config(event: InputEvent) -> void:
@@ -1434,11 +1594,14 @@ func _build_char_select_local_screen() -> void:
 	var headwear_def: Dictionary = GameManager.HEADWEAR_DEFS[_headwear_cursor]
 	var cloth_def: Dictionary = GameManager.CLOTH_DEFS[_cloth_cursor]
 
-	var base_row := _make_settings_row("Character", str(base_def.get("display_name", "?")), _char_slot == 0, true)
+	var base_row := _make_settings_row("Character", str(base_def.get("display_name", "?")), _char_slot == 0, true, 0.065,
+			func(): _set_local_char_row(0, -1), func(): _set_local_char_row(0, 1))
 	rows_vbox.add_child(base_row)
-	var headwear_row := _make_settings_row("Headwear", str(headwear_def.get("display_name", "?")), _char_slot == 1, true)
+	var headwear_row := _make_settings_row("Headwear", str(headwear_def.get("display_name", "?")), _char_slot == 1, true, 0.065,
+			func(): _set_local_char_row(1, -1), func(): _set_local_char_row(1, 1))
 	rows_vbox.add_child(headwear_row)
-	var cloth_row := _make_settings_row("Cloth / Cape", str(cloth_def.get("display_name", "?")), _char_slot == 2, true)
+	var cloth_row := _make_settings_row("Cloth / Cape", str(cloth_def.get("display_name", "?")), _char_slot == 2, true, 0.065,
+			func(): _set_local_char_row(2, -1), func(): _set_local_char_row(2, 1))
 	rows_vbox.add_child(cloth_row)
 
 	var slot_hint := Label.new()
@@ -1470,19 +1633,8 @@ func _build_char_select_local_screen() -> void:
 	action_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root_vbox.add_child(action_hbox)
 
-	var back_lbl := Label.new()
-	back_lbl.text = "[Esc] Back"
-	back_lbl.add_theme_font_size_override("font_size", _fs(16))
-	back_lbl.add_theme_color_override("font_color", COLOR_DIM)
-	back_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	action_hbox.add_child(back_lbl)
-
-	var nav_lbl := Label.new()
-	nav_lbl.text = "Enter to start the match"
-	nav_lbl.add_theme_font_size_override("font_size", _fs(16))
-	nav_lbl.add_theme_color_override("font_color", COLOR_PROMPT)
-	nav_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	action_hbox.add_child(nav_lbl)
+	action_hbox.add_child(_make_lobby_button("BACK  [Esc]", func(): _set_screen("local_config")))
+	action_hbox.add_child(_make_lobby_button("START MATCH  [Enter]", _commit_local_char_select))
 
 
 func _input_char_select_local(event: InputEvent) -> void:
@@ -1525,6 +1677,12 @@ func _cycle_local_slot(delta: int) -> void:
 			var cloth_count: int = GameManager.CLOTH_DEFS.size()
 			_cloth_cursor = (_cloth_cursor + delta + cloth_count) % cloth_count
 	_rebuild_ui()
+
+
+func _set_local_char_row(slot: int, delta: int) -> void:
+	## Tap handler for the ◀ ▶ buttons on the local char-select rows.
+	_char_slot = slot
+	_cycle_local_slot(delta)
 
 
 func _sync_local_accessory_defaults() -> void:
