@@ -160,8 +160,36 @@ signal state_changed(new_state: int)
 ## span world Y [0, 2] -- comfortably inside this band.
 const PLANE_Y: float = 1.1
 
+## Task #36: mirrors player.gd's own ARENA_HALF (that file's
+## _check_boundary_fall()) so an embed landing outside the playable arena can
+## get the same "fell off the edge" visual treatment as a player who walks
+## off it. Plain duplicated constant, not a shared reference -- same
+## accepted tradeoff bot_controller.gd's own duplicate ARENA_HALF already
+## uses, since there's no shared-constants module in this project.
+const ARENA_HALF: float = 15.0
+## How long the sink/shrink fall visual takes once triggered -- named
+## distinctly from player.gd's own FALL_DURATION since these are two
+## independent, differently-tuned effects (the dart never teleports/respawns
+## on its own, so there's no matching "duration until reset" concern here).
+const DART_FALL_VISUAL_DURATION: float = 0.9
+
 var state: int = State.HOLSTERED
 var owner_player: Variant = null  # duck-typed player.gd reference
+
+## Task #36: true once this dart's CURRENT EMBEDDED anchor sits outside
+## ARENA_HALF and the purely-visual sink/shrink treatment (below) has been
+## applied to head_mesh/rope_mesh's LOCAL transforms. Deliberately does NOT
+## touch pos_2d/global_position/state -- the dart stays a fully normal,
+## functional EMBEDDED anchor (Recall/redirect/wrap-routing/hit-detection all
+## keep reading pos_2d exactly as before); only the rendered mesh sinks below
+## the gameplay plane. Reset (mesh transforms snapped back, flag cleared)
+## by _reset_dart_fall_visual(), called from every point that moves the dart
+## out of this specific fallen EMBEDDED anchor -- a fresh _embed_in_place()
+## landing back inside bounds, begin_recall(), begin_swing_redirect(), and
+## force_holster() -- so a fallen dart never carries a sunken visual into a
+## state where it should render normally again.
+var _dart_fallen: bool = false
+var _dart_fall_tween: Tween = null
 
 ## The dart's own gameplay position, XZ-plane Vector2 (see the project's core
 ## 2D-logic invariant) -- global_position.y is always PLANE_Y, never gameplay.
@@ -564,7 +592,71 @@ func _embed_in_place() -> void:
 	# as a fresh throw's own embed.
 	Sfx.play_impact()
 	_spawn_impact_sparks()
+	# Task #36: re-evaluate the fall visual fresh on EVERY embed (this is the
+	# single choke point every EMBEDDED transition passes through, per this
+	# function's own header comment above) -- always reset first so a
+	# SWINGING redirect that lands back INSIDE the arena after a previous
+	# fallen anchor doesn't keep rendering sunken, then re-trigger only if
+	# THIS landing is itself outside ARENA_HALF (mirrors player.gd's own
+	# _check_boundary_fall() reach). Purely visual: pos_2d/state/EMBEDDED
+	# gameplay logic above is completely unaffected either way.
+	_reset_dart_fall_visual()
+	if absf(pos_2d.x) > ARENA_HALF or absf(pos_2d.y) > ARENA_HALF:
+		_start_dart_fall_visual()
 	state_changed.emit(state)
+
+
+## Task #36: purely-visual "the dart fell off the edge" treatment, mirroring
+## player.gd's _start_fall() sink/shrink/spin style (see that function's own
+## header comment) but scoped to just the dart's rendered meshes -- gameplay
+## stays a completely normal, functional EMBEDDED anchor (see _dart_fallen's
+## own header comment for the full reasoning). Sinks head_mesh AND rope_mesh
+## by the SAME local -Y offset together so the rope's rendered chain (which
+## _update_rope_visual() places relative to THIS body's global_position, see
+## that function's own `world_pos - global_position` line) reads as sinking
+## into the void alongside the dart head, not staying rendered at the normal
+## height while only the head sinks. No spin: head_mesh's own basis is
+## rewritten every frame in _process() from the dart's facing (dir_2d), which
+## would instantly stomp any rotation this tween applied on top of it -- sink
+## + shrink alone already reads clearly as "falling" without fighting that.
+func _start_dart_fall_visual() -> void:
+	if _dart_fallen:
+		return
+	_dart_fallen = true
+	_dart_fall_tween = create_tween()
+	_dart_fall_tween.set_parallel(true)
+	if head_mesh != null:
+		_dart_fall_tween.tween_property(head_mesh, "position:y", head_mesh.position.y - 1.6, DART_FALL_VISUAL_DURATION)\
+			.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+		_dart_fall_tween.tween_property(head_mesh, "scale", head_mesh.scale * 0.15, DART_FALL_VISUAL_DURATION)\
+			.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+	if rope_mesh != null:
+		_dart_fall_tween.tween_property(rope_mesh, "position:y", rope_mesh.position.y - 1.6, DART_FALL_VISUAL_DURATION)\
+			.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+
+
+## Snaps head_mesh/rope_mesh's local transforms back to their scene-authored
+## identity (both are direct children of this body with no local offset of
+## their own -- see rope_dart.tscn -- so ZERO/ONE is always the correct
+## "normal" resting value, not a value that needs to be captured/cached
+## beforehand) and clears the fallen flag. Called unconditionally at the top
+## of _embed_in_place() (see above) and from every other point that moves
+## this dart out of a fallen EMBEDDED anchor -- begin_recall(),
+## begin_swing_redirect(), and force_holster() -- so the sunken visual never
+## survives into RETURNING/SWINGING flight or a fresh HOLSTERED reset. Safe
+## to call when nothing is currently fallen (the common case): the tween-kill
+## and position/scale writes are cheap no-ops against already-identity
+## transforms.
+func _reset_dart_fall_visual() -> void:
+	if _dart_fall_tween != null and _dart_fall_tween.is_valid():
+		_dart_fall_tween.kill()
+	_dart_fall_tween = null
+	_dart_fallen = false
+	if head_mesh != null:
+		head_mesh.position = Vector3.ZERO
+		head_mesh.scale = Vector3.ONE
+	if rope_mesh != null:
+		rope_mesh.position = Vector3.ZERO
 
 
 ## Task #34: small one-shot spark burst at the dart's own current pos_2d/
@@ -675,6 +767,11 @@ func _spawn_impact_sparks() -> void:
 func begin_swing_redirect(redirect_dir: Vector2, max_travel_distance: float = -1.0, charge_ratio: float = 0.0) -> void:
 	if state != State.EMBEDDED:
 		return
+	# Task #36: unanchoring out of a fallen EMBEDDED anchor into a fresh
+	# SWINGING leg -- the sunken head/rope visual must not carry through
+	# active flight (see _dart_fallen's own header comment); _embed_in_place()
+	# re-evaluates and re-triggers this fresh once the leg lands again.
+	_reset_dart_fall_visual()
 	var aim_dir: Vector2 = redirect_dir.normalized() if redirect_dir.length() > 0.01 else Vector2(0.0, 1.0)
 	# Task #30: SWINGING's speed now scales with hold duration (charge_ratio),
 	# the same lerp shape release_throw() already applies to its own
@@ -750,6 +847,11 @@ func begin_swing_redirect(redirect_dir: Vector2, max_travel_distance: float = -1
 func begin_recall() -> void:
 	if state != State.FLYING and state != State.EMBEDDED and state != State.SWINGING:
 		return
+	# Task #36: recalling out of a fallen EMBEDDED anchor -- same "must not
+	# carry the sunken visual into active flight" reasoning as
+	# begin_swing_redirect() above (RETURNING renders the dart flying back
+	# toward the hand; it must not still read as sunk while doing so).
+	_reset_dart_fall_visual()
 	state = State.RETURNING
 	_recall_time = 0.0
 	# Task #34: play immediately on the tap/release that starts the recall
@@ -912,6 +1014,16 @@ func force_holster() -> void:
 	pos_2d = Vector2(global_position.x, global_position.z)
 	if rope_mesh != null:
 		rope_mesh.visible = false
+	# Task #36: a player can respawn (death OR ring-out, see player.gd's
+	# take_dart_hit()/_on_fall_finished()) while their OWN dart is mid-fallen-
+	# visual out at a boundary anchor -- without this, force_holster()'s own
+	# position snap above would leave head_mesh/rope_mesh's LOCAL sink offset
+	# still applied underneath the now-holstered dart (rendered floating
+	# sunken in the owner's hand) and any in-flight tween still running/
+	# dangling. Same reset _embed_in_place()/begin_recall()/
+	# begin_swing_redirect() already call for every other way out of a fallen
+	# anchor.
+	_reset_dart_fall_visual()
 	state_changed.emit(state)
 
 

@@ -1687,6 +1687,18 @@ func _on_fall_finished() -> void:
 	is_falling = false
 	global_position = spawn_pos
 	collision_shape.disabled = false
+	# Task #36: this ring-out respawn path (walking off the platform edge, a
+	# separate/older path from take_dart_hit()'s dart-kill respawn) used to
+	# only reset is_falling/global_position/collision_shape.disabled -- a
+	# player whose dart was still FLYING/EMBEDDED/SWINGING/RETURNING
+	# elsewhere on the map respawned here with it left exactly where it was,
+	# completely disconnected from the player who just reappeared at spawn.
+	# take_dart_hit()/reset_for_round() both already guard against this same
+	# class of bug via this exact call, in this exact order (teleport to
+	# spawn_pos FIRST, then reset, so force_holster() below reads the NEW
+	# spawn-local hand position) -- see _reset_movement_and_dart_state()'s
+	# own header comment.
+	_reset_movement_and_dart_state()
 
 
 func _reset_fall_visual() -> void:
