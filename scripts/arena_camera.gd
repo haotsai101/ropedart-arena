@@ -11,6 +11,27 @@ extends Camera3D
 # Computed from the initial camera transform in _ready().
 var _offset: Vector3 = Vector3(0, 14, 12)
 
+## Screen shake (Task #34 -- kill/death feedback, GDD Audio's "heavy impacts
+## have stronger feedback" extended to VFX). _base_position is the camera's
+## own real pan/zoom target position (the value _process()'s existing
+## lerp-toward-target_pos logic used to write straight into global_position),
+## tracked SEPARATELY from global_position so a shake offset can be layered on
+## top of it every frame WITHOUT ever feeding back into the pan lerp itself --
+## writing the shaken position directly into global_position and then reading
+## it back next frame as the lerp's "current" value would let the shake's own
+## random jitter permanently drift the camera's real pan target over
+## consecutive shakes, which is not the intended effect (a shake should
+## visibly settle back to exactly where the camera actually was panned/zoomed
+## to, not to a randomly-drifted nearby point).
+## _shake_duration counts down to 0; _shake_duration_total is the ORIGINAL
+## requested duration (fixed for the life of one shake), used only to compute
+## a 1.0->0.0 falloff ratio so the shake amplitude tapers out smoothly instead
+## of cutting off abruptly at zero.
+var _base_position: Vector3
+var _shake_intensity: float = 0.0
+var _shake_duration: float = 0.0
+var _shake_duration_total: float = 0.0
+
 
 func _ready() -> void:
 	projection = PROJECTION_ORTHOGONAL
@@ -23,6 +44,18 @@ func _ready() -> void:
 		_offset = global_position - ground_hit
 	else:
 		_offset = Vector3(0, 14, 12)
+	_base_position = global_position
+
+
+## Public: request a brief screen shake. A shake already in progress is only
+## ever made STRONGER/LONGER (maxf, not overwrite) -- so a rapid double-kill
+## can't have its second, later shake() call cut the first one's remaining
+## duration short.
+func shake(intensity: float, duration: float) -> void:
+	_shake_intensity = maxf(_shake_intensity, intensity)
+	if duration > _shake_duration:
+		_shake_duration = duration
+		_shake_duration_total = duration
 
 
 func _process(delta: float) -> void:
@@ -54,4 +87,14 @@ func _process(delta: float) -> void:
 	size = lerpf(size, target_size, lerp_speed * delta)
 
 	var target_pos: Vector3 = Vector3(cx, 0.0, cz) + _offset
-	global_position = global_position.lerp(target_pos, lerp_speed * delta)
+	_base_position = _base_position.lerp(target_pos, lerp_speed * delta)
+
+	var shake_offset := Vector3.ZERO
+	if _shake_duration > 0.0:
+		_shake_duration = maxf(_shake_duration - delta, 0.0)
+		var falloff: float = _shake_duration / _shake_duration_total if _shake_duration_total > 0.0 else 0.0
+		var mag: float = _shake_intensity * falloff
+		shake_offset = Vector3(randf_range(-1.0, 1.0), 0.0, randf_range(-1.0, 1.0)) * mag
+		if _shake_duration <= 0.0:
+			_shake_intensity = 0.0
+	global_position = _base_position + shake_offset

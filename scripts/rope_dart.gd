@@ -200,6 +200,22 @@ var _swing_effective_range: float = INF
 @onready var head_mesh: MeshInstance3D = $Head
 @onready var rope_mesh: MultiMeshInstance3D = $RopeLine
 
+## Task #34: per-instance duplicated head material (see _ready()) so this
+## dart's CHARGING glow can never bleed into every OTHER player's dart --
+## rope_dart.tscn's HeadMat sub-resource is otherwise shared BY REFERENCE
+## across every instantiate() of this scene, exactly the same sharing hazard
+## this file's own _ready() header comment already documents for RopeMultiMesh
+## (the fix here is the same shape: build/duplicate a fresh per-instance
+## resource once at _ready(), never mutate the shared scene-authored one).
+## Null-safe everywhere it's read (_process()) in case head_mesh/its material
+## are ever missing for any reason.
+var _head_material: StandardMaterial3D = null
+## Recall SFX repeat cadence while RETURNING -- see _process_returning()'s own
+## use, and play_recall()'s header comment in sfx.gd for why the interval
+## itself (not just each crack's pitch) shortens as the recall ramp
+## progresses.
+var _recall_sfx_timer: float = 0.0
+
 ## Chain-link visual tuning (item 1). One shared MultiMesh (rope_dart.tscn's
 ## RopeMultiMesh, a small TorusMesh "ring" link) is GPU-instanced along the
 ## rope's own wrap-aware path (see _compute_rope_path_2d() below) -- every
@@ -249,6 +265,20 @@ const ROPE_LINK_TILT: float = PI * 0.5
 ## run_project screenshots, not derived from any specific formula.
 const SWING_BOW_RATIO: float = 0.28
 const SWING_BOW_SAMPLE_COUNT: int = 10
+## Task #33: purely cosmetic curve applied to the rendered chain ONLY while
+## state == State.RETURNING (Recall) and ONLY when that path is still a plain
+## unwrapped two-point straight line (hand -> tail) -- same guard/pattern as
+## SWING_BOW_RATIO/_apply_swing_bow() above, see _apply_retrieve_curve()'s own
+## header comment for how the bow direction/magnitude differ (driven by the
+## player's LIVE aim_dir, not the dart's own travel direction, since the
+## player is actively steering their aim during Recall in a way they aren't
+## during SWINGING). Same tuning method as the swing bow (picked by eye via
+## run_project screenshots, not derived from a specific formula) -- reuses the
+## swing bow's own ratio/sample-count as a starting point for visual
+## consistency between the two curves rather than re-deriving new constants
+## from scratch.
+const RETRIEVE_CURVE_RATIO: float = 0.28
+const RETRIEVE_CURVE_SAMPLE_COUNT: int = 10
 ## Offset from pos_2d (the dart body's CENTER, which is what FLYING/EMBEDDED
 ## collision and _check_player_hits()'s rope-line trip check actually use as
 ## the dart-side endpoint) back to the tail/pommel end opposite the tip,
@@ -309,6 +339,18 @@ func _ready() -> void:
 			own_mm.instance_count = ROPE_LINK_MAX_COUNT
 			own_mm.visible_instance_count = 0
 			rope_mesh.multimesh = own_mm
+	if head_mesh != null:
+		# Task #34: duplicate the shared HeadMat sub-resource per-instance
+		# (see _head_material's own header comment above for why) before ever
+		# touching its emission -- CHARGING's own glow-buildup below writes
+		# into _head_material every frame, never into the shared original.
+		var base_mat: Material = head_mesh.get_active_material(0)
+		if base_mat is StandardMaterial3D:
+			_head_material = (base_mat as StandardMaterial3D).duplicate() as StandardMaterial3D
+			head_mesh.set_surface_override_material(0, _head_material)
+			_head_material.emission_enabled = true
+			_head_material.emission = Color(1.0, 0.55, 0.1)
+			_head_material.emission_energy_multiplier = 0.0
 
 
 func _process(_delta: float) -> void:
@@ -340,6 +382,19 @@ func _process(_delta: float) -> void:
 			if owner_player != null and is_instance_valid(owner_player) and owner_player.aim_dir.length() > 0.01:
 				facing_2d = owner_player.aim_dir
 		head_mesh.basis = _basis_align_y(Vector3(facing_2d.x, 0.0, facing_2d.y))
+	# Task #34 (lower-priority, "only if time allows"): a subtle glow building
+	# up on the dart head while CHARGING, intensifying with charge level --
+	# same charge_ratio shape release_throw() itself uses for its own speed
+	# lerp, just driving emission_energy_multiplier on the per-instance-
+	# duplicated _head_material instead (see that field's own header comment).
+	# Snaps back to zero (no ambient glow) the instant CHARGING ends, whether
+	# that was a real release_throw() or simply re-holstering.
+	if _head_material != null:
+		if state == State.CHARGING:
+			var charge_ratio: float = clampf(_charge_time / max_charge_time, 0.0, 1.0)
+			_head_material.emission_energy_multiplier = lerp(0.3, 4.0, charge_ratio)
+		else:
+			_head_material.emission_energy_multiplier = 0.0
 
 
 func _physics_process(delta: float) -> void:
@@ -404,6 +459,7 @@ func release_throw(throw_dir: Vector2) -> void:
 		pos_2d = owner_player.get_pos_2d() + dir_2d * launch_forward_offset
 	global_position = Vector3(pos_2d.x, PLANE_Y, pos_2d.y)
 	state = State.FLYING
+	Sfx.play_throw(charge_ratio)
 	state_changed.emit(state)
 
 
@@ -500,7 +556,52 @@ func _embed_in_place() -> void:
 		var away_from_owner: Vector2 = pos_2d - owner_player.get_pos_2d()
 		if away_from_owner.length() > 0.01:
 			dir_2d = away_from_owner.normalized()
+	# Task #34: Impact/Anchor SFX + a small spark burst wherever the dart
+	# actually embeds -- fires from every real embed exit (wall/obstacle
+	# collision AND open-air max-range stop, per this function's own header
+	# comment on being the single choke point every EMBEDDED transition
+	# passes through), so a SWINGING redirect landing gets the same feedback
+	# as a fresh throw's own embed.
+	Sfx.play_impact()
+	_spawn_impact_sparks()
 	state_changed.emit(state)
+
+
+## Task #34: small one-shot spark burst at the dart's own current pos_2d/
+## PLANE_Y, spawned as a sibling in the current scene (same "moves
+## independently, outlives this call" placement rope_dart.gd's own header
+## comment already uses for the dart itself) rather than a child of this
+## node -- a child would inherit this RigidBody's own future position
+## writes (the NEXT throw/redirect could drag an in-flight particle burst
+## across the map with it), which a one-shot VFX at a fixed world point must
+## never do. Self-frees via a one-shot SceneTreeTimer once its own lifetime
+## elapses, the same auto-cleanup shape this project's Slash/Kick tweens
+## already use for their own transient state.
+func _spawn_impact_sparks() -> void:
+	var particles := GPUParticles3D.new()
+	particles.amount = 14
+	particles.one_shot = true
+	particles.explosiveness = 1.0
+	particles.lifetime = 0.3
+	particles.emitting = false
+	var mesh := SphereMesh.new()
+	mesh.radius = 0.035
+	mesh.height = 0.07
+	particles.draw_pass_1 = mesh
+	var mat := ParticleProcessMaterial.new()
+	mat.direction = Vector3(0.0, 1.0, 0.0)
+	mat.spread = 60.0
+	mat.gravity = Vector3(0.0, -6.0, 0.0)
+	mat.initial_velocity_min = 1.5
+	mat.initial_velocity_max = 4.0
+	mat.scale_min = 0.5
+	mat.scale_max = 1.0
+	mat.color = Color(1.0, 0.85, 0.4)
+	particles.process_material = mat
+	get_tree().current_scene.add_child(particles)
+	particles.global_position = Vector3(pos_2d.x, PLANE_Y, pos_2d.y)
+	particles.emitting = true
+	get_tree().create_timer(particles.lifetime + 0.15).timeout.connect(particles.queue_free)
 
 
 ## Called on Throw/Recall-button release while EMBEDDED, after player.gd has
@@ -635,6 +736,7 @@ func begin_swing_redirect(redirect_dir: Vector2, max_travel_distance: float = -1
 		bootstrap.reverse()
 	_wrap_state["flying_clamp"] = bootstrap
 	state = State.SWINGING
+	Sfx.play_swing(clamped_charge_ratio)
 	state_changed.emit(state)
 
 
@@ -650,6 +752,12 @@ func begin_recall() -> void:
 		return
 	state = State.RETURNING
 	_recall_time = 0.0
+	# Task #34: play immediately on the tap/release that starts the recall
+	# (instant feedback), then _process_returning() below repeats this
+	# periodically -- own timer reset here so a recall interrupted right after
+	# a previous one doesn't inherit a stale near-zero countdown.
+	Sfx.play_recall(0.0)
+	_recall_sfx_timer = 0.3
 	# Own state key ("returning") -- see _wrap_state's header comment.
 	#
 	# Task #13 fix: bootstrap "returning"'s wrap memory from whichever
@@ -726,6 +834,22 @@ func _process_returning(delta: float) -> void:
 	_recall_time += delta
 	var speed: float = recall_base_speed + recall_accel * _recall_time
 	var owner_pos: Vector2 = owner_player.get_pos_2d()
+
+	# Task #34: periodic whip-crack while RETURNING, own repeat cadence
+	# (_recall_sfx_timer) shortening as ramp_ratio climbs -- see
+	# play_recall()'s own header comment in sfx.gd for why the interval
+	# itself, not just each crack's pitch, needs to speed up alongside the
+	# real increasing pull speed (GDD: "Recall speed increases over time").
+	# ramp_ratio saturates over a few seconds of recall (2.0s denominator,
+	# picked purely by ear -- most recalls resolve well before this, so in
+	# practice this rarely reaches 1.0, but a very long recall (an owner
+	# repeatedly repositioning far from the dart) still caps out instead of
+	# climbing unboundedly.
+	_recall_sfx_timer -= delta
+	if _recall_sfx_timer <= 0.0:
+		var ramp_ratio: float = clampf(_recall_time / 2.0, 0.0, 1.0)
+		Sfx.play_recall(ramp_ratio)
+		_recall_sfx_timer = lerp(0.32, 0.14, ramp_ratio)
 
 	var path: PackedVector2Array = _compute_rope_path_2d(pos_2d, owner_pos, "returning")
 	var next_wp: Vector2 = path[1] if path.size() > 1 else owner_pos
@@ -928,6 +1052,12 @@ func _update_rope_visual() -> void:
 	# `path` array (chain-link placement); gameplay (pos_2d, dir_2d, wrap
 	# routing, hit detection) is untouched.
 	path = _apply_swing_bow(path)
+	# Task #33: purely visual, aim-driven bow while RETURNING (Recall) -- see
+	# _apply_retrieve_curve()'s own header comment. Mutually exclusive with the
+	# swing bow above (each is gated on its own state), so only one of the two
+	# ever actually reshapes `path` on a given call; same "reshape the local
+	# path only" discipline.
+	path = _apply_retrieve_curve(path)
 
 	var total_len := 0.0
 	for i in path.size() - 1:
@@ -1031,6 +1161,78 @@ func _apply_swing_bow(path: PackedVector2Array) -> PackedVector2Array:
 		# lerp(control,to,t), t) -- tapers naturally to zero offset at both
 		# endpoints (t=0 -> from, t=1 -> to) without needing a separate
 		# falloff term.
+		var a: Vector2 = from.lerp(control, t)
+		var b: Vector2 = control.lerp(to, t)
+		curved.append(a.lerp(b, t))
+	curved.append(to)
+	return curved
+
+
+## Task #33: direct user request -- "let's add curve to the retrieve. The
+## curve should be correlated with where the character aim." Sibling of
+## _apply_swing_bow() above, same quadratic-Bezier-sample rendering technique
+## and the same "reshape the local `path` array only, never pos_2d/dir_2d/
+## wrap-state/hit-detection" discipline -- but for RETURNING (Recall) instead
+## of SWINGING, and driven by a different input: the swing bow reads the
+## dart's OWN travel direction (dir_2d), appropriate for SWINGING since the
+## player isn't actively steering during that leg; Recall instead reads the
+## OWNER's live aim_dir, since the player keeps aiming (and can keep
+## redirecting their aim) while the dart flies back to them, so the curve
+## should visibly track wherever they're CURRENTLY pointing rather than a
+## static bow computed once.
+##
+## Deliberately only fires on a plain 2-point (unwrapped) path -- exactly the
+## same guard _apply_swing_bow() uses and for the same reason: if the rope is
+## already bending around a real wrap corner (path.size() > 2), leave those
+## segments alone rather than layering an aim-driven bow on top, which could
+## visually push the rendered chain back into the very obstacle geometry the
+## wrap routing exists to route around. _process_returning()'s own retraction
+## logic already follows the wrap-aware path point by point regardless of
+## this function -- this only ever touches the OPEN-space rendering case.
+##
+## Bow direction/magnitude: projects the owner's live aim_dir onto the
+## PERPENDICULAR axis of the straight hand->tail line (same perpendicular
+## construction _apply_swing_bow() uses) via a plain dot product -- aim_dir
+## and the perpendicular are both unit vectors, so this dot product is
+## already bounded to [-1, 1] and its SIGN directly encodes which side of the
+## direct retrieval line the player is currently aiming toward (aiming left
+## of the line bows the chain left, aiming right bows it right), with its
+## MAGNITUDE naturally tapering to ~0 as aim_dir converges on the line's own
+## direction (aiming directly at the dart, or directly at the hand, both
+## produce little/no curve) -- no separate deadzone/clamp needed, the dot
+## product's own geometry already gives exactly the falloff the user asked
+## for. Unlike _apply_swing_bow() (which additionally scales magnitude by
+## _flight_speed relative to a plain throw), there is no equivalent "speed"
+## axis here worth reading -- recall speed only ramps toward the owner, not
+## sideways, so it has no natural relationship to a LEFT/RIGHT aim-driven
+## bow; magnitude is a flat RETRIEVE_CURVE_RATIO instead.
+func _apply_retrieve_curve(path: PackedVector2Array) -> PackedVector2Array:
+	if state != State.RETURNING or path.size() != 2:
+		return path
+	if owner_player == null or not is_instance_valid(owner_player):
+		return path
+	var aim: Vector2 = owner_player.aim_dir
+	if aim.length() < 0.01:
+		return path
+	aim = aim.normalized()
+	var from: Vector2 = path[0]
+	var to: Vector2 = path[1]
+	var straight: Vector2 = to - from
+	var length: float = straight.length()
+	if length < 0.01:
+		return path
+	var line_dir: Vector2 = straight / length
+	var perp: Vector2 = Vector2(-line_dir.y, line_dir.x)
+	var side: float = perp.dot(aim)
+	var bow_amount: float = length * RETRIEVE_CURVE_RATIO * side
+	var control: Vector2 = (from + to) * 0.5 + perp * bow_amount
+	var curved := PackedVector2Array()
+	curved.append(from)
+	for i in range(1, RETRIEVE_CURVE_SAMPLE_COUNT):
+		var t: float = float(i) / float(RETRIEVE_CURVE_SAMPLE_COUNT)
+		# Quadratic Bezier via De Casteljau -- see _apply_swing_bow()'s own
+		# comment on this same construction, tapering to zero offset at both
+		# endpoints without a separate falloff term.
 		var a: Vector2 = from.lerp(control, t)
 		var b: Vector2 = control.lerp(to, t)
 		curved.append(a.lerp(b, t))

@@ -124,6 +124,13 @@ const SLASH_FLASH_COLOR: Color = Color(1.0, 0.15, 0.1)
 const KICK_FLASH_COLOR: Color = Color(1.0, 0.6, 0.05)
 const MELEE_FLASH_DURATION: float = 0.15
 
+## Task #34: kill/death screen shake tuning (see _trigger_kill_vfx() below and
+## arena_camera.gd's own shake()) -- picked by eye via run_project, aiming for
+## "clearly readable" without being disorienting given the camera's own fairly
+## wide orthographic framing of the whole arena.
+const KILL_SHAKE_INTENSITY: float = 0.35
+const KILL_SHAKE_DURATION: float = 0.22
+
 
 @onready var aim_indicator: Node3D = $AimIndicator
 @onready var collision_shape: CollisionShape3D = $PlayerCollision
@@ -390,6 +397,16 @@ var _dash_cooldown_timer: float = 0.0
 var _is_dashing: bool = false
 var _dash_dir: Vector2 = Vector2.ZERO
 var _prev_dash: bool = false
+## Task #34: brief trail/streak VFX while dashing -- a continuous (one_shot =
+## false) GPUParticles3D toggled on/off around the dash's own DASH_DURATION
+## window (see the dash-activation and dash-duration-countdown blocks in
+## _physics_process()) rather than a fresh one-shot burst per dash, so the
+## particles read as a streak trailing the whole burst rather than a single
+## puff at the start. Built once in _ready() (_setup_dash_trail()) as a CHILD
+## of this CharacterBody3D (unlike rope_dart.gd's one-shot impact sparks,
+## which are deliberately NOT parented to the moving dart -- this one SHOULD
+## follow the player around, that's the whole point of a trail).
+var _dash_trail: GPUParticles3D = null
 
 # Procedural animation state
 var _run_bob_time: float = 0.0
@@ -460,6 +477,7 @@ func _ready() -> void:
 				_player_materials.append(mat)
 	_reset_player_tint()
 	_setup_animation()
+	_setup_dash_trail()
 	if is_bot:
 		bot_controller = get_node_or_null("BotController")
 	# Rope dart: one persistent instance, added as a sibling in the current
@@ -591,6 +609,44 @@ func _find_animation_player(node: Node) -> AnimationPlayer:
 		if found != null:
 			return found
 	return null
+
+
+## Task #34: builds this player's own dash-trail particle emitter once, as a
+## child of this CharacterBody3D (see _dash_trail's own header comment for why
+## this one, unlike rope_dart.gd's impact sparks, SHOULD be parented and move
+## with the owner). Colored via player_color (already resolved above in
+## _ready(), before this is called) so each player's own trail is visually
+## identifiable, matching this project's existing player-color-as-identity
+## convention (_reset_player_tint's own emission tint). Starts with
+## emitting = false -- toggled on/off by the dash-activation/dash-duration
+## blocks in _physics_process(), never emits outside an actual dash.
+func _setup_dash_trail() -> void:
+	var particles := GPUParticles3D.new()
+	particles.name = "DashTrail"
+	particles.amount = 24
+	particles.lifetime = 0.35
+	particles.one_shot = false
+	particles.emitting = false
+	particles.local_coords = false
+	var mesh := SphereMesh.new()
+	mesh.radius = 0.07
+	mesh.height = 0.14
+	particles.draw_pass_1 = mesh
+	var mat := ParticleProcessMaterial.new()
+	mat.direction = Vector3(0.0, 1.0, 0.0)
+	mat.spread = 180.0
+	mat.gravity = Vector3.ZERO
+	mat.initial_velocity_min = 0.3
+	mat.initial_velocity_max = 1.0
+	mat.damping_min = 2.0
+	mat.damping_max = 3.0
+	mat.scale_min = 0.4
+	mat.scale_max = 0.9
+	mat.color = player_color
+	particles.process_material = mat
+	add_child(particles)
+	particles.position = Vector3(0.0, _mesh_ground_offset + 0.3, 0.0)
+	_dash_trail = particles
 
 
 func _reset_player_tint() -> void:
@@ -753,6 +809,8 @@ func _physics_process(delta: float) -> void:
 		if _dash_timer <= 0.0:
 			_is_dashing = false
 			_dash_cooldown_timer = DASH_COOLDOWN
+			if _dash_trail != null:
+				_dash_trail.emitting = false
 
 	# --- Dash activation ---
 	# Task #17/#18: Dash is itself a movement burst, so while movement is
@@ -793,6 +851,9 @@ func _physics_process(delta: float) -> void:
 			_dash_timer = DASH_DURATION
 			_dash_cooldown_timer = DASH_COOLDOWN
 			_dash_dir = dash_dir.normalized()
+			Sfx.play_dash()
+			if _dash_trail != null:
+				_dash_trail.emitting = true
 		_prev_dash = dash_held
 
 	# --- Velocity ---
@@ -1197,6 +1258,7 @@ func _trigger_slash_vfx() -> void:
 	if not played_clip:
 		_play_lunge_tween(1.2)
 	_flash_materials(SLASH_FLASH_COLOR)
+	Sfx.play_slash()
 
 
 ## Task #15: Kick's own visual feedback on the ATTACKER -- no suitable
@@ -1210,6 +1272,7 @@ func _trigger_kick_vfx() -> void:
 	_combat_anim_timer = KICK_ANIM_DURATION
 	_play_lunge_tween(1.0)
 	_flash_materials(KICK_FLASH_COLOR)
+	Sfx.play_kick()
 
 
 ## Shared procedural "punch forward, snap back" used by Kick always and by
@@ -1255,6 +1318,60 @@ func _flash_materials(color: Color) -> void:
 	var tw := create_tween()
 	tw.tween_interval(MELEE_FLASH_DURATION)
 	tw.tween_callback(_reset_player_tint)
+
+
+## Task #34: kill/death VFX on the KILLED player -- a particle burst at their
+## own death position plus a brief screen shake on whichever camera the
+## viewport is currently using (arena_camera.gd's own shake(), added this same
+## task -- this was flagged as pending work early in this project's history
+## and never built). Called from take_dart_hit() BEFORE that function
+## overwrites global_position with spawn_pos, so get_pos_2d() here still reads
+## the real death location, not the respawn point.
+## Camera lookup is duck-typed (has_method("shake")) rather than a hard cast
+## to ArenaCamera's own script type -- this project has no shared base
+## class/interface for Camera3D scripts, and a duck-typed check is the same
+## pattern already used throughout this file for the dart/bot_controller duck
+## typing (see this file's own header comment).
+func _trigger_kill_vfx() -> void:
+	_spawn_death_particles(get_pos_2d())
+	var cam := get_viewport().get_camera_3d()
+	if cam != null and cam.has_method("shake"):
+		cam.shake(KILL_SHAKE_INTENSITY, KILL_SHAKE_DURATION)
+
+
+## One-shot particle burst at a fixed world point, colored via this player's
+## OWN player_color (the "who died" read) -- spawned as a sibling in the
+## current scene, same "don't parent a one-shot VFX to something that will
+## keep moving/teleporting after this call" reasoning rope_dart.gd's own
+## _spawn_impact_sparks() uses (this player's own global_position is about to
+## be overwritten to spawn_pos by take_dart_hit(), right after this call
+## returns). Self-frees via a one-shot SceneTreeTimer, mirroring that same
+## function's cleanup shape.
+func _spawn_death_particles(pos_2d: Vector2) -> void:
+	var particles := GPUParticles3D.new()
+	particles.amount = 28
+	particles.one_shot = true
+	particles.explosiveness = 1.0
+	particles.lifetime = 0.5
+	particles.emitting = false
+	var mesh := SphereMesh.new()
+	mesh.radius = 0.09
+	mesh.height = 0.18
+	particles.draw_pass_1 = mesh
+	var mat := ParticleProcessMaterial.new()
+	mat.direction = Vector3(0.0, 1.0, 0.0)
+	mat.spread = 180.0
+	mat.gravity = Vector3(0.0, -9.0, 0.0)
+	mat.initial_velocity_min = 2.5
+	mat.initial_velocity_max = 6.0
+	mat.scale_min = 0.6
+	mat.scale_max = 1.3
+	mat.color = player_color
+	particles.process_material = mat
+	get_tree().current_scene.add_child(particles)
+	particles.global_position = Vector3(pos_2d.x, 1.0, pos_2d.y)
+	particles.emitting = true
+	get_tree().create_timer(particles.lifetime + 0.15).timeout.connect(particles.queue_free)
 
 
 ## Called by another player's _perform_kick() -- never by this player's own
@@ -1380,6 +1497,18 @@ func take_dart_hit() -> void:
 	is_dead = true
 	_trip_timer = 0.0
 	lives -= 1
+	# Task #34: kill/lethal-hit SFX + a particle burst + brief screen shake --
+	# fires HERE, before the teleport-to-spawn_pos below, so the burst spawns
+	# at the actual death POSITION (this player's current global_position),
+	# not the respawn point. Every take_dart_hit() call is a real lethal hit
+	# (GDD Combat's "Dart Contact" section -- it always costs a life), whether
+	# or not it happens to also result in full elimination this time, so this
+	# fires unconditionally here rather than only inside the lives<=0 branch
+	# below -- distinct from and stronger than apply_rope_trip()'s own much
+	# smaller play_trip() cue (GDD Audio: "heavy impacts have stronger
+	# feedback").
+	Sfx.play_kill()
+	_trigger_kill_vfx()
 	if lives <= 0:
 		_eliminate()
 		return
@@ -1417,6 +1546,7 @@ func apply_rope_trip() -> void:
 	if is_dead or is_eliminated:
 		return
 	_trip_timer = TRIP_DURATION
+	Sfx.play_trip()
 
 
 func _get_move_input() -> Vector2:
