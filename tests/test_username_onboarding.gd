@@ -67,9 +67,13 @@ func _run() -> void:
 
 ## A: fresh launch (no saved username) skips straight to "browser" with an
 ## auto-generated placeholder name that passes the existing charset/length
-## validation -- no typing required.
+## validation -- no typing required. Task #41: the digits are now derived
+## from OS.get_unique_id() (device-stable) rather than randi() (re-randomized
+## every call), so this also checks the SAME device produces a consistent/
+## repeatable name across multiple calls instead of a fresh random one each
+## time -- the format itself ("GUEST" + 4 digits) is unchanged from before.
 func _test_fresh_launch_auto_generates() -> void:
-	var label := "A: fresh launch auto-generates a valid guest username and skips to browser"
+	var label := "A: fresh launch auto-generates a valid, device-derived guest username and skips to browser"
 	# Simulate "no saved username" WITHOUT touching disk -- UsernameManager
 	# .has_username() only reads the in-memory `username` var.
 	UsernameManager.username = ""
@@ -86,11 +90,18 @@ func _test_fresh_launch_auto_generates() -> void:
 	var format_ok: bool = regex.search(name_now) != null
 	var len_ok: bool = name_now.length() >= 2 and name_now.length() <= 16
 
-	if screen_ok and format_ok and len_ok:
-		_pass(label, "screen=%s username=%s" % [lobby._screen, name_now])
+	# Determinism: calling the generator again directly (same device, same
+	# OS.get_unique_id()) must reproduce the SAME suffix, not a new random one
+	# -- this is the actual behavior change under test in #41.
+	var repeat1: String = lobby._generate_guest_username()
+	var repeat2: String = lobby._generate_guest_username()
+	var deterministic_ok: bool = repeat1 == repeat2 and repeat1 == name_now
+
+	if screen_ok and format_ok and len_ok and deterministic_ok:
+		_pass(label, "screen=%s username=%s (repeat1=%s repeat2=%s)" % [lobby._screen, name_now, repeat1, repeat2])
 	else:
 		any_failure = true
-		print("[username onboarding test] %s: FAIL -- screen=%s username='%s' (format_ok=%s len_ok=%s)" % [label, lobby._screen, name_now, format_ok, len_ok])
+		print("[username onboarding test] %s: FAIL -- screen=%s username='%s' (format_ok=%s len_ok=%s deterministic_ok=%s repeat1=%s repeat2=%s)" % [label, lobby._screen, name_now, format_ok, len_ok, deterministic_ok, repeat1, repeat2])
 
 	lobby.queue_free()
 	await get_tree().process_frame

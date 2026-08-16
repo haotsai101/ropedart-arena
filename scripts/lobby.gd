@@ -220,16 +220,32 @@ func _process(delta: float) -> void:
 
 ## First-launch placeholder identity — lets a brand-new player start playing
 ## immediately with zero typing (see _ready()'s call site). Format:
-## "GUEST" + a random 4-digit number, e.g. "GUEST4821" -- 9 characters, well
-## under the 16-char max, and built entirely from the A-Z/0-9/_ charset
+## "GUEST" + a 4-digit number, e.g. "GUEST4821" -- 9 characters, well under
+## the 16-char max, and built entirely from the A-Z/0-9/_ charset
 ## _apply_filtered_username() already accepts, so it is guaranteed to pass
 ## the exact same validation a typed name would rather than needing a
-## separate ruleset. The 4-digit suffix (0000-9999) gives 10000 possible
-## names, enough that same-room collisions are rare without resorting to a
-## longer, less readable placeholder. The player can rename anytime via the
-## tappable "Welcome, X ✎" row on the browser screen (_open_username_edit()).
+## separate ruleset.
+##
+## The 4-digit suffix is now DERIVED from OS.get_unique_id() (a cross-platform
+## device/install ID) rather than pure randi() -- so a reinstall or a cleared
+## save on the SAME device reliably regenerates the same guest identity
+## instead of a brand-new random one every time. get_unique_id() itself
+## returns a long (32+ char), platform-encoded string that doesn't fit this
+## 4-digit/charset shape, so it's never used raw: String.hash() folds it down
+## to an int, absi() + `% 10000` reduces that to the same 0000-9999 suffix
+## range the previous randi()-based version produced, so format/length/
+## charset are all unchanged -- only the SOURCE of the digits changed from
+## random to device-derived. hash() is a pure function of its input, so
+## calling this repeatedly on the same device yields the same suffix every
+## time (verified via a headless probe, see test_username_onboarding.gd).
+## Falls back to randi() when get_unique_id() is unavailable (returns "" on
+## some platforms, e.g. web export) so those installs don't all collide on
+## the same digest. The player can rename anytime via the tappable
+## "Welcome, X ✎" row on the browser screen (_open_username_edit()).
 func _generate_guest_username() -> String:
-	return "GUEST%04d" % (randi() % 10000)
+	var uid: String = OS.get_unique_id()
+	var seed_val: int = uid.hash() if uid != "" else randi()
+	return "GUEST%04d" % (absi(seed_val) % 10000)
 
 
 ## Reopens the shared username-entry screen (_build_username_screen()) but
