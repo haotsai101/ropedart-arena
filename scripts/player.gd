@@ -734,14 +734,23 @@ func _process(delta: float) -> void:
 	else:
 		_play_anim("Idle_A")
 
-	# Facing: smoothly turn the mesh to face the movement direction. KayKit's
-	# modeled forward is actually +Z after import (same as the old fruit
-	# models needed, confirmed visually), opposite of Basis.looking_at()'s -Z
-	# convention, so look toward the reverse vector.
-	var vel2d := Vector2(velocity.x, velocity.z)
-	if vel2d.length() > 0.5:
-		_facing_dir = vel2d.normalized()
-		var dir3 := Vector3(vel2d.x, 0.0, vel2d.y).normalized()
+	# Facing: smoothly turn the mesh to face the AIM direction (Task #44 --
+	# previously this tracked movement velocity, so standing still while
+	# aiming did nothing visually; aim_dir is the existing, continuously
+	# updated direction already driving throw/redirect across mouse/gamepad/
+	# touch input -- see _get_aim_input()/_get_mouse_aim() and the aim_dir
+	# update block in _physics_process -- and it already falls back to the
+	# movement direction when there's no live aim input, e.g. gamepad/touch
+	# with the aim stick neutral, so normal "face the way you're walking"
+	# behavior is preserved for those inputs; only mouse (which always has a
+	# live aim reading toward the cursor) and explicit stick aim actually
+	# decouple facing from movement now, which is the intended behavior
+	# change here. KayKit's modeled forward is actually +Z after import (same
+	# as the old fruit models needed, confirmed visually), opposite of
+	# Basis.looking_at()'s -Z convention, so look toward the reverse vector.
+	if aim_dir.length() > 0.01:
+		_facing_dir = aim_dir.normalized()
+		var dir3 := Vector3(_facing_dir.x, 0.0, _facing_dir.y)
 		var desired_quat: Quaternion = Basis.looking_at(-dir3, Vector3.UP).get_rotation_quaternion()
 		player_mesh.quaternion = player_mesh.quaternion.slerp(desired_quat, clampf(12.0 * delta, 0.0, 1.0))
 
