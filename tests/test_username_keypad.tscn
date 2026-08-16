@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bqk8p1m2w9v3x"]
+
+[ext_resource type="Script" path="res://tests/test_username_keypad.gd" id="1_keypad"]
+
+[node name="TestUsernameKeypad" type="Node"]
+script = ExtResource("1_keypad")

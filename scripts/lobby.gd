@@ -217,13 +217,35 @@ func _build_username_screen() -> void:
 	_add_title("ROPE DART ARENA", 80)
 	_add_subtitle("Enter your username", 20)
 
+	# Real LineEdit -- gives desktop keyboard/mouse users a tappable field they
+	# can type into exactly as before. On touch platforms this is left
+	# UNFOCUSED and (below) non-editable: iOS in particular only shows its
+	# virtual keyboard in response to a genuine user touch on a focused native
+	# text field -- a programmatic grab_focus() call from code with no real
+	# touch behind it is a well-known way to get "focus but no keyboard" on
+	# iOS specifically (confirmed via Godot issue trackers/forums, e.g.
+	# godotengine/godot#97993 and multiple forum threads on grab_focus() alone
+	# not reliably raising the OS keyboard on iOS). Rather than depend on that
+	# quirky native path for touch, touch users are routed entirely through
+	# the guaranteed-working custom on-screen keyboard built below by
+	# _build_username_custom_keyboard() -- both paths write through the same
+	# _apply_filtered_username()/_typed_username flow, so validation and the
+	# Enter/CONTINUE-to-confirm behavior are identical either way.
+	var is_touch: bool = DisplayServer.is_touchscreen_available()
+
 	var vp_size: Vector2 = get_viewport_rect().size
 	var vw: float = vp_size.x
 	var vh: float = vp_size.y
-	var panel_w: float = vw * 0.52
-	var panel_h: float = vh * 0.34
+	# Touch needs a noticeably bigger panel than desktop -- it has to fit an
+	# extra 6-row key grid below the field, and on a narrow portrait phone
+	# viewport (small vw) the original 52%-of-vw desktop panel width is too
+	# narrow to hold an 8-column grid at a tappable key size. v_offset shifts
+	# the (screen-centered) panel down to clear _add_subtitle()'s text above.
+	var panel_w: float = vw * (0.90 if is_touch else 0.52)
+	var panel_h: float = vh * (0.74 if is_touch else 0.34)
+	var v_offset: float = vh * 0.07 if is_touch else 0.0
 
-	var panel := _make_panel(int(panel_w), int(panel_h), 0)
+	var panel := _make_panel(int(panel_w), int(panel_h), int(v_offset))
 	add_child(panel)
 
 	var inset: float = vw * 0.03
@@ -234,39 +256,37 @@ func _build_username_screen() -> void:
 	vbox.offset_right = -inset
 	vbox.offset_bottom = -(vh * 0.03)
 	vbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	vbox.add_theme_constant_override("separation", 16)
+	vbox.add_theme_constant_override("separation", 10 if is_touch else 16)
 	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	panel.add_child(vbox)
 
 	var hint := Label.new()
-	hint.text = "A-Z  0-9  _   Tap the field or type   Enter/Continue to confirm"
+	hint.text = "Use the keypad below" if is_touch else "A-Z  0-9  _   Tap the field or type   Enter/Continue to confirm"
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_font_size_override("font_size", _fs(15))
 	hint.add_theme_color_override("font_color", COLOR_DIM)
 	vbox.add_child(hint)
 
-	# Real LineEdit -- gives touch/mouse users a tappable field (triggers the
-	# OS virtual keyboard automatically on touch platforms) while keyboard
-	# users keep typing directly into it exactly as before. This REPLACES the
-	# old manual per-keystroke InputEventKey capture (_input_username) as the
-	# actual typing mechanism, but the Enter-to-confirm behavior is preserved
-	# via text_submitted below -- so keyboard users see no behavior change.
 	_username_line_edit = LineEdit.new()
 	_username_line_edit.text = _typed_username
 	_username_line_edit.placeholder_text = "USERNAME"
 	_username_line_edit.max_length = 16
 	_username_line_edit.alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_username_line_edit.custom_minimum_size = Vector2(vw * 0.30, vh * 0.09)
+	_username_line_edit.custom_minimum_size = Vector2(vw * 0.30, vh * (0.065 if is_touch else 0.09))
 	_username_line_edit.add_theme_font_size_override("font_size", _fs(30))
 	_username_line_edit.add_theme_color_override("font_color", COLOR_VALUE)
 	_username_line_edit.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	_username_line_edit.text_changed.connect(_on_username_text_changed)
 	_username_line_edit.text_submitted.connect(_on_username_text_submitted)
+	# On touch, the field is display-only -- the custom keypad below is the
+	# sole, guaranteed input path (editable = false also prevents the OS from
+	# racing our own focus/keyboard logic with its own quirky one).
+	_username_line_edit.editable = not is_touch
 	vbox.add_child(_username_line_edit)
 
 	var confirm_btn := _make_lobby_button("CONTINUE", _try_confirm_username)
 	confirm_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	confirm_btn.custom_minimum_size = Vector2(vw * 0.20, vh * 0.07)
+	confirm_btn.custom_minimum_size = Vector2(vw * 0.20, vh * (0.06 if is_touch else 0.07))
 	vbox.add_child(confirm_btn)
 
 	var min_hint := Label.new()
@@ -276,15 +296,32 @@ func _build_username_screen() -> void:
 	min_hint.add_theme_color_override("font_color", COLOR_DIM)
 	vbox.add_child(min_hint)
 
-	_username_line_edit.grab_focus()
-	_username_line_edit.caret_column = _username_line_edit.text.length()
+	if is_touch:
+		# Pass the panel's actual available content width (not the raw
+		# viewport width) so the grid's key size is derived from the space it
+		# will really be laid out in -- this is what keeps the grid correctly
+		# sized on a narrow portrait phone panel instead of overflowing it.
+		var avail_w: float = panel_w - inset * 2.0
+		vbox.add_child(_build_username_custom_keyboard(avail_w, vh))
+	else:
+		# Desktop/keyboard path only -- auto-focusing here is a programmatic
+		# grab_focus() with no real click behind it, which is exactly the
+		# pattern that fails to raise iOS's virtual keyboard, so it is
+		# deliberately NOT done on touch (see comment above).
+		_username_line_edit.grab_focus()
+		_username_line_edit.caret_column = _username_line_edit.text.length()
 
 
 func _on_username_text_changed(new_text: String) -> void:
-	## Mirrors the old manual capture's validation (A-Z/0-9/_, uppercase,
-	## max 16) but applied to LineEdit's own text so touch/mouse typists get
-	## the exact same accepted-character set as the old keyboard-only path.
-	var caret: int = _username_line_edit.caret_column
+	_apply_filtered_username(new_text, _username_line_edit.caret_column)
+
+
+## Shared validation/apply path for BOTH the native LineEdit's text_changed
+## signal (desktop keyboard/mouse typing) and the custom touch keypad below
+## (_custom_kb_key_pressed / _custom_kb_backspace) -- keeps a single source of
+## truth for the accepted character set (A-Z/0-9/_, uppercase, max 16) so
+## neither input path can drift from the other.
+func _apply_filtered_username(new_text: String, caret: int) -> void:
 	var filtered: String = ""
 	for i: int in new_text.length():
 		var ch: String = new_text[i].to_upper()
@@ -298,10 +335,117 @@ func _on_username_text_changed(new_text: String) -> void:
 			filtered += ch
 	filtered = filtered.left(16)
 	_typed_username = filtered
-	if filtered != new_text:
+	if filtered != new_text and _username_line_edit != null:
 		var removed: int = new_text.length() - filtered.length()
 		_username_line_edit.text = filtered
 		_username_line_edit.caret_column = clampi(caret - removed, 0, filtered.length())
+
+
+# ---------------------------------------------------------------------------
+# Custom on-screen keyboard (touch fallback)
+# ---------------------------------------------------------------------------
+# A compact A-Z/0-9/_ + Backspace grid, guaranteed to work regardless of the
+# host OS's native virtual-keyboard quirks (see _build_username_screen()'s
+# comment). Shown only when DisplayServer.is_touchscreen_available() is true,
+# mirroring the exact same touch-gating pattern virtual_controls.gd uses for
+# the in-game movement/aim/action overlay. Every key routes through
+# _apply_filtered_username() -- the same validation the native LineEdit
+# uses -- so there is exactly one place that decides what a "valid username
+# character" is.
+
+const _KEYPAD_CHARS: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+
+## avail_w must be the actual width the grid will be laid out within (the
+## panel's inner content width, NOT the raw viewport width) -- key_dim is
+## solved backwards from it so the grid exactly fits instead of overflowing a
+## narrow portrait-phone panel (see _build_username_screen()'s call site).
+func _build_username_custom_keyboard(avail_w: float, _vh: float) -> Control:
+	const COLUMNS: int = 8
+	const SEP: int = 4
+
+	var kb_vbox := VBoxContainer.new()
+	kb_vbox.add_theme_constant_override("separation", 6)
+	kb_vbox.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	kb_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	var grid := GridContainer.new()
+	grid.columns = COLUMNS
+	grid.add_theme_constant_override("h_separation", SEP)
+	grid.add_theme_constant_override("v_separation", SEP)
+	grid.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	kb_vbox.add_child(grid)
+
+	var key_dim: float = clampf((avail_w - float(COLUMNS - 1) * SEP) / float(COLUMNS), 26.0, 56.0)
+	for i: int in _KEYPAD_CHARS.length():
+		var ch: String = _KEYPAD_CHARS[i]
+		grid.add_child(_make_keypad_key(ch, key_dim, func(): _custom_kb_key_pressed(ch)))
+
+	var backspace_btn := _make_keypad_key("⌫", key_dim, _custom_kb_backspace)
+	backspace_btn.add_theme_color_override("font_color", COLOR_ACCENT)
+	grid.add_child(backspace_btn)
+
+	return kb_vbox
+
+
+func _make_keypad_key(label: String, key_dim: float, callback: Callable) -> Button:
+	## Small square Button styled to match this file's existing lobby-button
+	## palette (_make_lobby_button/_make_arrow_button) so the keypad reads as
+	## part of the same UI, not a bolted-on control scheme.
+	var btn := Button.new()
+	btn.text = label
+	btn.focus_mode = Control.FOCUS_NONE
+	btn.custom_minimum_size = Vector2(key_dim, key_dim)
+	btn.add_theme_font_size_override("font_size", _fs(16))
+
+	var style_normal := StyleBoxFlat.new()
+	style_normal.bg_color = COLOR_ROW_NORMAL
+	style_normal.border_color = COLOR_BORDER_NORMAL
+	style_normal.border_width_left = 1
+	style_normal.border_width_right = 1
+	style_normal.border_width_top = 1
+	style_normal.border_width_bottom = 1
+	style_normal.corner_radius_top_left = 6
+	style_normal.corner_radius_top_right = 6
+	style_normal.corner_radius_bottom_left = 6
+	style_normal.corner_radius_bottom_right = 6
+	var style_pressed: StyleBoxFlat = style_normal.duplicate()
+	style_pressed.bg_color = COLOR_ROW_SELECTED
+	style_pressed.border_color = COLOR_BORDER_FOCUSED
+
+	btn.add_theme_stylebox_override("normal", style_normal)
+	btn.add_theme_stylebox_override("hover", style_pressed)
+	btn.add_theme_stylebox_override("pressed", style_pressed)
+	btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	btn.add_theme_color_override("font_color", COLOR_TEXT)
+	btn.add_theme_color_override("font_hover_color", COLOR_ACCENT)
+	btn.add_theme_color_override("font_pressed_color", COLOR_ACCENT)
+
+	btn.pressed.connect(callback)
+	return btn
+
+
+func _custom_kb_key_pressed(ch: String) -> void:
+	var candidate: String = (_typed_username + ch).left(16)
+	_apply_filtered_username(candidate, candidate.length())
+	_sync_username_line_edit_display()
+
+
+func _custom_kb_backspace() -> void:
+	var candidate: String = _typed_username.left(maxi(0, _typed_username.length() - 1))
+	_apply_filtered_username(candidate, candidate.length())
+	_sync_username_line_edit_display()
+
+
+## _apply_filtered_username() only touches the LineEdit's own .text when its
+## filtered output DIFFERS from the text passed in (the native-typing path's
+## way of stripping invalid chars mid-keystroke) -- for the custom keypad the
+## input is already valid so that branch never fires, so the display LineEdit
+## needs its own explicit sync here after every keypad press/backspace.
+func _sync_username_line_edit_display() -> void:
+	if _username_line_edit != null:
+		_username_line_edit.text = _typed_username
+		_username_line_edit.caret_column = _typed_username.length()
 
 
 func _on_username_text_submitted(_text: String) -> void:
