@@ -1029,6 +1029,21 @@ func _get_action_held() -> bool:
 	if player_index == 0:
 		if _virtual_controls != null and _virtual_controls.get_throw_held():
 			return true
+		# Task #43 fix: once a touch device's virtual overlay is active, do NOT
+		# also fall back to Input.is_mouse_button_pressed() below. Godot's
+		# default project setting input_devices/pointing/emulate_mouse_from_touch
+		# is true and unset/unoverridden in this project's project.godot --
+		# every real touch ALSO synthesizes a mouse click/drag event, so
+		# Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) reads true for ANY
+		# touch anywhere on screen (e.g. dragging the movement stick), not just
+		# a tap on the actual Throw button. That's what made the movement
+		# stick spuriously "trigger" Throw. KEY_SPACE is deliberately still
+		# checked even with the overlay active -- a physical/bluetooth keyboard
+		# attached to a touch device is a legitimate (if rare) input source
+		# that keyboard emulation from touch does not spuriously trigger, so
+		# there's no equivalent bug to guard against there.
+		if _virtual_controls != null:
+			return Input.is_key_pressed(KEY_SPACE)
 		return Input.is_key_pressed(KEY_SPACE) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var joy := player_index - 1
 	if Input.is_joy_button_pressed(joy, JOY_BUTTON_RIGHT_SHOULDER):
@@ -1254,6 +1269,14 @@ func _get_melee_action_held() -> bool:
 	if player_index == 0:
 		if _virtual_controls != null and _virtual_controls.get_slash_held():
 			return true
+		# Task #43 fix: same bug/fix shape as _get_action_held() above -- once
+		# the touch overlay is active, don't also fall back to
+		# Input.is_mouse_button_pressed(), since emulate_mouse_from_touch (the
+		# project's unoverridden default) makes ANY touch read as a right
+		# mouse-button press too. KEY_E is left in for the same
+		# bluetooth-keyboard-on-touch-device reasoning as _get_action_held().
+		if _virtual_controls != null:
+			return Input.is_key_pressed(KEY_E)
 		return Input.is_key_pressed(KEY_E) or Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
 	return Input.is_joy_button_pressed(player_index - 1, JOY_BUTTON_B)
 
