@@ -512,6 +512,12 @@ func _ready() -> void:
 		vc.name = "VirtualControls"
 		get_tree().root.add_child(vc)
 		_virtual_controls = vc
+		# Off-screen enemy pins (Task #45) -- same touch-only gate, since
+		# arena_camera.gd's tight touch follow zoom (see that script) is what
+		# makes off-screen enemies possible in the first place.
+		var pins: Node = load("res://scripts/enemy_pins.gd").new()
+		pins.name = "EnemyPins"
+		get_tree().root.add_child(pins)
 	# Online: set up authority and sync — only when multiplayer peer is active
 	if GameManager.is_online and multiplayer.multiplayer_peer != null:
 		set_multiplayer_authority(player_peer_id)
