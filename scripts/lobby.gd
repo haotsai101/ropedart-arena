@@ -110,10 +110,15 @@ func _ready() -> void:
 	NetworkManager.headwear_chosen.connect(_on_character_chosen)
 	NetworkManager.cloth_chosen.connect(_on_character_chosen)
 
-	if UsernameManager.has_username():
-		_set_screen("browser")
-	else:
-		_set_screen("username")
+	if not UsernameManager.has_username():
+		# First-ever launch: skip the username-entry screen entirely and drop
+		# straight into the browser with an auto-generated placeholder name --
+		# sidesteps the iOS virtual-keyboard question for onboarding (see
+		# _build_username_screen()'s comment) by not requiring any typing to
+		# start playing. The player can rename anytime via the tappable
+		# "Welcome, X ✎" row on the browser screen (_open_username_edit()).
+		UsernameManager.save(_generate_guest_username())
+	_set_screen("browser")
 
 
 func _exit_tree() -> void:
@@ -213,9 +218,40 @@ func _process(delta: float) -> void:
 # SCREEN 1: USERNAME
 # ===========================================================================
 
+## First-launch placeholder identity — lets a brand-new player start playing
+## immediately with zero typing (see _ready()'s call site). Format:
+## "GUEST" + a random 4-digit number, e.g. "GUEST4821" -- 9 characters, well
+## under the 16-char max, and built entirely from the A-Z/0-9/_ charset
+## _apply_filtered_username() already accepts, so it is guaranteed to pass
+## the exact same validation a typed name would rather than needing a
+## separate ruleset. The 4-digit suffix (0000-9999) gives 10000 possible
+## names, enough that same-room collisions are rare without resorting to a
+## longer, less readable placeholder. The player can rename anytime via the
+## tappable "Welcome, X ✎" row on the browser screen (_open_username_edit()).
+func _generate_guest_username() -> String:
+	return "GUEST%04d" % (randi() % 10000)
+
+
+## Reopens the shared username-entry screen (_build_username_screen()) but
+## pre-filled with the current saved name instead of blank, so the player is
+## editing their existing identity rather than starting over. Entered from
+## the browser screen's tappable "Welcome, X ✎" row (see
+## _add_username_subtitle_button() call in _build_browser_screen()). Uses the
+## exact same LineEdit + custom on-screen-keypad UI/validation/confirm logic
+## as first-time entry -- this screen now serves both purposes.
+func _open_username_edit() -> void:
+	_typed_username = UsernameManager.username
+	_set_screen("username")
+
+
 func _build_username_screen() -> void:
+	# Since first-ever launch now auto-generates a name and skips this screen
+	# entirely (see _ready()), reaching this screen normally means the player
+	# already has a saved username and is here to change it -- copy and the
+	# Cancel button below reflect that "editing", not "onboarding", context.
+	var is_editing: bool = UsernameManager.has_username()
 	_add_title("ROPE DART ARENA", 80)
-	_add_subtitle("Enter your username", 20)
+	_add_subtitle("Update your username" if is_editing else "Enter your username", 20)
 
 	# Real LineEdit -- gives desktop keyboard/mouse users a tappable field they
 	# can type into exactly as before. On touch platforms this is left
@@ -284,10 +320,29 @@ func _build_username_screen() -> void:
 	_username_line_edit.editable = not is_touch
 	vbox.add_child(_username_line_edit)
 
-	var confirm_btn := _make_lobby_button("CONTINUE", _try_confirm_username)
-	confirm_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-	confirm_btn.custom_minimum_size = Vector2(vw * 0.20, vh * (0.06 if is_touch else 0.07))
-	vbox.add_child(confirm_btn)
+	if is_editing:
+		# Editing an existing name (the normal case now) gets a Cancel path
+		# alongside Continue -- no dead ends, matches this file's existing
+		# "BACK [Esc]" / "LEAVE ROOM [Esc]" button convention elsewhere.
+		var actions_hbox := HBoxContainer.new()
+		actions_hbox.alignment = BoxContainer.ALIGNMENT_CENTER
+		actions_hbox.add_theme_constant_override("separation", 12)
+		actions_hbox.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		actions_hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		vbox.add_child(actions_hbox)
+
+		var back_btn := _make_lobby_button("CANCEL  [Esc]", func(): _set_screen("browser"))
+		back_btn.custom_minimum_size = Vector2(vw * 0.20, vh * (0.06 if is_touch else 0.07))
+		actions_hbox.add_child(back_btn)
+
+		var confirm_btn := _make_lobby_button("CONTINUE", _try_confirm_username)
+		confirm_btn.custom_minimum_size = Vector2(vw * 0.20, vh * (0.06 if is_touch else 0.07))
+		actions_hbox.add_child(confirm_btn)
+	else:
+		var confirm_btn2 := _make_lobby_button("CONTINUE", _try_confirm_username)
+		confirm_btn2.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		confirm_btn2.custom_minimum_size = Vector2(vw * 0.20, vh * (0.06 if is_touch else 0.07))
+		vbox.add_child(confirm_btn2)
 
 	var min_hint := Label.new()
 	min_hint.text = "2 – 16 characters"
@@ -465,7 +520,7 @@ func _try_confirm_username() -> void:
 
 func _build_browser_screen() -> void:
 	_add_title("ROPE DART ARENA", 80)
-	_add_subtitle("Welcome,  " + UsernameManager.username, 20)
+	_add_username_subtitle_button("Welcome,  " + UsernameManager.username, 20, _open_username_edit)
 
 	var vp_size: Vector2 = get_viewport_rect().size
 	var vw: float = vp_size.x
@@ -1064,6 +1119,33 @@ func _add_subtitle(text: String, font_size: int) -> void:
 	add_child(lbl)
 
 
+func _add_username_subtitle_button(text: String, font_size: int, callback: Callable) -> void:
+	## Same position/sizing as _add_subtitle() but a real tappable/clickable
+	## Button instead of an inert Label -- used for the browser screen's
+	## "Welcome, X" row so tapping it reopens the username-entry screen
+	## pre-filled with the current name (see _open_username_edit()). A
+	## trailing pencil glyph plus an accent hover/press color both signal
+	## this row is interactive, not just decorative text (readability
+	## principle: never leave the player wondering what's tappable).
+	var vh: float = get_viewport_rect().size.y
+	var btn := Button.new()
+	btn.text = text + "   ✎"
+	btn.flat = true
+	btn.focus_mode = Control.FOCUS_NONE
+	btn.add_theme_font_size_override("font_size", font_size)
+	btn.add_theme_color_override("font_color", COLOR_DIM)
+	btn.add_theme_color_override("font_hover_color", COLOR_ACCENT)
+	btn.add_theme_color_override("font_pressed_color", COLOR_ACCENT)
+	btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	btn.set_anchor(SIDE_LEFT, 0.0)
+	btn.set_anchor(SIDE_RIGHT, 1.0)
+	btn.offset_top = vh * 0.16
+	btn.offset_bottom = vh * 0.20
+	btn.mouse_filter = Control.MOUSE_FILTER_STOP
+	btn.pressed.connect(callback)
+	add_child(btn)
+
+
 func _make_lobby_button(text: String, callback: Callable) -> Button:
 	## Real, tappable Button — fires on both mouse click and touch tap for
 	## free (standard Godot `pressed` behavior). Used for every primary lobby
@@ -1256,6 +1338,8 @@ func _input(event: InputEvent) -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	match _screen:
+		"username":
+			_input_username(event)
 		"browser":
 			_input_browser(event)
 		"waiting":
@@ -1264,6 +1348,22 @@ func _unhandled_input(event: InputEvent) -> void:
 			_input_local_config(event)
 		"char_select_local":
 			_input_char_select_local(event)
+
+
+func _input_username(event: InputEvent) -> void:
+	## Esc/B = cancel back to the browser screen -- only offered when editing
+	## an existing name (there is always a saved one to fall back to by the
+	## time this screen is reachable in normal play; see _build_username_screen()).
+	## Mirrors the Esc/B "leave"/"back" convention used by _input_waiting()
+	## and _input_local_config() elsewhere in this file.
+	if not UsernameManager.has_username():
+		return
+	var is_escape := (event is InputEventKey and (event as InputEventKey).pressed
+			and (event as InputEventKey).keycode == KEY_ESCAPE)
+	var is_b := (event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed
+			and (event as InputEventJoypadButton).button_index == JOY_BUTTON_B)
+	if is_escape or is_b:
+		_set_screen("browser")
 
 
 func _input_browser(event: InputEvent) -> void:
