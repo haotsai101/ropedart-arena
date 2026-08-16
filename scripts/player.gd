@@ -61,6 +61,19 @@ const DEADZONE := 0.2
 const DASH_SPEED: float = 20.0
 const DASH_DURATION: float = 0.15
 const DASH_COOLDOWN: float = 0.25
+
+## Task #38 (Mobility -- Grapple/Pendulum Swing/Slingshot, docs/project.md):
+## while EMBEDDED, the shared Dash button is repointed to a "momentum
+## release" instead of a ground burst -- capture whatever velocity the
+## player already has (tangential from circling the anchor == Pendulum
+## Swing, radial-outward from running straight against the taut rope ==
+## Slingshot, same underlying mechanism either way per the GDD) and boost
+## its magnitude by this multiplier rather than snapping to a fixed
+## direction/speed the way a normal ground dash does. Reuses the existing
+## DASH_SPEED/_DURATION/_COOLDOWN system wholesale (see the dash-activation
+## block in _physics_process()) -- only the captured direction and the
+## resulting speed differ from a normal dash.
+const MOMENTUM_RELEASE_BOOST_MULT: float = 1.8
 const WALK_ANIM_SPEED: float = 2.0
 ## Half-extent of the platform on the XZ plane — must match the ground
 ## PlaneMesh/BoxShape3D size (30x30) in scenes/main.tscn. Stepping past this
@@ -397,6 +410,12 @@ var _dash_cooldown_timer: float = 0.0
 var _is_dashing: bool = false
 var _dash_dir: Vector2 = Vector2.ZERO
 var _prev_dash: bool = false
+## Speed used by the dash-active velocity branch below -- DASH_SPEED for a
+## normal ground dash, or a per-launch boosted value for a Task #38 momentum
+## release (see MOMENTUM_RELEASE_BOOST_MULT's own comment). Reset to
+## DASH_SPEED at the top of every fresh dash activation so a normal dash
+## right after a momentum release never inherits a stale boosted value.
+var _dash_speed: float = DASH_SPEED
 ## Task #34: brief trail/streak VFX while dashing -- a continuous (one_shot =
 ## false) GPUParticles3D toggled on/off around the dash's own DASH_DURATION
 ## window (see the dash-activation and dash-duration-countdown blocks in
@@ -846,11 +865,86 @@ func _physics_process(delta: float) -> void:
 	if not _is_dashing and _dash_cooldown_timer <= 0.0:
 		var dash_held: bool = _get_dash_pressed()
 		if dash_held and not _prev_dash and not _movement_locked_now:
-			var dash_dir: Vector2 = move_input if move_input.length() > 0.1 else _facing_dir
+			# Task #38: while EMBEDDED, Dash is repointed to a momentum
+			# release (Pendulum Swing / Slingshot) instead of a normal ground
+			# burst -- same shared button, disambiguated by dart.state, same
+			# pattern as Throw/Recall/Redirect and Slash/Kick elsewhere in
+			# this project. _movement_locked_now above already excludes
+			# CHARGING and holding-to-redirect, so this only ever fires while
+			# genuinely EMBEDDED and not mid-hold, per the GDD.
+			var dart_embedded_now: bool = dart != null and is_instance_valid(dart) and dart.state == DART_STATE_EMBEDDED
+			if dart_embedded_now:
+				# `velocity` here is left over from the END of the PREVIOUS
+				# physics tick, already run through
+				# _apply_rope_leash_velocity_clamp() -- for the tangential/
+				# circling (Pendulum) case this is exactly right and MUST be
+				# preferred: the leash only ever strips the outward-radial
+				# component, so as the player sweeps around the anchor
+				# `velocity`'s direction correctly curves to track the true
+				# instantaneous tangent, which a fixed/raw held-input
+				# direction alone would NOT (measured: after a 40-tick
+				# circling sweep with a constant world-space move_input, the
+				# true post-clamp velocity direction had already rotated
+				# ~30deg off the original input direction -- using raw input
+				# instead of measured velocity would launch the player off at
+				# a stale angle, not the direction they're actually curving
+				# along).
+				#
+				# BUT for the radial/straight-out (Slingshot) case -- the
+				# GDD's own DoD explicitly requires this to work ("run
+				# straight out against the taut rope, then Dash") -- a
+				# headless probe driving the real player/dart state machine
+				# (pure radial-outward move_input held against a taut
+				# EMBEDDED anchor for 20+ ticks) measured `velocity` settling
+				# to a *persistent* exact zero from the second tick onward:
+				# once at/beyond rope_length, the leash cancels the ENTIRE
+				# freshly-commanded outward velocity every tick (it's 100%
+				# radial, so "the outward component" being projected out IS
+				# the whole vector) -- so by the time a player has been
+				# holding straight into the taut rope for more than an
+				# instant, `velocity` alone reads 0 and this mechanic would
+				# silently do nothing.
+				#
+				# Fix: prefer measured `velocity` whenever it's meaningfully
+				# non-zero (the correct, curve-accurate answer for circling,
+				# and for any other case where the player still has real
+				# motion); fall back to the CURRENT tick's freshly-computed
+				# commanded velocity (mirrors the "--- Velocity ---" block's
+				# own move_input -> velocity formula below) only in the
+				# specific degenerate case the leash has fully zeroed actual
+				# velocity but the player is still actively pushing outward --
+				# exactly the sustained-slingshot steady state, and nothing
+				# else.
+				var actual_vel2d := Vector2(velocity.x, velocity.z)
+				var actual_speed: float = actual_vel2d.length()
+				var release_vel2d: Vector2 = actual_vel2d
+				if actual_speed <= 0.1:
+					var commanded_move: Vector2 = move_input
+					if commanded_move.length() > 1.0:
+						commanded_move = commanded_move.normalized()
+					var trip_mult_now: float = TRIP_SPEED_MULT if _trip_timer > 0.0 else 1.0
+					release_vel2d = commanded_move * move_speed * trip_mult_now
+				var current_speed: float = release_vel2d.length()
+				# Falls back to facing direction only in the fully degenerate
+				# case of releasing from a genuine standstill (no velocity
+				# AND no movement input at all at the instant of release).
+				var release_dir: Vector2 = release_vel2d / current_speed if current_speed > 0.1 else _facing_dir
+				_dash_dir = release_dir.normalized()
+				_dash_speed = current_speed * MOMENTUM_RELEASE_BOOST_MULT
+				# Unanchor the dart into RETURNING NOW, same tick, so the
+				# leash's outward-radial clamp (_apply_rope_leash_velocity_
+				# clamp(), gated on dart.state == EMBEDDED) stops running
+				# starting next tick and this boosted velocity is actually
+				# free to carry the player away instead of being immediately
+				# capped back to the rope's radius.
+				dart.begin_recall()
+			else:
+				var dash_dir: Vector2 = move_input if move_input.length() > 0.1 else _facing_dir
+				_dash_dir = dash_dir.normalized()
+				_dash_speed = DASH_SPEED
 			_is_dashing = true
 			_dash_timer = DASH_DURATION
 			_dash_cooldown_timer = DASH_COOLDOWN
-			_dash_dir = dash_dir.normalized()
 			Sfx.play_dash()
 			if _dash_trail != null:
 				_dash_trail.emitting = true
@@ -858,7 +952,7 @@ func _physics_process(delta: float) -> void:
 
 	# --- Velocity ---
 	if _is_dashing:
-		velocity = Vector3(_dash_dir.x, 0.0, _dash_dir.y) * DASH_SPEED
+		velocity = Vector3(_dash_dir.x, 0.0, _dash_dir.y) * _dash_speed
 	elif _knockback_timer > 0.0:
 		# Kick knockback: same "scripted state overrides normal input" shape
 		# as dash above, just driven by apply_kick_knockback() instead of this
@@ -1769,6 +1863,7 @@ func _reset_movement_and_dart_state() -> void:
 	_dash_timer = 0.0
 	_dash_cooldown_timer = 0.0
 	_prev_dash = false
+	_dash_speed = DASH_SPEED
 	_knockback_timer = 0.0
 	_knockback_dir = Vector2.ZERO
 	_melee_cooldown_timer = 0.0

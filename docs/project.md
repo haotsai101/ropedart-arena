@@ -314,35 +314,11 @@ Recall through enemies
 
 *(Everything in this section is bonus/stretch — built after the v1 weapon-swing mechanic is proven out. The player's own body swings on the rope here, distinct from the v1 weapon-swing where the dart swings around the player.)*
 
-## Grapple
+## Grapple / Pendulum Swing / Slingshot
 
-Anchor dart.
+**Bonus mechanic (Phase 7)** — one unified system, not three separate ones. While Embedded, movement is already free tangentially around the anchor (the leash only ever cancels the outward-radial component, never sideways/tangential) — that's the pendulum swing, no new input needed to start it.
 
-Swing.
-
-Release.
-
-Maintain momentum.
-
----
-
-## Pendulum Swing
-
-Use rope to:
-
-* Build speed
-* Cross hazards
-* Dodge attacks
-
----
-
-## Slingshot
-
-Run opposite rope direction.
-
-Release.
-
-Launch player.
+**Release** — same button as Dash, context-sensitive: while Embedded, Dash instead captures your current velocity as a boosted launch impulse and triggers Recall on the dart at the same instant, so the leash stops capping your outward speed and you actually fly with the momentum instead of being clamped back to the rope's radius. Works the same whether that momentum came from circling the anchor (Pendulum Swing) or running straight out against the taut rope (Slingshot) — the direction you were moving at release is what carries you, not a separate mechanic per style.
 
 ---
 

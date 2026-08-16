@@ -295,7 +295,7 @@ output.
 
 ---
 
-## Phase 7 (bonus / stretch) — Mobility pendulum-swing
+## Phase 7 (bonus / stretch) — Mobility pendulum-swing (DONE)
 
 **Goal:** the mechanic explicitly deferred during design review — the
 player's own body swings around a fixed anchor, distinct from Phase 4's
