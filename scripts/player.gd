@@ -1667,16 +1667,35 @@ func _get_move_input() -> Vector2:
 	return v.rotated(_move_rotation_offset) if v.length() >= DEADZONE else Vector2.ZERO
 
 
+## Task #42 (touch control redesign, direct user request): the standalone
+## touch aim stick is gone -- _virtual_controls no longer exposes get_aim()
+## at all (see virtual_controls.gd's own header comment). Touch aim is now
+## derived here instead:
+##   - Default (not CHARGING, not holding-to-redirect): aim tracks wherever
+##     the player is currently moving, falling back to _facing_dir (last real
+##     movement direction) when the left stick is neutral -- exactly the
+##     brief's "wherever they're currently facing/moving".
+##   - While CHARGING (dart.state == HOLSTERED->CHARGING) or while holding to
+##     redirect (dart.state == EMBEDDED with _embedded_hold_active) --
+##     _movement_locked_now already zeroes the left stick's CONTRIBUTION TO
+##     VELOCITY in _physics_process's velocity block, but leaves the raw
+##     _get_move_input() reading itself untouched -- so re-reading that same
+##     raw stick here for aim is free and matches the brief word-for-word:
+##     "pinned in place, but the same stick now steers where you're aiming."
+## Returning the raw stick reading (or _facing_dir when neutral) as THIS
+## function's own result means the existing shared aim_dir update block in
+## _physics_process (`if aim_input.length() > DEADZONE: aim_dir =
+## aim_input.normalized() ...`) already does the right thing with zero
+## further changes there -- that block, _get_mouse_aim(), and the gamepad
+## branch below are all completely untouched by this.
 func _get_aim_input() -> Vector2:
 	if is_bot and bot_controller != null:
 		# Same world-space reasoning as _get_move_input() above -- don't rotate.
 		return bot_controller.get_desired_aim()
 	if player_index == 0:
-		# Virtual joystick takes priority when a finger is active on the right stick
 		if _virtual_controls != null:
-			var vc_aim: Vector2 = _virtual_controls.get_aim()
-			if vc_aim.length() > 0.1:
-				return vc_aim.rotated(_move_rotation_offset)
+			var raw_move: Vector2 = _get_move_input()
+			return raw_move if raw_move.length() > DEADZONE else _facing_dir
 		# Mouse aim: project cursor onto the XZ gameplay plane -- already
 		# camera-correct via project_ray_origin/normal, do NOT rotate this.
 		return _get_mouse_aim()

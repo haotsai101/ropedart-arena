@@ -1,7 +1,21 @@
 extends CanvasLayer
-## Virtual on-screen joystick overlay for touch devices.
-## Left stick: movement (bottom-left), Right stick: aim (bottom-right),
-## Throw button: above right stick, Slash button: to the left of throw.
+## Virtual on-screen control overlay for touch devices.
+## Left: a single stick controlling movement (bottom-left).
+## Right: three EQUAL-SIZED buttons in a triangle cluster (bottom-right) --
+## Dash (top), Throw/Redirect (bottom-right), Slash/Kick (bottom-left).
+##
+## Task #42 (touch control redesign, direct user request): the old separate
+## aim stick on the right side is REMOVED entirely -- there is no
+## `get_aim()`/`_right_base`/`_right_knob_offset` any more. Touch aim is no
+## longer a distinct input at all: player.gd's own _get_aim_input() now
+## derives aim_dir from the SAME left movement stick this file already
+## exposes via get_move() -- tracking current movement/facing by default, and
+## (since CHARGING/holding-to-redirect already zero movement's CONTRIBUTION
+## to velocity but leave the raw stick reading intact) repurposed to drive
+## aim/facing rotation during those pinned windows instead. See player.gd's
+## _get_aim_input() for the actual mechanism; nothing here needs to know
+## about dart.state to make that work.
+##
 ## Throw and Recall are the SAME input everywhere (keyboard/mouse, gamepad,
 ## touch) -- see player.gd's _get_action_held() -- so there is deliberately
 ## no separate Recall button here; get_recall_held() is a thin alias of
@@ -16,43 +30,46 @@ extends CanvasLayer
 ## pattern as Throw/Recall). No touch-side code needed for that repoint.
 ##
 ## Phase 4: the Throw button is ALSO how a touch player redirects a swing
-## (tap while EMBEDDED = Recall, hold-then-release aiming with the right
-## stick = Redirect -- see player.gd's _handle_dart_away_input()). The raw
-## held/not-held signal this file exposes is mechanically identical for
-## touch and desktop (both just feed the same level signal into player.gd's
-## own hold-duration tracking), so no new input plumbing is needed here --
-## but unlike a mouse click, a touch player gets no natural physical
-## "click"/"hold" feedback from the hardware itself, and this button doubles
-## as BOTH Throw-charge and Recall/Redirect depending on dart state, so a
-## clear in-UI affordance for "you have now held long enough that releasing
-## will redirect, not tap-recall" matters more here than on desktop, given
-## how often this fires mid-fight. _throw_held_time/HOLD_REDIRECT_THRESHOLD
-## below drive a third, distinct button color once held past that point --
-## purely cosmetic, mirrors (not reads) player.gd's own
-## SWING_REDIRECT_HOLD_THRESHOLD so what the player SEES matches what
-## actually happens on release without this file needing to know anything
-## about dart.state itself.
+## (tap while EMBEDDED = Recall, hold-then-release aiming = Redirect -- see
+## player.gd's _handle_dart_away_input()). The raw held/not-held signal this
+## file exposes is mechanically identical for touch and desktop (both just
+## feed the same level signal into player.gd's own hold-duration tracking),
+## so no new input plumbing is needed here -- but unlike a mouse click, a
+## touch player gets no natural physical "click"/"hold" feedback from the
+## hardware itself, and this button doubles as BOTH Throw-charge and
+## Recall/Redirect depending on dart state, so a clear in-UI affordance for
+## "you have now held long enough that releasing will redirect, not
+## tap-recall" matters more here than on desktop, given how often this fires
+## mid-fight. _throw_held_time/HOLD_REDIRECT_THRESHOLD below drive a third,
+## distinct button color once held past that point -- purely cosmetic,
+## mirrors (not reads) player.gd's own SWING_REDIRECT_HOLD_THRESHOLD so what
+## the player SEES matches what actually happens on release without this
+## file needing to know anything about dart.state itself.
 ##
 ## Phase 4.5: Dash button, following the exact same finger-tracking/drawing
 ## pattern as Throw/Slash above -- a plain level signal (held/not-held), no
 ## tap-vs-hold distinction needed since player.gd's own _get_dash_pressed()
 ## already does simple rising-edge detection on whatever level signal it
-## receives (see that function + _prev_dash in player.gd). Positioned above
-## the Slash button (same x, offset up) so it doesn't overlap either the
-## Slash or Throw buttons.
-## Exposed API: get_move() -> Vector2, get_aim() -> Vector2,
-## get_throw_held() -> bool, get_slash_held() -> bool, get_recall_held() -> bool,
-## get_dash_held() -> bool.
+## receives (see that function + _prev_dash in player.gd).
+##
+## Priority / multi-touch: Dash/Throw/Slash all track their own finger id
+## independently of the left stick's (_left_finger/_throw_finger/
+## _dash_finger/_slash_finger below), and _handle_touch()'s press branch
+## checks each zone independently rather than gating on "is the left stick
+## currently idle" -- so pressing any right-side button while the left stick
+## is simultaneously held down works correctly (verified live, Task #42).
+##
+## Exposed API: get_move() -> Vector2, get_throw_held() -> bool,
+## get_slash_held() -> bool, get_recall_held() -> bool, get_dash_held() -> bool.
 
 const BASE_RADIUS   := 110.0
 const KNOB_RADIUS   :=  40.0
-const THROW_RADIUS  :=  55.0
-const SLASH_RADIUS  :=  42.0
-const DASH_RADIUS   :=  38.0
+## All three right-side buttons share this one radius (Task #42: "same size
+## as the other two" applies uniformly to Dash/Throw/Slash, not just
+## Throw/Slash as before).
+const BUTTON_RADIUS :=  52.0
 const MARGIN        :=  30.0
-const THROW_GAP     :=  20.0   # px gap between right stick top and throw button bottom
-const SLASH_GAP     :=  16.0   # px gap between throw button and slash button
-const DASH_GAP      :=  16.0   # px gap between slash button and dash button (stacked above it)
+const BUTTON_GAP     :=  18.0   # px gap between adjacent right-side buttons
 
 const COLOR_BASE          := Color(0.1, 0.1, 0.1, 0.4)
 const COLOR_KNOB          := Color(0.8, 0.8, 0.8, 0.6)
@@ -80,14 +97,12 @@ const HOLD_REDIRECT_THRESHOLD: float = 0.1
 
 # Computed screen positions
 var _left_base:     Vector2 = Vector2.ZERO
-var _right_base:    Vector2 = Vector2.ZERO
 var _throw_center:  Vector2 = Vector2.ZERO
 var _slash_center:  Vector2 = Vector2.ZERO
 var _dash_center:   Vector2 = Vector2.ZERO
 
 # Touch state
 var _left_knob_offset:  Vector2 = Vector2.ZERO
-var _right_knob_offset: Vector2 = Vector2.ZERO
 var _throw_held:        bool    = false
 var _slash_held:        bool    = false
 var _dash_held:         bool    = false
@@ -100,7 +115,6 @@ var _throw_held_time: float = 0.0
 
 # Finger ID tracking (-1 = not claimed)
 var _left_finger:   int = -1
-var _right_finger:  int = -1
 var _throw_finger:  int = -1
 var _slash_finger:  int = -1
 var _dash_finger:   int = -1
@@ -136,21 +150,21 @@ func _process(delta: float) -> void:
 func _update_layout() -> void:
 	var sz: Vector2 = get_viewport().get_visible_rect().size
 	_left_base    = Vector2(MARGIN + BASE_RADIUS, sz.y - MARGIN - BASE_RADIUS)
-	_right_base   = Vector2(sz.x - MARGIN - BASE_RADIUS, sz.y - MARGIN - BASE_RADIUS)
-	# Throw button sits above right joystick with a small gap
+	# Task #42: no more right stick -- the three equal-sized buttons form a
+	# triangle cluster in the bottom-right corner instead (Throw at the
+	# corner, Slash to its left at the same height, Dash centered above the
+	# two). All three use the same BUTTON_RADIUS/BUTTON_GAP.
 	_throw_center = Vector2(
-		sz.x - MARGIN - BASE_RADIUS,
-		sz.y - MARGIN - BASE_RADIUS * 2.0 - THROW_GAP - THROW_RADIUS
+		sz.x - MARGIN - BUTTON_RADIUS,
+		sz.y - MARGIN - BUTTON_RADIUS
 	)
-	# Slash button sits to the left of the throw button, same height
 	_slash_center = Vector2(
-		_throw_center.x - THROW_RADIUS - SLASH_GAP - SLASH_RADIUS,
+		_throw_center.x - BUTTON_RADIUS * 2.0 - BUTTON_GAP,
 		_throw_center.y
 	)
-	# Dash button sits directly above the slash button, same x
 	_dash_center = Vector2(
-		_slash_center.x,
-		_slash_center.y - SLASH_RADIUS - DASH_GAP - DASH_RADIUS
+		(_throw_center.x + _slash_center.x) / 2.0,
+		_throw_center.y - BUTTON_RADIUS * 2.0 - BUTTON_GAP
 	)
 	if _canvas != null:
 		_canvas.queue_redraw()
@@ -161,17 +175,13 @@ func _on_canvas_draw() -> void:
 	_canvas.draw_circle(_left_base, BASE_RADIUS, COLOR_BASE)
 	_canvas.draw_circle(_left_base + _left_knob_offset, KNOB_RADIUS, COLOR_KNOB)
 
-	# --- Right joystick ---
-	_canvas.draw_circle(_right_base, BASE_RADIUS, COLOR_BASE)
-	_canvas.draw_circle(_right_base + _right_knob_offset, KNOB_RADIUS, COLOR_KNOB)
-
 	# --- Throw button --- (see HOLD_REDIRECT_THRESHOLD's own comment: the
 	# distinct COLOR_THROW_HOLDING tint is purely cosmetic feedback for "held
 	# long enough that releasing now will Redirect, not tap-Recall")
 	var btn_color: Color = COLOR_THROW
 	if _throw_held:
 		btn_color = COLOR_THROW_HOLDING if _throw_held_time >= HOLD_REDIRECT_THRESHOLD else COLOR_THROW_ACTIVE
-	_canvas.draw_circle(_throw_center, THROW_RADIUS, btn_color)
+	_canvas.draw_circle(_throw_center, BUTTON_RADIUS, btn_color)
 	var fallback_font: Font = ThemeDB.fallback_font
 	if fallback_font != null:
 		# draw_string pos is the baseline; offset upward by half font size to center
@@ -188,7 +198,7 @@ func _on_canvas_draw() -> void:
 
 	# --- Slash button ---
 	var slash_color: Color = COLOR_SLASH_ACTIVE if _slash_held else COLOR_SLASH
-	_canvas.draw_circle(_slash_center, SLASH_RADIUS, slash_color)
+	_canvas.draw_circle(_slash_center, BUTTON_RADIUS, slash_color)
 	if fallback_font != null:
 		var slash_label_pos: Vector2 = _slash_center + Vector2(0.0, 8.0)
 		_canvas.draw_string(
@@ -203,7 +213,7 @@ func _on_canvas_draw() -> void:
 
 	# --- Dash button ---
 	var dash_color: Color = COLOR_DASH_ACTIVE if _dash_held else COLOR_DASH
-	_canvas.draw_circle(_dash_center, DASH_RADIUS, dash_color)
+	_canvas.draw_circle(_dash_center, BUTTON_RADIUS, dash_color)
 	if fallback_font != null:
 		var dash_label_pos: Vector2 = _dash_center + Vector2(0.0, 7.0)
 		_canvas.draw_string(
@@ -227,38 +237,33 @@ func _input(event: InputEvent) -> void:
 func _handle_touch(event: InputEventScreenTouch) -> void:
 	var pos: Vector2 = event.position
 	if event.pressed:
-		# Priority: left stick, then throw button, then right stick
-		# (throw button overlaps right-base zone so check it before right stick)
+		# Priority: left stick, then Throw, then Slash, then Dash. Each zone
+		# tracks its own finger id independently (Task #42: this is exactly
+		# what makes Dash/Throw/Slash work correctly while the left stick is
+		# simultaneously held -- a press landing in one zone never depends on
+		# any other zone's current finger state).
 		if _left_finger == -1 and pos.distance_to(_left_base) <= BASE_RADIUS:
 			_left_finger = event.index
 			_left_knob_offset = (pos - _left_base).limit_length(BASE_RADIUS)
 			get_viewport().set_input_as_handled()
-		elif _throw_finger == -1 and pos.distance_to(_throw_center) <= THROW_RADIUS + 20.0:
+		elif _throw_finger == -1 and pos.distance_to(_throw_center) <= BUTTON_RADIUS + 20.0:
 			_throw_finger = event.index
 			_throw_held = true
 			_throw_held_time = 0.0
 			get_viewport().set_input_as_handled()
-		elif _slash_finger == -1 and pos.distance_to(_slash_center) <= SLASH_RADIUS + 20.0:
+		elif _slash_finger == -1 and pos.distance_to(_slash_center) <= BUTTON_RADIUS + 20.0:
 			_slash_finger = event.index
 			_slash_held = true
 			get_viewport().set_input_as_handled()
-		elif _dash_finger == -1 and pos.distance_to(_dash_center) <= DASH_RADIUS + 20.0:
+		elif _dash_finger == -1 and pos.distance_to(_dash_center) <= BUTTON_RADIUS + 20.0:
 			_dash_finger = event.index
 			_dash_held = true
-			get_viewport().set_input_as_handled()
-		elif _right_finger == -1 and pos.distance_to(_right_base) <= BASE_RADIUS:
-			_right_finger = event.index
-			_right_knob_offset = (pos - _right_base).limit_length(BASE_RADIUS)
 			get_viewport().set_input_as_handled()
 	else:
 		# Finger lifted — release whichever zone it owned
 		if event.index == _left_finger:
 			_left_finger = -1
 			_left_knob_offset = Vector2.ZERO
-			get_viewport().set_input_as_handled()
-		if event.index == _right_finger:
-			_right_finger = -1
-			_right_knob_offset = Vector2.ZERO
 			get_viewport().set_input_as_handled()
 		if event.index == _throw_finger:
 			_throw_finger = -1
@@ -281,9 +286,6 @@ func _handle_drag(event: InputEventScreenDrag) -> void:
 	if event.index == _left_finger:
 		_left_knob_offset = (event.position - _left_base).limit_length(BASE_RADIUS)
 		get_viewport().set_input_as_handled()
-	elif event.index == _right_finger:
-		_right_knob_offset = (event.position - _right_base).limit_length(BASE_RADIUS)
-		get_viewport().set_input_as_handled()
 	if _canvas != null:
 		_canvas.queue_redraw()
 
@@ -293,13 +295,6 @@ func get_move() -> Vector2:
 	if _left_knob_offset.length() < 0.1:
 		return Vector2.ZERO
 	return _left_knob_offset / BASE_RADIUS
-
-
-## Returns normalised aim vector in [-1,1] range; Vector2.ZERO when idle.
-func get_aim() -> Vector2:
-	if _right_knob_offset.length() < 0.1:
-		return Vector2.ZERO
-	return _right_knob_offset / BASE_RADIUS
 
 
 ## Returns true while the throw button is held by a finger.
