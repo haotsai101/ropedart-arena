@@ -64,6 +64,7 @@ func create_room(max_players: int = 4, bot_difficulty: int = 0, map_id: int = 0)
 		"max_players": max_players,
 		"bot_difficulty": bot_difficulty,
 		"map_id": map_id,
+		"version": GameVersion.VERSION,
 	}))
 
 
@@ -71,7 +72,7 @@ func join_room(code: String) -> void:
 	is_host = false
 	room_code = code.to_upper()
 	_connect_signaling()
-	_pending_send.append(JSON.stringify({"type": "join", "code": room_code}))
+	_pending_send.append(JSON.stringify({"type": "join", "code": room_code, "version": GameVersion.VERSION}))
 
 
 func disconnect_from_room() -> void:
@@ -304,7 +305,12 @@ func _handle_signal(msg: Dictionary) -> void:
 				emit_signal("cloth_chosen", peer_id, cloth_id)
 
 		"error":
-			emit_signal("connection_failed", str(msg.get("message", "Unknown signaling error")))
+			var err_code: String = str(msg.get("code", ""))
+			if err_code == "version_mismatch":
+				var host_version: String = str(msg.get("host_version", "?"))
+				emit_signal("connection_failed", "Version mismatch (you: %s, host: %s) — please update your game and try again." % [GameVersion.VERSION, host_version])
+			else:
+				emit_signal("connection_failed", str(msg.get("message", "Unknown signaling error")))
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ const USERNAME_TIMEOUT_MS = 5000;
 //   code,
 //   host_socket,
 //   host_username,
+//   host_version,                                 // game build version string declared by the host on "create"
 //   players: [ { socket, username, peer_id } ],  // index 0 = host (peer_id 1)
 //   settings: { max_players: 4, bot_difficulty: 0, map_id: 0 },
 //   started: false
@@ -81,10 +82,12 @@ function handleMessage(ws, raw) {
       const bot_difficulty = Math.min(2, Math.max(0, parseInt(msg.bot_difficulty) || 0));
       const map_id = Math.min(1, Math.max(0, parseInt(msg.map_id) || 0));
       const username = ws.username || "Player";
+      const host_version = String(msg.version || "unknown").slice(0, 64);
       rooms[code] = {
         code,
         host_socket: ws,
         host_username: username,
+        host_version,
         players: [{ socket: ws, username, peer_id: 1 }],
         settings: { max_players, bot_difficulty, map_id },
         started: false,
@@ -107,6 +110,21 @@ function handleMessage(ws, raw) {
       }
       if (room.players.length >= room.settings.max_players) {
         send(ws, { type: "error", message: "Room is full" });
+        return;
+      }
+      const joiner_version = String(msg.version || "unknown").slice(0, 64);
+      if (joiner_version !== room.host_version) {
+        send(ws, {
+          type: "error",
+          code: "version_mismatch",
+          message:
+            "Version mismatch: your game (" +
+            joiner_version +
+            ") does not match the room's host version (" +
+            room.host_version +
+            "). Please update your game.",
+          host_version: room.host_version,
+        });
         return;
       }
       const peer_id = room.players.length + 1; // 2, 3, 4, ...
