@@ -61,7 +61,7 @@ const EDGE_MARGIN: float = 1.5
 # Must match player.gd's MELEE_RANGE (this file has no static access to that
 # script's consts across the duck-typed `player` reference used elsewhere
 # here -- same hand-mirroring convention already used for DART_STATE_* above).
-const MELEE_RANGE: float = 1.4
+const MELEE_RANGE: float = 1.8
 ## Must roughly match player.gd's own MELEE_COOLDOWN -- how often a bot
 ## re-pulses get_desired_melee() while a target stays in range. Doesn't need
 ## to match exactly (player.gd's own cooldown is the real gate that decides

@@ -89,7 +89,7 @@ const FALL_DURATION: float = 1.0
 ## `player` reference used elsewhere there -- same hand-mirroring convention
 ## already used for DART_STATE_* in that file) -- keep both in sync if this
 ## ever gets tuned.
-const MELEE_RANGE: float = 1.4
+const MELEE_RANGE: float = 1.8
 ## Rising-edge-gated, not held-to-repeat: one press = one Slash/Kick attempt,
 ## then a brief cooldown before the next press can trigger another -- without
 ## this a held button (or a bot's continuously-true in-range decision) would
@@ -369,10 +369,16 @@ var lives: int = 3
 ## True once `lives` reaches 0 this round -- no more respawn until the next
 ## reset_for_round() revives this player. See _eliminate().
 var is_eliminated: bool = false
-const RESPAWN_INVULN_TIME: float = 0.3  ## brief window after respawn where
-## this player can't be re-targeted/re-killed the same tick they teleport in
-## (guards against a degenerate case where spawn_pos itself sits inside a
-## still-lethal dart's hit/trip radius) -- see _physics_process()'s countdown.
+const RESPAWN_INVULN_TIME: float = 1.2  ## brief window after ANY spawn (round
+## start via reset_for_round(), or a mid-round respawn via take_dart_hit())
+## where this player is both untouchable -- is_dead stays true so every
+## existing "skip dead players" guard (Slash/Kick targeting, apply_kick_
+## knockback(), take_dart_hit() itself, apply_rope_trip()) already treats
+## them as untargetable, same mechanism that originally guarded the
+## degenerate case of spawn_pos sitting inside a still-lethal dart's hit/trip
+## radius the instant a player teleports in -- and unmovable, via
+## _physics_process()'s own early-return for this window, so they can't be
+## displaced (or act) until it expires.
 var _invuln_timer: float = 0.0
 
 const TRIP_DURATION: float = 0.6
@@ -790,6 +796,21 @@ func _physics_process(delta: float) -> void:
 		move_and_slide()
 		return
 
+	# --- Spawn/respawn protection window (see RESPAWN_INVULN_TIME's own
+	# comment) -- unmovable: early-return before any input is read, same
+	# "scripted state overrides the normal per-tick pipeline" shape
+	# is_eliminated/is_falling above already use. Sits ABOVE the
+	# is_network_controlled early-return below so the countdown still runs
+	# for remote-driven players too -- otherwise a remote human on the host
+	# would keep is_dead == true (untargetable) for the whole round.
+	if _invuln_timer > 0.0:
+		_invuln_timer -= delta
+		if _invuln_timer <= 0.0:
+			is_dead = false
+		velocity = Vector3.ZERO
+		move_and_slide()
+		return
+
 	# Network-controlled players (remote peers): position is handled by
 	# MultiplayerSynchronizer; we still need move_and_slide() for the physics
 	# engine to register the body, but we don't apply local input.
@@ -819,11 +840,7 @@ func _physics_process(delta: float) -> void:
 		move_input = _get_move_input()
 		aim_input  = _get_aim_input()
 
-	# --- Respawn invuln / rope-trip countdowns ---
-	if _invuln_timer > 0.0:
-		_invuln_timer -= delta
-		if _invuln_timer <= 0.0:
-			is_dead = false
+	# --- Rope-trip countdown ---
 	if _trip_timer > 0.0:
 		_trip_timer -= delta
 
@@ -1669,6 +1686,15 @@ func _eliminate() -> void:
 		aim_indicator.visible = false
 	collision_shape.disabled = true
 	_reset_movement_and_dart_state()
+	# The dart is a sibling in the scene tree, not a child of this
+	# CharacterBody3D (see the dart-instantiation comment in _ready()), so
+	# hiding player_mesh above does nothing to it -- without this, an
+	# eliminated player's dart is left floating visibly in place, holstered
+	# at their now-invisible hand, for the rest of the round. Re-shown by
+	# _reset_movement_and_dart_state() on the next reset_for_round() -- which is
+	# also why this runs AFTER the reset call above, not before it.
+	if dart != null and is_instance_valid(dart):
+		dart.visible = false
 
 
 ## Called by rope_dart.gd's _check_player_hits() when the ROPE LINE (not the
@@ -1889,14 +1915,14 @@ func reset_for_round(start_pos: Vector3) -> void:
 	spawn_pos = start_pos
 	global_position = start_pos
 	collision_shape.disabled = false
-	is_dead = false
+	is_dead = true  # cleared by the spawn-invuln countdown once it expires -- see RESPAWN_INVULN_TIME
 	is_eliminated = false
 	lives = GameManager.lives_per_round
 	if player_mesh != null:
 		player_mesh.visible = true
 	if aim_indicator != null:
 		aim_indicator.visible = true
-	_invuln_timer = 0.0
+	_invuln_timer = RESPAWN_INVULN_TIME
 	_trip_timer = 0.0
 	_reset_movement_and_dart_state()
 
@@ -1939,3 +1965,8 @@ func _reset_movement_and_dart_state() -> void:
 	_embedded_hold_time = 0.0
 	if dart != null and is_instance_valid(dart) and dart.has_method("force_holster"):
 		dart.force_holster()
+		# Undoes _eliminate()'s dart.visible = false -- harmless no-op when
+		# called from take_dart_hit() (mid-round respawn), where the dart was
+		# never hidden in the first place; matters when called from
+		# reset_for_round() reviving a player who was eliminated last round.
+		dart.visible = true

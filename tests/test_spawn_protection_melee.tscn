@@ -1,0 +1,6 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/test_spawn_protection_melee.gd" id="1_spawn"]
+
+[node name="TestSpawnProtectionMelee" type="Node"]
+script = ExtResource("1_spawn")
