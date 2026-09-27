@@ -49,6 +49,7 @@ static func build_character_visual(base_id: String, headwear_id: String, cloth_i
 		mat.emission_enabled = true
 		mat.emission = character_color * 0.4
 		mi.set_surface_override_material(0, mat)
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 	return root
 
