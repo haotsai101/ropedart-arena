@@ -406,9 +406,30 @@ var _fall_timer: SceneTreeTimer = null
 # Virtual on-screen controls — non-null only for player_index 0 on touch devices.
 var _virtual_controls: Node = null
 
-# Online multiplayer
+# Online multiplayer (host-authoritative -- see GameManager's "Online match
+# sync" block). The host simulates every player; guests only render the host's
+# snapshots and send their own player's input.
 var player_peer_id: int = 1          # which multiplayer peer owns this player
-var is_network_controlled: bool = false  # true when a remote peer drives this player
+
+## Bitfield for the buttons half of a guest's per-tick input packet.
+const NET_BTN_DASH := 1
+const NET_BTN_ACTION := 2
+const NET_BTN_MELEE := 4
+## Snapshot flags bitfield (see get_net_snapshot()).
+const NET_FLAG_DEAD := 1
+const NET_FLAG_ELIMINATED := 2
+const NET_FLAG_DASHING := 4
+## One-off cosmetic events mirrored host -> guests (see _fx()/play_fx()).
+enum Fx { DASH, SLASH, KICK, KILL, TRIP, FALL }
+## Host-side cap on queued guest input frames (~100ms at 60Hz): frames are
+## consumed one per physics tick so short taps survive network bunching, but
+## a backlog beyond this is dropped oldest-first to keep input latency bounded.
+const NET_INPUT_MAX_QUEUE := 6
+## Guest-side: how fast a rendered player closes the gap to the latest host
+## snapshot position, and the gap beyond which it snaps instead (respawns,
+## round resets -- anything that's a teleport on the host).
+const NET_INTERP_RATE := 25.0
+const NET_SNAP_DISTANCE := 2.5
 
 # Dash state
 var _dash_timer: float = 0.0
@@ -464,9 +485,14 @@ var _combat_anim_active: bool = false
 var _combat_anim_timer: float = 0.0
 var _lunge_tween: Tween = null
 
-# Network input cache — written by _rpc_set_input, read by _physics_process
-var _net_move: Vector2 = Vector2.ZERO
-var _net_aim: Vector2 = Vector2.ZERO
+# Host-side: a remote human's queued input frames ([move, aim, buttons]),
+# filled by push_net_input() and consumed one per tick into _net_frame, which
+# the _get_*_input() getters read instead of local devices.
+var _net_queue: Array = []
+var _net_frame: Array = [Vector2.ZERO, Vector2.ZERO, 0]
+# Guest-side: latest host snapshot position this player is gliding toward.
+var _net_target_pos: Vector3 = Vector3.ZERO
+var _has_net_target: bool = false
 
 
 func _ready() -> void:
@@ -513,7 +539,7 @@ func _ready() -> void:
 	dart.owner_player = self
 	get_tree().current_scene.add_child(dart)
 	# Virtual controls for touch devices (player_index 0, human only)
-	if player_index == 0 and not is_bot and DisplayServer.is_touchscreen_available():
+	if is_primary_local_player() and DisplayServer.is_touchscreen_available():
 		var vc: Node = load("res://scripts/virtual_controls.gd").new()
 		vc.name = "VirtualControls"
 		get_tree().root.add_child(vc)
@@ -524,34 +550,164 @@ func _ready() -> void:
 		var pins: Node = load("res://scripts/enemy_pins.gd").new()
 		pins.name = "EnemyPins"
 		get_tree().root.add_child(pins)
-	# Online: set up authority and sync — only when multiplayer peer is active
-	if GameManager.is_online and multiplayer.multiplayer_peer != null:
-		set_multiplayer_authority(player_peer_id)
-		_setup_multiplayer_sync()
 
 
-func _setup_multiplayer_sync() -> void:
-	var sync := MultiplayerSynchronizer.new()
-	sync.name = "NetSync"
-	sync.set_multiplayer_authority(player_peer_id)
-	var config := SceneReplicationConfig.new()
-	config.add_property(NodePath(".:global_position"))
-	config.add_property(NodePath(".:rotation"))
-	sync.replication_config = config
-	add_child(sync)
+# ---------------------------------------------------------------------------
+# Online roles
+# ---------------------------------------------------------------------------
+
+func _is_online() -> bool:
+	return GameManager.is_online and multiplayer.multiplayer_peer != null
 
 
-# RPC: authority peer (the client that owns this player) sends its input to the host.
-# The host applies it; local authority doesn't need this path.
-@rpc("any_peer", "call_local", "unreliable_ordered")
-func _rpc_set_input(move: Vector2, aim: Vector2) -> void:
-	# Only the host (server) stores the received input; the authority peer drives locally.
-	if not multiplayer.is_server():
+## True on the peer that runs this player's real simulation: always offline,
+## and only the host online.
+func is_sim_authority() -> bool:
+	return not _is_online() or multiplayer.is_server()
+
+
+## The player driven by THIS device's own keyboard/mouse/touch: slot 0
+## offline (other local slots use gamepads), or whichever human slot this
+## peer owns online. Also what the camera/enemy pins treat as "me".
+func is_primary_local_player() -> bool:
+	if is_bot:
+		return false
+	if _is_online():
+		return player_peer_id == multiplayer.get_unique_id()
+	return player_index == 0
+
+
+## Host-side: a remote guest's human player, driven by its queued input.
+func _uses_net_input() -> bool:
+	return _is_online() and multiplayer.is_server() and not is_bot \
+		and player_peer_id != multiplayer.get_unique_id()
+
+
+## Which input branch the _get_*_input() getters take for a human: the
+## primary device (keyboard/mouse/touch) online -- a guest only ever reads
+## its own player -- or offline slot 0; gamepad `player_index - 1` otherwise.
+func _reads_primary_input() -> bool:
+	return _is_online() or player_index == 0
+
+
+func push_net_input(move: Vector2, aim: Vector2, buttons: int) -> void:
+	_net_queue.append([move, aim, buttons])
+	while _net_queue.size() > NET_INPUT_MAX_QUEUE:
+		_net_queue.pop_front()
+
+
+func clear_net_input() -> void:
+	_net_queue.clear()
+	_net_frame = [Vector2.ZERO, Vector2.ZERO, 0]
+
+
+func _consume_net_input() -> void:
+	# An empty queue keeps the previous frame -- a late packet then reads as
+	# "still holding the same input", not a spurious release.
+	if not _net_queue.is_empty():
+		_net_frame = _net_queue.pop_front()
+
+
+func _net_button(bit: int) -> bool:
+	return (int(_net_frame[2]) & bit) != 0
+
+
+## Guest-side physics tick: no simulation at all (the host's snapshots drive
+## this player), just ship this device's input for our own player.
+func _net_guest_tick() -> void:
+	if not is_primary_local_player():
 		return
-	if multiplayer.get_remote_sender_id() != player_peer_id:
-		return  # reject spoofed input from wrong peer
-	_net_move = move
-	_net_aim = aim
+	var move_in: Vector2 = _get_move_input()
+	var aim_in: Vector2 = _get_aim_input()
+	var buttons: int = 0
+	if _get_dash_pressed():
+		buttons |= NET_BTN_DASH
+	if _get_action_held():
+		buttons |= NET_BTN_ACTION
+	if _get_melee_action_held():
+		buttons |= NET_BTN_MELEE
+	GameManager.send_local_input(move_in, aim_in, buttons)
+	# Aim locally right away instead of waiting a round trip for the host's
+	# snapshot (apply_net_snapshot() skips aim_dir for our own player) -- same
+	# rule as _physics_process's own aim block.
+	if aim_in.length() > DEADZONE:
+		aim_dir = aim_in.normalized()
+	elif move_in.length() > DEADZONE:
+		aim_dir = move_in.normalized()
+	if aim_indicator != null:
+		aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
+
+
+## Host-side: this player's replicated state, one entry of GameManager's
+## per-tick snapshot.
+func get_net_snapshot() -> Array:
+	var flags: int = 0
+	if is_dead:
+		flags |= NET_FLAG_DEAD
+	if is_eliminated:
+		flags |= NET_FLAG_ELIMINATED
+	if _is_dashing:
+		flags |= NET_FLAG_DASHING
+	var dart_ok: bool = dart != null and is_instance_valid(dart)
+	return [
+		global_position, velocity, aim_dir, lives, flags,
+		dart.state if dart_ok else -1,
+		dart.pos_2d if dart_ok else Vector2.ZERO,
+		dart.dir_2d if dart_ok else Vector2.ZERO,
+		dart.get_charge_time() if dart_ok else 0.0,
+	]
+
+
+## Guest-side: apply one host snapshot entry (see get_net_snapshot()).
+func apply_net_snapshot(snap: Array) -> void:
+	var pos: Vector3 = snap[0]
+	_net_target_pos = pos
+	if not _has_net_target or global_position.distance_to(pos) > NET_SNAP_DISTANCE:
+		global_position = pos
+	_has_net_target = true
+	velocity = snap[1]
+	if not is_primary_local_player():
+		aim_dir = snap[2]
+		if aim_indicator != null:
+			aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
+	lives = int(snap[3])
+	var flags: int = int(snap[4])
+	is_dead = (flags & NET_FLAG_DEAD) != 0
+	if (flags & NET_FLAG_ELIMINATED) != 0 and not is_eliminated:
+		_eliminate()
+	var dashing: bool = (flags & NET_FLAG_DASHING) != 0
+	if dashing != _is_dashing:
+		_is_dashing = dashing
+		if not dashing and _dash_trail != null:
+			_dash_trail.emitting = false
+	if dart != null and is_instance_valid(dart) and int(snap[5]) >= 0:
+		dart.apply_net_state(int(snap[5]), snap[6], snap[7], float(snap[8]))
+
+
+## Plays a one-off cosmetic event locally and, on an online host, mirrors it
+## to every guest (GameManager._rpc_player_fx -> play_fx() there).
+func _fx(kind: int, pos_2d: Vector2 = Vector2.ZERO) -> void:
+	play_fx(kind, pos_2d)
+	GameManager.broadcast_player_fx(player_index, kind, pos_2d)
+
+
+func play_fx(kind: int, pos_2d: Vector2 = Vector2.ZERO) -> void:
+	match kind:
+		Fx.DASH:
+			Sfx.play_dash()
+			if _dash_trail != null:
+				_dash_trail.emitting = true
+		Fx.SLASH:
+			_trigger_slash_vfx()
+		Fx.KICK:
+			_trigger_kick_vfx()
+		Fx.KILL:
+			Sfx.play_kill()
+			_trigger_kill_vfx(pos_2d)
+		Fx.TRIP:
+			Sfx.play_trip()
+		Fx.FALL:
+			_start_fall()
 
 
 ## KayKit's Rig_Medium characters and both animation source files all share
@@ -709,6 +865,10 @@ func _play_anim(anim_name: String, speed: float = 1.0, force: bool = false) -> v
 
 
 func _process(delta: float) -> void:
+	# Online guest: glide toward the latest host snapshot position (see
+	# apply_net_snapshot(), which snaps instead for teleport-sized gaps).
+	if _has_net_target and not is_sim_authority():
+		global_position = global_position.lerp(_net_target_pos, clampf(NET_INTERP_RATE * delta, 0.0, 1.0))
 	# Smooth speed ratio toward current velocity magnitude (0.0–1.0)
 	var speed_ratio: float = velocity.length() / move_speed
 	_move_speed_smooth = lerp(_move_speed_smooth, speed_ratio, 10.0 * delta)
@@ -779,6 +939,13 @@ func _process(delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	if not is_sim_authority():
+		_net_guest_tick()
+		return
+	if _uses_net_input():
+		# Consume every tick, even through the early-returns below, so a
+		# backlog never builds up while this player can't act.
+		_consume_net_input()
 	if is_falling:
 		return
 	if is_eliminated:
@@ -799,10 +966,7 @@ func _physics_process(delta: float) -> void:
 	# --- Spawn/respawn protection window (see RESPAWN_INVULN_TIME's own
 	# comment) -- unmovable: early-return before any input is read, same
 	# "scripted state overrides the normal per-tick pipeline" shape
-	# is_eliminated/is_falling above already use. Sits ABOVE the
-	# is_network_controlled early-return below so the countdown still runs
-	# for remote-driven players too -- otherwise a remote human on the host
-	# would keep is_dead == true (untargetable) for the whole round.
+	# is_eliminated/is_falling above already use.
 	if _invuln_timer > 0.0:
 		_invuln_timer -= delta
 		if _invuln_timer <= 0.0:
@@ -811,34 +975,8 @@ func _physics_process(delta: float) -> void:
 		move_and_slide()
 		return
 
-	# Network-controlled players (remote peers): position is handled by
-	# MultiplayerSynchronizer; we still need move_and_slide() for the physics
-	# engine to register the body, but we don't apply local input.
-	if is_network_controlled:
-		velocity = Vector3.ZERO
-		move_and_slide()
-		_check_boundary_fall()
-		return
-
-	# If we are the authority peer for an online player, gather input locally
-	# and send it to the host via RPC so the host can apply it.
-	if GameManager.is_online and multiplayer.multiplayer_peer != null:
-		if is_multiplayer_authority() and not multiplayer.is_server():
-			var move_in := _get_move_input()
-			var aim_in  := _get_aim_input()
-			rpc_id(1, "_rpc_set_input", move_in, aim_in)
-
-	# --- Inputs: online host uses _net_* cache; everyone else reads locally ---
-	var move_input: Vector2
-	var aim_input: Vector2
-
-	if GameManager.is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server() and not is_multiplayer_authority():
-		# Host driving a remote-owned player from its cached RPC input
-		move_input = _net_move
-		aim_input  = _net_aim
-	else:
-		move_input = _get_move_input()
-		aim_input  = _get_aim_input()
+	var move_input: Vector2 = _get_move_input()
+	var aim_input: Vector2 = _get_aim_input()
 
 	# --- Rope-trip countdown ---
 	if _trip_timer > 0.0:
@@ -977,9 +1115,7 @@ func _physics_process(delta: float) -> void:
 			_is_dashing = true
 			_dash_timer = DASH_DURATION
 			_dash_cooldown_timer = DASH_COOLDOWN
-			Sfx.play_dash()
-			if _dash_trail != null:
-				_dash_trail.emitting = true
+			_fx(Fx.DASH)
 		_prev_dash = dash_held
 
 	# --- Velocity ---
@@ -1039,7 +1175,9 @@ func _physics_process(delta: float) -> void:
 func _get_dash_pressed() -> bool:
 	if is_bot and bot_controller != null:
 		return bot_controller.get_desired_dash()
-	if player_index == 0:
+	if _uses_net_input():
+		return _net_button(NET_BTN_DASH)
+	if _reads_primary_input():
 		# Virtual Dash button takes priority, same pattern as
 		# _get_move_input()/_get_aim_input()/_get_throw_held() above --
 		# see virtual_controls.gd's Phase 4.5 header comment.
@@ -1058,7 +1196,9 @@ func _get_action_held() -> bool:
 	## cover bots: see _get_throw_held()/_get_recall_held() below, which read
 	## bot_controller.gd's independent get_desired_throw()/get_desired_recall()
 	## AI decisions instead of this shared physical signal.
-	if player_index == 0:
+	if _uses_net_input():
+		return _net_button(NET_BTN_ACTION)
+	if _reads_primary_input():
 		if _virtual_controls != null and _virtual_controls.get_throw_held():
 			return true
 		# Task #43 fix: once a touch device's virtual overlay is active, do NOT
@@ -1298,7 +1438,9 @@ func _get_melee_action_held() -> bool:
 	## _get_throw_held()/_get_recall_held(): bots go through their own
 	## get_desired_melee() AI decision in _get_melee_held() below instead of
 	## this shared physical signal.
-	if player_index == 0:
+	if _uses_net_input():
+		return _net_button(NET_BTN_MELEE)
+	if _reads_primary_input():
 		if _virtual_controls != null and _virtual_controls.get_slash_held():
 			return true
 		# Task #43 fix: same bug/fix shape as _get_action_held() above -- once
@@ -1359,7 +1501,7 @@ func _perform_slash() -> void:
 	# Slash, same as the target's own reaction (teleport/knockback) already
 	# only fires when it connects, but the ATTACKER'S half of the feedback
 	# loop shouldn't depend on hitting something.
-	_trigger_slash_vfx()
+	_fx(Fx.SLASH)
 	var my_pos: Vector2 = get_pos_2d()
 	for p in get_tree().get_nodes_in_group("players"):
 		if p == self or not is_instance_valid(p):
@@ -1376,7 +1518,7 @@ func _perform_slash() -> void:
 func _perform_kick() -> void:
 	# Task #15: same "fire the attacker's own VFX unconditionally" reasoning
 	# as _perform_slash() above.
-	_trigger_kick_vfx()
+	_fx(Fx.KICK)
 	var my_pos: Vector2 = get_pos_2d()
 	for p in get_tree().get_nodes_in_group("players"):
 		if p == self or not is_instance_valid(p):
@@ -1481,8 +1623,8 @@ func _flash_materials(color: Color) -> void:
 ## class/interface for Camera3D scripts, and a duck-typed check is the same
 ## pattern already used throughout this file for the dart/bot_controller duck
 ## typing (see this file's own header comment).
-func _trigger_kill_vfx() -> void:
-	_spawn_death_particles(get_pos_2d())
+func _trigger_kill_vfx(pos_2d: Vector2) -> void:
+	_spawn_death_particles(pos_2d)
 	var cam := get_viewport().get_camera_3d()
 	if cam != null and cam.has_method("shake"):
 		cam.shake(KILL_SHAKE_INTENSITY, KILL_SHAKE_DURATION)
@@ -1656,8 +1798,7 @@ func take_dart_hit() -> void:
 	# below -- distinct from and stronger than apply_rope_trip()'s own much
 	# smaller play_trip() cue (GDD Audio: "heavy impacts have stronger
 	# feedback").
-	Sfx.play_kill()
-	_trigger_kill_vfx()
+	_fx(Fx.KILL, get_pos_2d())
 	if lives <= 0:
 		_eliminate()
 		return
@@ -1704,7 +1845,7 @@ func apply_rope_trip() -> void:
 	if is_dead or is_eliminated:
 		return
 	_trip_timer = TRIP_DURATION
-	Sfx.play_trip()
+	_fx(Fx.TRIP)
 
 
 func _get_move_input() -> Vector2:
@@ -1714,7 +1855,9 @@ func _get_move_input() -> Vector2:
 		# so their output must NOT be rotated by the camera-relative offset
 		# below; only raw human input (keyboard/gamepad/touch) needs it.
 		return bot_controller.get_desired_move()
-	if player_index == 0:
+	if _uses_net_input():
+		return _net_frame[0]
+	if _reads_primary_input():
 		# Virtual joystick takes priority when a finger is on it
 		if _virtual_controls != null:
 			var vc_move: Vector2 = _virtual_controls.get_move()
@@ -1756,7 +1899,9 @@ func _get_aim_input() -> Vector2:
 	if is_bot and bot_controller != null:
 		# Same world-space reasoning as _get_move_input() above -- don't rotate.
 		return bot_controller.get_desired_aim()
-	if player_index == 0:
+	if _uses_net_input():
+		return _net_frame[1]
+	if _reads_primary_input():
 		if _virtual_controls != null:
 			var raw_move: Vector2 = _get_move_input()
 			return raw_move if raw_move.length() > DEADZONE else _facing_dir
@@ -1834,7 +1979,7 @@ func _check_boundary_fall() -> void:
 		return
 	var p2d: Vector2 = get_pos_2d()
 	if absf(p2d.x) > ARENA_HALF or absf(p2d.y) > ARENA_HALF:
-		_start_fall()
+		_fx(Fx.FALL)
 
 
 func _start_fall() -> void:
@@ -1914,6 +2059,7 @@ func reset_for_round(start_pos: Vector3) -> void:
 		_reset_fall_visual()
 	spawn_pos = start_pos
 	global_position = start_pos
+	_net_target_pos = start_pos
 	collision_shape.disabled = false
 	is_dead = true  # cleared by the spawn-invuln countdown once it expires -- see RESPAWN_INVULN_TIME
 	is_eliminated = false

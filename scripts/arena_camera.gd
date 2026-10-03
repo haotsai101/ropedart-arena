@@ -38,8 +38,8 @@ var _shake_duration_total: float = 0.0
 ## players/bots are far apart, since the camera has to zoom OUT to keep
 ## everyone in frame -- that's exactly the complaint. On touch
 ## (DisplayServer.is_touchscreen_available()) we instead follow only the
-## local human player (player_index == 0, this project's existing convention
-## for "the local player" -- see hud.gd/virtual_controls.gd/player.gd itself)
+## local human player (player.gd's is_primary_local_player(): slot 0 offline,
+## this peer's own slot online)
 ## at a tight, mostly-fixed zoom, gated so desktop's existing behavior above
 ## is completely unaffected (additive branch, not a replacement).
 ##
@@ -158,7 +158,7 @@ func _process_desktop_fit_all(delta: float) -> void:
 func _process_touch_follow(delta: float) -> void:
 	var local_player: Node = null
 	for p in get_tree().get_nodes_in_group("players"):
-		if p.player_index == 0 and not p.is_bot:
+		if p.is_primary_local_player():
 			local_player = p
 			break
 	if local_player == null:

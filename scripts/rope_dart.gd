@@ -426,6 +426,8 @@ func _process(_delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	if _is_net_guest():
+		return  # the host simulates this dart; apply_net_state() mirrors it here
 	match state:
 		State.CHARGING:
 			_charge_time = minf(_charge_time + delta, max_charge_time)
@@ -460,6 +462,53 @@ func _physics_process(delta: float) -> void:
 			_check_player_hits()
 		_:
 			pass
+
+
+# ---------------------------------------------------------------------------
+# Online (host-authoritative -- see GameManager's "Online match sync" block)
+# ---------------------------------------------------------------------------
+
+func _is_net_guest() -> bool:
+	return owner_player != null and is_instance_valid(owner_player) and not owner_player.is_sim_authority()
+
+
+func get_charge_time() -> float:
+	return _charge_time
+
+
+## Guest-side: mirror the host's dart from one snapshot entry. State
+## transitions replay the same cosmetic feedback the host's own transition
+## functions fire (throw/impact/recall SFX, sparks, fall visual), without any
+## of their gameplay side effects -- hits, clamps and wrap routing for
+## gameplay only ever run on the host.
+func apply_net_state(new_state: int, new_pos: Vector2, new_dir: Vector2, charge_time: float) -> void:
+	pos_2d = new_pos
+	dir_2d = new_dir
+	_charge_time = charge_time
+	if new_state != state:
+		state = new_state
+		match new_state:
+			State.FLYING:
+				_wrap_state.clear()
+				_reset_dart_fall_visual()
+				Sfx.play_throw(clampf(_charge_time / max_charge_time, 0.0, 1.0))
+			State.EMBEDDED:
+				Sfx.play_impact()
+				_spawn_impact_sparks()
+				_reset_dart_fall_visual()
+				if absf(pos_2d.x) > ARENA_HALF or absf(pos_2d.y) > ARENA_HALF:
+					_start_dart_fall_visual()
+			State.SWINGING:
+				_reset_dart_fall_visual()
+			State.RETURNING:
+				_reset_dart_fall_visual()
+				Sfx.play_recall(0.0)
+			State.HOLSTERED:
+				_wrap_state.clear()
+				_reset_dart_fall_visual()
+		state_changed.emit(state)
+	if state != State.HOLSTERED and state != State.CHARGING:
+		global_position = Vector3(pos_2d.x, PLANE_Y, pos_2d.y)
 
 
 func begin_charge() -> void:

@@ -59,6 +59,28 @@ var player_cloth: Dictionary = {}        # player_index (int) → cloth id (Stri
 var _all_players: Array = []
 var _timer: float = 0.0
 
+# --- Online match sync (host-authoritative) ---------------------------------
+# The host simulates every player, dart and bot; guests only send their own
+# input (_rpc_input) and render what the host broadcasts: a full state
+# snapshot every physics tick (_rpc_snapshot) plus one-off cosmetic events
+# (_rpc_player_fx). All of these RPCs live on this autoload rather than on
+# player/dart nodes so they always resolve, even while a peer is still
+# loading the match scene (packets for a scene that isn't built yet are
+# simply ignored -- see _rpc_snapshot()).
+
+## Human slot -> owning peer id, in slot order (host first). Slots beyond
+## this array are bots. Set by set_online_slots() from the lobby's
+## room_players so every peer derives the identical mapping -- replaces the
+## old "peer N owns slot N-1" assumption, which broke once peer ids stopped
+## being reused after a lobby leave.
+var online_slot_peers: Array = []
+## Guests that finished building the match scene (see _rpc_client_ready()).
+## The host holds the first round until every human slot is ready, so no
+## guest misses the opening round reset/countdown.
+var _ready_peers: Dictionary = {}
+var _awaiting_ready: bool = false
+const READY_TIMEOUT_SEC := 10.0
+
 const PLAYER_COLORS := [
 	Color(0.3, 0.6, 0.9),
 	Color(0.9, 0.2, 0.2),
@@ -202,6 +224,14 @@ const _FALLBACK_SPAWNS := [
 
 func _ready() -> void:
 	call_deferred("_init_game")
+	multiplayer.peer_disconnected.connect(_on_net_peer_disconnected)
+	# Deferred: NetworkManager is a later autoload, not in the tree yet here.
+	call_deferred("_connect_network_signals")
+
+
+func _connect_network_signals() -> void:
+	NetworkManager.host_disconnected.connect(func(): _on_match_connection_lost("Host left the game"))
+	NetworkManager.connection_failed.connect(_on_match_connection_lost)
 
 
 func _init_game() -> void:
@@ -218,6 +248,11 @@ func _init_game() -> void:
 
 	if is_online:
 		_init_game_online(main)
+		if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+			_rpc_client_ready.rpc_id(1)
+			return  # the host starts rounds; _rpc_round_reset() mirrors them here
+		_start_first_round_when_ready()
+		return
 	else:
 		_init_game_local(main)
 
@@ -258,31 +293,20 @@ func _init_game_online(main: Node) -> void:
 		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
 	var bot_script := load("res://scripts/bot_controller.gd")
-	var my_id: int = multiplayer.get_unique_id()
-
-	# Build the set of peer IDs that have actual human players in this room
-	var connected_peers: Dictionary = {}
-	for entry in NetworkManager.room_players:
-		if entry is Dictionary and entry.has("peer_id"):
-			connected_peers[int(entry["peer_id"])] = true
+	_all_players.clear()
 
 	for i in total_players:
 		var p = player_scene.instantiate()
 		p.name = "Player%d" % i
 		p.player_index = i
-		# peer_id 1 owns player 0; peer_id 2 owns player 1, etc.
-		var owner_peer_id: int = i + 1
-		var is_human_slot: bool = connected_peers.has(owner_peer_id)
-
-		if is_human_slot:
+		var owner_peer_id: int = peer_id_for_slot(i)
+		if owner_peer_id > 0:
 			p.is_bot = false
 			p.player_peer_id = owner_peer_id
-			p.is_network_controlled = (my_id != owner_peer_id)
 		else:
-			# No human for this slot — host drives it as a bot
+			# No human for this slot — the host simulates it as a bot
 			p.is_bot = true
-			p.player_peer_id = 1  # host is authoritative; its MultiplayerSynchronizer replicates position
-			p.is_network_controlled = (my_id != 1)
+			p.player_peer_id = 1
 
 		p.character_id = player_characters.get(i, CHARACTER_DEFS[i % CHARACTER_DEFS.size()]["id"])
 		p.character_headwear_id = str(player_headwear.get(i, ""))
@@ -296,7 +320,11 @@ func _init_game_online(main: Node) -> void:
 			p.add_child(bc)
 
 
-func assign_default_characters() -> void:
+## `shuffle_seed` >= 0 makes the shuffle deterministic -- online matches pass
+## one derived from the room code so every peer builds the identical roster
+## for slots nobody picked (bots, or players who never chose), instead of
+## each peer rolling its own random defaults.
+func assign_default_characters(shuffle_seed: int = -1) -> void:
 	player_characters.clear()
 	# Fresh match: reset accessory picks to "" (native) too -- a stale
 	# headwear/cloth id left over from a previous match's roster shouldn't
@@ -304,7 +332,16 @@ func assign_default_characters() -> void:
 	player_headwear.clear()
 	player_cloth.clear()
 	var shuffled: Array = CHARACTER_DEFS.duplicate()
-	shuffled.shuffle()
+	if shuffle_seed < 0:
+		shuffled.shuffle()
+	else:
+		var rng := RandomNumberGenerator.new()
+		rng.seed = shuffle_seed
+		for i in range(shuffled.size() - 1, 0, -1):
+			var j: int = rng.randi_range(0, i)
+			var tmp = shuffled[i]
+			shuffled[i] = shuffled[j]
+			shuffled[j] = tmp
 	var slot: int = 0
 	for def in shuffled:
 		if slot >= total_players:
@@ -398,13 +435,19 @@ func start_round() -> void:
 	# deliberately NOT touched here -- they persist across rounds within a
 	# match (see round_wins' own comment); only _reset_match_state() (a whole
 	# NEW match starting) clears them.
+	_reset_players_for_round()
+	_timer = countdown_duration
+	if is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_rpc_round_reset.rpc(_timer)
+	_set_state(RoundState.COUNTDOWN)
+
+
+func _reset_players_for_round() -> void:
 	var spawn_positions := _get_spawn_positions()
 	for i in _all_players.size():
 		var p = _all_players[i]
 		var pos: Vector3 = spawn_positions[i % spawn_positions.size()]
 		p.reset_for_round(pos)
-	_timer = countdown_duration
-	_set_state(RoundState.COUNTDOWN)
 
 
 func _reset_match_state() -> void:
@@ -496,3 +539,165 @@ func _get_spawn_positions() -> Array:
 			positions.append(m.global_position + Vector3(0, PLAYER_HALF_HEIGHT, 0))
 		return positions
 	return _FALLBACK_SPAWNS
+
+
+# ---------------------------------------------------------------------------
+# Online match sync (see the "Online match sync" var block at the top)
+# ---------------------------------------------------------------------------
+
+## Called by lobby.gd on every peer right before the match scene loads.
+## `room_players` is NetworkManager.room_players ([{username, peer_id}]),
+## identical on every peer since the signaling server broadcasts it.
+func set_online_slots(room_players: Array) -> void:
+	var ids: Array = []
+	for entry in room_players:
+		if entry is Dictionary and entry.has("peer_id"):
+			ids.append(int(entry["peer_id"]))
+	ids.sort()
+	online_slot_peers = ids
+	_ready_peers.clear()
+
+
+## Owning peer id for a player slot, or 0 if that slot is a bot.
+func peer_id_for_slot(slot: int) -> int:
+	return int(online_slot_peers[slot]) if slot >= 0 and slot < online_slot_peers.size() else 0
+
+
+func _is_online_host() -> bool:
+	return is_online and multiplayer.multiplayer_peer != null and multiplayer.is_server()
+
+
+func _is_online_guest() -> bool:
+	return is_online and multiplayer.multiplayer_peer != null and not multiplayer.is_server()
+
+
+func _find_player_by_peer(peer_id: int) -> Node:
+	for p in _all_players:
+		if is_instance_valid(p) and not p.is_bot and p.player_peer_id == peer_id:
+			return p
+	return null
+
+
+func _missing_ready_peers() -> Array:
+	var missing: Array = []
+	for peer_id in online_slot_peers:
+		if int(peer_id) != 1 and not _ready_peers.has(int(peer_id)):
+			missing.append(peer_id)
+	return missing
+
+
+func _start_first_round_when_ready() -> void:
+	if _missing_ready_peers().is_empty():
+		start_round()
+		return
+	_awaiting_ready = true
+	get_tree().create_timer(READY_TIMEOUT_SEC).timeout.connect(func():
+		if _awaiting_ready:
+			push_warning("GameManager: starting without ready from peers %s" % [_missing_ready_peers()])
+			_awaiting_ready = false
+			start_round()
+	)
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _rpc_client_ready() -> void:
+	if not multiplayer.is_server():
+		return
+	_ready_peers[multiplayer.get_remote_sender_id()] = true
+	if _awaiting_ready and _missing_ready_peers().is_empty():
+		_awaiting_ready = false
+		start_round()
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_round_reset(countdown: float) -> void:
+	_reset_players_for_round()
+	_timer = countdown
+
+
+## Guest -> host, every physics tick, for the guest's own player only.
+## `buttons` is a bitfield -- see player.gd's NET_BTN_* constants.
+@rpc("any_peer", "call_remote", "unreliable_ordered")
+func _rpc_input(move: Vector2, aim: Vector2, buttons: int) -> void:
+	if not multiplayer.is_server():
+		return
+	var p: Node = _find_player_by_peer(multiplayer.get_remote_sender_id())
+	if p != null:
+		p.push_net_input(move, aim, buttons)
+
+
+func send_local_input(move: Vector2, aim: Vector2, buttons: int) -> void:
+	_rpc_input.rpc_id(1, move, aim, buttons)
+
+
+func _physics_process(_delta: float) -> void:
+	if not _is_online_host() or _all_players.is_empty():
+		return
+	var snapshot: Array = []
+	for p in _all_players:
+		snapshot.append(p.get_net_snapshot() if is_instance_valid(p) else [])
+	_rpc_snapshot.rpc(snapshot)
+
+
+@rpc("authority", "call_remote", "unreliable_ordered")
+func _rpc_snapshot(snapshot: Array) -> void:
+	if snapshot.size() != _all_players.size():
+		return  # match scene not built yet on this peer (or a stale packet)
+	for i in snapshot.size():
+		var p = _all_players[i]
+		if is_instance_valid(p) and not (snapshot[i] as Array).is_empty():
+			p.apply_net_snapshot(snapshot[i])
+
+
+## Host-side: mirror a player's one-off cosmetic event to every guest.
+func broadcast_player_fx(player_index: int, kind: int, pos_2d: Vector2) -> void:
+	if _is_online_host():
+		_rpc_player_fx.rpc(player_index, kind, pos_2d)
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_player_fx(player_index: int, kind: int, pos_2d: Vector2) -> void:
+	if player_index < 0 or player_index >= _all_players.size():
+		return
+	var p = _all_players[player_index]
+	if is_instance_valid(p):
+		p.play_fx(kind, pos_2d)
+
+
+func _on_net_peer_disconnected(peer_id: int) -> void:
+	# Host: a guest dropped mid-match -- stop replaying its last held input
+	# so its character doesn't keep running/charging forever.
+	if not _is_online_host():
+		return
+	_ready_peers.erase(peer_id)
+	var p: Node = _find_player_by_peer(peer_id)
+	if p != null:
+		p.clear_net_input()
+
+
+## Mid-match loss of the room (host quit, or this peer's own connection
+## dropped): nothing can continue without the host, so tear the match down
+## and go back to the lobby's room browser.
+func _on_match_connection_lost(reason: String) -> void:
+	if not is_online or lobby_mode:
+		return  # lobby.gd handles connection problems before a match starts
+	push_warning("GameManager: online match ended -- %s" % reason)
+	return_to_lobby()
+
+
+func return_to_lobby() -> void:
+	NetworkManager.disconnect_from_room()
+	is_online = false
+	lobby_mode = true
+	_awaiting_ready = false
+	_ready_peers.clear()
+	online_slot_peers = []
+	_all_players.clear()
+	current_state = RoundState.LOBBY
+	# Touch overlays are added under /root (not the match scene) by
+	# player.gd's _ready(), so the scene change below wouldn't free them.
+	for overlay_name in ["VirtualControls", "EnemyPins"]:
+		var overlay: Node = get_tree().root.get_node_or_null(overlay_name)
+		if overlay != null:
+			overlay.queue_free()
+	get_tree().change_scene_to_file("res://scenes/lobby.tscn")

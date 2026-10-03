@@ -1,8 +1,10 @@
 extends Node
-## WebRTC + signaling autoload. Access globally as "NetworkManager".
-## Owns the WebSocket connection to the signaling server and all WebRTCPeerConnections.
-## Drives Godot's high-level multiplayer API (WebRTCMultiplayerPeer) so that RPC and
-## MultiplayerSynchronizer work transparently after pairing completes.
+## Signaling + relay autoload. Access globally as "NetworkManager".
+## Owns the single WebSocket connection to the signaling server. Text frames on
+## it are JSON room/lobby signaling; binary frames are Godot high-level
+## multiplayer traffic tunneled through the server by RelayMultiplayerPeer (see
+## that class's header for why this replaced direct WebRTC), so RPC and
+## MultiplayerSynchronizer work transparently once a room is created/joined.
 
 signal connected_to_room(code: String, peer_id: int)
 signal guest_joined(peer_id: int)
@@ -35,14 +37,14 @@ var _ws_open := false
 var _ws_was_open := false
 var _pending_send: Array = []
 
-var _rtc: WebRTCMultiplayerPeer = null
-var _peer_connections: Dictionary = {}   # peer_id (int) -> WebRTCPeerConnection
+## WebSocket buffer sizes -- the defaults (64 KiB) are sized for signaling
+## only; game traffic from up to MAX_PLAYERS synchronizers + RPCs can burst
+## past that on a slow frame.
+const WS_BUFFER_SIZE := 1 << 20
+
+var _relay: RelayMultiplayerPeer = null
 
 var _http: HTTPRequest = null
-
-
-func _ready() -> void:
-	_rtc = WebRTCMultiplayerPeer.new()
 
 
 func set_signaling_url(url: String) -> void:
@@ -82,10 +84,7 @@ func disconnect_from_room() -> void:
 	_ws_open = false
 	_ws_was_open = false
 	_pending_send.clear()
-	if _rtc != null:
-		_rtc.close()
-	_rtc = WebRTCMultiplayerPeer.new()
-	_peer_connections.clear()
+	_close_relay()
 	is_host = false
 	my_peer_id = 0
 	room_code = ""
@@ -143,6 +142,8 @@ func fetch_rooms() -> void:
 
 func _connect_signaling() -> void:
 	_ws = WebSocketPeer.new()
+	_ws.inbound_buffer_size = WS_BUFFER_SIZE
+	_ws.outbound_buffer_size = WS_BUFFER_SIZE
 	_ws_open = false
 	var err := _ws.connect_to_url(_signaling_url)
 	if err != OK:
@@ -169,7 +170,7 @@ func _flush_pending() -> void:
 
 
 # ---------------------------------------------------------------------------
-# _process — poll WS and RTC every frame
+# _process — poll the WS every frame
 # ---------------------------------------------------------------------------
 
 func _process(_delta: float) -> void:
@@ -182,21 +183,27 @@ func _process(_delta: float) -> void:
 			_ws_was_open = true
 			_flush_pending()
 
-		if ws_state == WebSocketPeer.STATE_CLOSED:
+		# Drain packets before handling a close so frames that arrived just
+		# before the socket closed are still delivered.
+		while _ws != null and _ws.get_available_packet_count() > 0:
+			var packet := _ws.get_packet()
+			if _ws.was_string_packet():
+				var msg: Variant = JSON.parse_string(packet.get_string_from_utf8())
+				if msg is Dictionary:
+					_handle_signal(msg)
+			elif _relay != null:
+				_relay.receive_frame(packet)
+
+		if _ws != null and ws_state == WebSocketPeer.STATE_CLOSED:
 			if _ws_open:
 				_ws_open = false
+				if _relay != null:
+					# Mid-room drop: every remote peer is gone with the socket.
+					_close_relay()
+					emit_signal("connection_failed", "Lost connection to server")
 			elif not _ws_was_open:
 				emit_signal("connection_failed", "Could not reach signaling server")
 				_ws = null
-
-		while _ws != null and _ws.get_available_packet_count() > 0:
-			var raw := _ws.get_packet().get_string_from_utf8()
-			var msg: Variant = JSON.parse_string(raw)
-			if msg is Dictionary:
-				_handle_signal(msg)
-
-	if _rtc != null:
-		_rtc.poll()
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +217,7 @@ func _handle_signal(msg: Dictionary) -> void:
 			room_code = str(msg.get("code", ""))
 			# Add host as first player in local list
 			room_players = [{"username": UsernameManager.username, "peer_id": 1}]
-			var err := _rtc.create_mesh(1)
-			if err != OK:
-				emit_signal("connection_failed", "WebRTCMultiplayerPeer.create_mesh failed: %d" % err)
-				return
-			multiplayer.multiplayer_peer = _rtc
+			_open_relay(1, true)
 			emit_signal("connected_to_room", room_code, 1)
 
 		"joined":
@@ -222,11 +225,8 @@ func _handle_signal(msg: Dictionary) -> void:
 			var joined_settings: Variant = msg.get("settings", null)
 			if joined_settings is Dictionary:
 				room_settings = joined_settings
-			var err := _rtc.create_client(my_peer_id)
-			if err != OK:
-				emit_signal("connection_failed", "WebRTCMultiplayerPeer.create_client failed: %d" % err)
-				return
-			multiplayer.multiplayer_peer = _rtc
+			_open_relay(my_peer_id, false)
+			_relay.add_remote_peer(1)  # guests only ever see the host (star topology)
 			emit_signal("connected_to_room", room_code, my_peer_id)
 
 		"player_list":
@@ -245,39 +245,21 @@ func _handle_signal(msg: Dictionary) -> void:
 			emit_signal("game_starting")
 
 		"host_disconnected":
+			if _relay != null:
+				_relay.remove_remote_peer(1)
 			emit_signal("host_disconnected")
 
 		"guest_joined":
 			var peer_id: int = int(msg.get("peer_id", 0))
 			if peer_id > 0:
-				_create_peer_connection(peer_id, true)
+				if _relay != null:
+					_relay.add_remote_peer(peer_id)
 				emit_signal("guest_joined", peer_id)
-
-		"offer":
-			var peer_id: int = int(msg.get("peer_id", 0))
-			if peer_id > 0:
-				_create_peer_connection(peer_id, false)
-				if _peer_connections.has(peer_id):
-					_peer_connections[peer_id].set_remote_description("offer", str(msg.get("sdp", "")))
-
-		"answer":
-			var peer_id: int = int(msg.get("peer_id", 0))
-			if _peer_connections.has(peer_id):
-				_peer_connections[peer_id].set_remote_description("answer", str(msg.get("sdp", "")))
-
-		"candidate":
-			var peer_id: int = int(msg.get("peer_id", 0))
-			if _peer_connections.has(peer_id):
-				var cand: Variant = msg.get("candidate", {})
-				if cand is Dictionary:
-					_peer_connections[peer_id].add_ice_candidate(
-						str(cand.get("sdpMid", "")),
-						int(cand.get("sdpMLineIndex", 0)),
-						str(cand.get("candidate", ""))
-					)
 
 		"peer_disconnected":
 			var peer_id: int = int(msg.get("peer_id", 0))
+			if _relay != null and is_host:
+				_relay.remove_remote_peer(peer_id)
 			emit_signal("peer_disconnected", peer_id)
 
 		"character_choice":
@@ -329,53 +311,19 @@ func _on_rooms_fetched(result: int, response_code: int, _headers: PackedStringAr
 
 
 # ---------------------------------------------------------------------------
-# WebRTC peer connection management
+# Relay multiplayer peer
 # ---------------------------------------------------------------------------
 
-func _create_peer_connection(peer_id: int, create_offer: bool) -> void:
-	if _peer_connections.has(peer_id):
-		return
-	var pc := WebRTCPeerConnection.new()
-	var init_err := pc.initialize({
-		"iceServers": [
-			{"urls": ["stun:stun.l.google.com:19302"]},
-			{"urls": ["stun:stun1.l.google.com:19302"]},
-		]
-	})
-	if init_err != OK:
-		emit_signal("connection_failed", "WebRTCPeerConnection.initialize failed: %d" % init_err)
-		return
-	pc.session_description_created.connect(_on_sdp_created.bind(peer_id))
-	pc.ice_candidate_created.connect(_on_ice_candidate.bind(peer_id))
-	var add_err := _rtc.add_peer(pc, peer_id)
-	if add_err != OK:
-		emit_signal("connection_failed", "WebRTCMultiplayerPeer.add_peer failed: %d" % add_err)
-		return
-	_peer_connections[peer_id] = pc
-	if create_offer:
-		pc.create_offer()
+func _open_relay(unique_id: int, as_host: bool) -> void:
+	_close_relay()
+	_relay = RelayMultiplayerPeer.new()
+	_relay.setup(_ws, unique_id, as_host)
+	multiplayer.multiplayer_peer = _relay
 
 
-func _on_sdp_created(type: String, sdp: String, target_peer_id: int) -> void:
-	if not _peer_connections.has(target_peer_id):
+func _close_relay() -> void:
+	if _relay == null:
 		return
-	_peer_connections[target_peer_id].set_local_description(type, sdp)
-	_send_signal({
-		"type": type,
-		"code": room_code,
-		"peer_id": target_peer_id,
-		"sdp": sdp
-	})
-
-
-func _on_ice_candidate(mid: String, index: int, candidate: String, target_peer_id: int) -> void:
-	_send_signal({
-		"type": "candidate",
-		"code": room_code,
-		"peer_id": target_peer_id,
-		"candidate": {
-			"sdpMid": mid,
-			"sdpMLineIndex": index,
-			"candidate": candidate
-		}
-	})
+	_relay.close()
+	_relay = null
+	multiplayer.multiplayer_peer = null

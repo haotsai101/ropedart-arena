@@ -2009,6 +2009,9 @@ func _start_online_game() -> void:
 	GameManager.lobby_mode = false
 	var map_id: int = NetworkManager.room_settings.get("map_id", 0)
 	GameManager.selected_map_scene = MAP_SCENES[clampi(map_id, 0, MAP_SCENES.size() - 1)]
+	# Human slot -> peer id mapping, derived identically on every peer (see
+	# GameManager.set_online_slots()); the assignment helpers below read it.
+	GameManager.set_online_slots(NetworkManager.room_players)
 	# Assign characters from peer choices with conflict resolution, then sync.
 	_assign_online_characters()
 	GameManager.sync_characters_rpc()
@@ -2022,13 +2025,14 @@ func _start_online_game() -> void:
 
 func _assign_online_characters() -> void:
 	## Map peer character choices onto player slots, resolving duplicates first-wins.
-	GameManager.assign_default_characters()
+	## Seeded from the room code so every peer derives the same defaults.
+	GameManager.assign_default_characters(hash(NetworkManager.room_code) & 0x7fffffff)
 	var used: Array = []
 	var total: int = GameManager.total_players
 
 	# First pass: apply each peer's choice if available, in player-index order.
 	for i: int in total:
-		var peer_id: int = i + 1
+		var peer_id: int = GameManager.peer_id_for_slot(i)
 		if NetworkManager.peer_characters.has(peer_id):
 			var choice: String = str(NetworkManager.peer_characters[peer_id])
 			if not used.has(choice):
@@ -2043,7 +2047,7 @@ func _assign_online_characters() -> void:
 
 	# Second pass: fix any defaults that collide with chosen chars.
 	for i: int in total:
-		var peer_id: int = i + 1
+		var peer_id: int = GameManager.peer_id_for_slot(i)
 		if not NetworkManager.peer_characters.has(peer_id):
 			var current: String = str(GameManager.player_characters.get(i, "char_barbarian"))
 			if used.count(current) > 1:
@@ -2062,7 +2066,7 @@ func _assign_online_accessories() -> void:
 	## CLAUDE.md's uniqueness note, scoped to the base character only).
 	var total: int = GameManager.total_players
 	for i: int in total:
-		var peer_id: int = i + 1
+		var peer_id: int = GameManager.peer_id_for_slot(i)
 		if NetworkManager.peer_headwear.has(peer_id):
 			GameManager.player_headwear[i] = str(NetworkManager.peer_headwear[peer_id])
 		if NetworkManager.peer_cloth.has(peer_id):

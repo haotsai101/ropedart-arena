@@ -1,6 +1,8 @@
 /**
- * Dartrope Arena — WebRTC Signaling Server (v2)
- * Handles room creation, join, settings, SDP/ICE relay for WebRTC peer negotiation.
+ * Dartrope Arena — Signaling + Relay Server (v3)
+ * Text frames: JSON room creation, join, settings, lobby choices.
+ * Binary frames: Godot high-level multiplayer packets, relayed between room
+ * members (see scripts/relay_multiplayer_peer.gd for the wire format).
  * Deploy on Render.com as a Web Service (Node, npm start).
  */
 
@@ -16,6 +18,7 @@ const USERNAME_TIMEOUT_MS = 5000;
 //   host_username,
 //   host_version,                                 // game build version string declared by the host on "create"
 //   players: [ { socket, username, peer_id } ],  // index 0 = host (peer_id 1)
+//   next_peer_id: 2,                              // monotonic -- ids are never reused after a leave
 //   settings: { max_players: 4, bot_difficulty: 0, map_id: 0 },
 //   started: false
 // }
@@ -89,6 +92,7 @@ function handleMessage(ws, raw) {
         host_username: username,
         host_version,
         players: [{ socket: ws, username, peer_id: 1 }],
+        next_peer_id: 2,
         settings: { max_players, bot_difficulty, map_id },
         started: false,
       };
@@ -127,7 +131,7 @@ function handleMessage(ws, raw) {
         });
         return;
       }
-      const peer_id = room.players.length + 1; // 2, 3, 4, ...
+      const peer_id = room.next_peer_id++;
       const username = ws.username || "Player";
       room.players.push({ socket: ws, username, peer_id });
       ws_meta.set(ws, { code, peer_id });
@@ -143,7 +147,7 @@ function handleMessage(ws, raw) {
       // Broadcast updated player list to everyone in the room
       broadcastToRoom(room, { type: "player_list", players: buildPlayerList(room) });
 
-      // Notify host to initiate WebRTC offer to this guest
+      // Notify host so its relay peer announces this guest (peer_connected)
       send(room.host_socket, { type: "guest_joined", peer_id });
       break;
     }
@@ -189,35 +193,29 @@ function handleMessage(ws, raw) {
       break;
     }
 
-    case "offer":
-    case "answer": {
-      const room = rooms[(msg.code || "").toUpperCase()];
-      if (!room) return;
-      const target = getPeerById(room, msg.peer_id);
-      const meta = ws_meta.get(ws);
-      send(target, {
-        type,
-        peer_id: meta ? meta.peer_id : 0,
-        sdp: msg.sdp,
-      });
-      break;
-    }
-
-    case "candidate": {
-      const room = rooms[(msg.code || "").toUpperCase()];
-      if (!room) return;
-      const target = getPeerById(room, msg.peer_id);
-      const meta = ws_meta.get(ws);
-      send(target, {
-        type: "candidate",
-        peer_id: meta ? meta.peer_id : 0,
-        candidate: msg.candidate,
-      });
-      break;
-    }
-
     default:
       send(ws, { type: "error", message: "Unknown message type: " + type });
+  }
+}
+
+// Binary frame layout: [int32 LE peer][u8 transfer_mode][u8 channel][payload].
+// From a client, `peer` is the target (>0 one peer, 0 all others, <0 all
+// except -peer). We rewrite it to the sender's peer_id before forwarding.
+const RELAY_HEADER_SIZE = 6;
+
+function handleBinary(ws, data) {
+  const meta = ws_meta.get(ws);
+  if (!meta) return;
+  const room = rooms[meta.code];
+  if (!room || data.length < RELAY_HEADER_SIZE) return;
+  const target = data.readInt32LE(0);
+  const out = Buffer.from(data); // copy so the rewrite never touches ws's own buffer
+  out.writeInt32LE(meta.peer_id, 0);
+  for (const p of room.players) {
+    if (p.peer_id === meta.peer_id) continue;
+    if (target > 0 && p.peer_id !== target) continue;
+    if (target < 0 && p.peer_id === -target) continue;
+    if (p.socket.readyState === p.socket.OPEN) p.socket.send(out, { binary: true });
   }
 }
 
@@ -282,7 +280,10 @@ wss.on("connection", (ws) => {
     }
   }, USERNAME_TIMEOUT_MS);
 
-  ws.on("message", (data) => handleMessage(ws, data.toString()));
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) handleBinary(ws, data);
+    else handleMessage(ws, data.toString());
+  });
   ws.on("close", () => {
     if (ws._username_timer) clearTimeout(ws._username_timer);
     handleDisconnect(ws);
@@ -295,5 +296,5 @@ wss.on("connection", (ws) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`Dartrope signaling server v2 listening on port ${PORT}`);
+  console.log(`Dartrope signaling/relay server v3 listening on port ${PORT}`);
 });

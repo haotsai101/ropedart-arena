@@ -52,7 +52,7 @@ func _process(_delta: float) -> void:
 
 func _find_local_player() -> Node:
 	for p in get_tree().get_nodes_in_group("players"):
-		if p.player_index == 0 and not p.is_bot:
+		if p.is_primary_local_player():
 			return p
 	return null
 

@@ -7,8 +7,6 @@ extends Node
 ##   - MELEE_RANGE widened 1.4 -> 1.8 (mirrored in bot_controller.gd).
 ##   - An eliminated player's dart (a scene-tree sibling, not a child) is
 ##     hidden on _eliminate() and re-shown by the next reset_for_round().
-##   - A network-controlled player's invuln window still expires (it early-
-##     returns out of _physics_process() before local input is read).
 ##
 ## Drives player.gd's real _physics_process through the actual scene tree,
 ## same approach as test_dart_phase2_combat.gd. Run this scene directly (F6)
@@ -30,7 +28,6 @@ func _run() -> void:
 	await _test_midround_respawn_protection()
 	await _test_melee_range()
 	await _test_eliminated_dart_hidden_then_restored()
-	await _test_network_controlled_invuln_expires()
 	_test_bot_melee_range_mirrors_player()
 
 	print("[spawn protection test] %s" % ("ALL PASSED" if not any_failure else "FAILURES FOUND -- see above"))
@@ -164,23 +161,6 @@ func _test_eliminated_dart_hidden_then_restored() -> void:
 			_fail(label, "dart still hidden after reset_for_round()")
 		else:
 			_pass(label)
-	p.queue_free()
-	await _frames(1)
-
-
-## E: a network-controlled player (e.g. a remote human on the host) must
-## still come out of spawn protection -- otherwise they'd be untargetable
-## for the whole online round.
-func _test_network_controlled_invuln_expires() -> void:
-	var label := "E: network-controlled player's protection expires"
-	var p = _make_player(Vector3(0, 0.7, 0))
-	p.is_network_controlled = true
-	p.reset_for_round(Vector3(0, 0.7, 0))
-	await _frames(SETTLE_FRAMES)
-	if p.is_dead:
-		_fail(label, "is_dead still true after %d frames -- permanently untargetable" % SETTLE_FRAMES)
-	else:
-		_pass(label)
 	p.queue_free()
 	await _frames(1)
 
