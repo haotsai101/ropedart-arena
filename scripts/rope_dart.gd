@@ -224,6 +224,10 @@ var _recall_time: float = 0.0
 ## extra cap", falling back to the plain rope_length clamp, exactly like
 ## begin_swing_redirect()'s own max_travel_distance <= 0.0 case.
 var _swing_effective_range: float = INF
+## Guest prediction replay in progress (see player.gd _reconcile_prediction()):
+## state transitions run for their gameplay effect only -- no SFX, sparks or
+## fall visuals, which the live predicted tick already played once.
+var silent: bool = false
 
 @onready var head_mesh: MeshInstance3D = $Head
 @onready var rope_mesh: MultiMeshInstance3D = $RopeLine
@@ -472,6 +476,38 @@ func _is_net_guest() -> bool:
 	return owner_player != null and is_instance_valid(owner_player) and not owner_player.is_sim_authority()
 
 
+## Guest-side client prediction of our OWN dart (driven by player.gd's
+## _predict_tick(), once per input, after the player's own predicted tick --
+## the host's order). Same travel as _physics_process() minus
+## _check_player_hits(): hits and kills are only ever decided by the host.
+func predict_tick(delta: float) -> void:
+	match state:
+		State.CHARGING:
+			_charge_time = minf(_charge_time + delta, max_charge_time)
+		State.FLYING, State.SWINGING:
+			_process_flying(delta)
+		State.RETURNING:
+			_process_returning(delta)
+
+
+## Guest-side: rewind our predicted dart to the host's acked state before
+## player.gd replays the unacked inputs on top of it. Silent -- feedback for
+## state changes was already played by the live predicted tick.
+func restore_net_prediction(new_state: int, new_pos: Vector2, new_dir: Vector2, flight_speed: float,
+		charge_time: float, recall_time: float, swing_range: float) -> void:
+	if (new_state == State.HOLSTERED or new_state == State.CHARGING) and state != new_state:
+		_wrap_state.clear()
+	state = new_state
+	pos_2d = new_pos
+	dir_2d = new_dir
+	_flight_speed = flight_speed
+	_charge_time = charge_time
+	_recall_time = recall_time
+	_swing_effective_range = swing_range
+	if state != State.HOLSTERED and state != State.CHARGING:
+		global_position = Vector3(pos_2d.x, PLANE_Y, pos_2d.y)
+
+
 func get_charge_time() -> float:
 	return _charge_time
 
@@ -536,7 +572,8 @@ func release_throw(throw_dir: Vector2) -> void:
 		pos_2d = owner_player.get_pos_2d() + dir_2d * launch_forward_offset
 	global_position = Vector3(pos_2d.x, PLANE_Y, pos_2d.y)
 	state = State.FLYING
-	Sfx.play_throw(charge_ratio)
+	if not silent:
+		Sfx.play_throw(charge_ratio)
 	state_changed.emit(state)
 
 
@@ -639,6 +676,9 @@ func _embed_in_place() -> void:
 	# comment on being the single choke point every EMBEDDED transition
 	# passes through), so a SWINGING redirect landing gets the same feedback
 	# as a fresh throw's own embed.
+	if silent:
+		state_changed.emit(state)
+		return  # replaying a prediction: the live tick already did the feedback below
 	Sfx.play_impact()
 	_spawn_impact_sparks()
 	# Task #36: re-evaluate the fall visual fresh on EVERY embed (this is the
@@ -900,14 +940,16 @@ func begin_recall() -> void:
 	# carry the sunken visual into active flight" reasoning as
 	# begin_swing_redirect() above (RETURNING renders the dart flying back
 	# toward the hand; it must not still read as sunk while doing so).
-	_reset_dart_fall_visual()
+	if not silent:
+		_reset_dart_fall_visual()
 	state = State.RETURNING
 	_recall_time = 0.0
 	# Task #34: play immediately on the tap/release that starts the recall
 	# (instant feedback), then _process_returning() below repeats this
 	# periodically -- own timer reset here so a recall interrupted right after
 	# a previous one doesn't inherit a stale near-zero countdown.
-	Sfx.play_recall(0.0)
+	if not silent:
+		Sfx.play_recall(0.0)
 	_recall_sfx_timer = 0.3
 	# Own state key ("returning") -- see _wrap_state's header comment.
 	#
@@ -997,7 +1039,7 @@ func _process_returning(delta: float) -> void:
 	# repeatedly repositioning far from the dart) still caps out instead of
 	# climbing unboundedly.
 	_recall_sfx_timer -= delta
-	if _recall_sfx_timer <= 0.0:
+	if _recall_sfx_timer <= 0.0 and not silent:
 		var ramp_ratio: float = clampf(_recall_time / 2.0, 0.0, 1.0)
 		Sfx.play_recall(ramp_ratio)
 		_recall_sfx_timer = lerp(0.32, 0.14, ramp_ratio)

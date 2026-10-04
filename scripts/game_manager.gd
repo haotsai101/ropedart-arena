@@ -60,13 +60,14 @@ var _all_players: Array = []
 var _timer: float = 0.0
 
 # --- Online match sync (host-authoritative) ---------------------------------
-# The host simulates every player, dart and bot; guests only send their own
-# input (_rpc_input) and render what the host broadcasts: a full state
-# snapshot every physics tick (_rpc_snapshot) plus one-off cosmetic events
-# (_rpc_player_fx). All of these RPCs live on this autoload rather than on
-# player/dart nodes so they always resolve, even while a peer is still
-# loading the match scene (packets for a scene that isn't built yet are
-# simply ignored -- see _rpc_snapshot()).
+# The host simulates every player, dart and bot; guests send their own input
+# and render what the host broadcasts. Per-tick traffic is raw NetCodec
+# packets (see _on_game_packet()): guest input, a full state snapshot to all
+# guests, and each guest's own replayable state for its client-side
+# prediction. One-off cosmetic events stay reliable RPCs (_rpc_player_fx).
+# All of this lives on this autoload rather than on player/dart nodes so it
+# always resolves, even while a peer is still loading the match scene
+# (packets for a scene that isn't built yet are simply ignored).
 
 ## Human slot -> owning peer id, in slot order (host first). Slots beyond
 ## this array are bots. Set by set_online_slots() from the lobby's
@@ -223,6 +224,9 @@ const _FALLBACK_SPAWNS := [
 
 
 func _ready() -> void:
+	# Run _physics_process after the players have simulated this tick, so the
+	# host's snapshot carries this tick's state rather than the previous one.
+	process_physics_priority = 100
 	call_deferred("_init_game")
 	multiplayer.peer_disconnected.connect(_on_net_peer_disconnected)
 	# Deferred: NetworkManager is a later autoload, not in the tree yet here.
@@ -230,6 +234,7 @@ func _ready() -> void:
 
 
 func _connect_network_signals() -> void:
+	NetworkManager.game_packet.connect(_on_game_packet)
 	NetworkManager.host_disconnected.connect(func(): _on_match_connection_lost("Host left the game"))
 	NetworkManager.connection_failed.connect(_on_match_connection_lost)
 
@@ -616,18 +621,12 @@ func _rpc_round_reset(countdown: float) -> void:
 
 
 ## Guest -> host, every physics tick, for the guest's own player only.
-## `buttons` is a bitfield -- see player.gd's NET_BTN_* constants.
-@rpc("any_peer", "call_remote", "unreliable_ordered")
-func _rpc_input(move: Vector2, aim: Vector2, buttons: int) -> void:
-	if not multiplayer.is_server():
-		return
-	var p: Node = _find_player_by_peer(multiplayer.get_remote_sender_id())
-	if p != null:
-		p.push_net_input(move, aim, buttons)
-
-
-func send_local_input(move: Vector2, aim: Vector2, buttons: int) -> void:
-	_rpc_input.rpc_id(1, move, aim, buttons)
+## `buttons` is a bitfield -- see player.gd's NET_BTN_* constants. `seq`
+## numbers the input so the host can ack it (see the own-state packet).
+## `move`/`aim` must already be NetCodec.quantize_input()-ed: the guest
+## predicts with exactly what the host decodes.
+func send_local_input(seq: int, move: Vector2, aim: Vector2, buttons: int) -> void:
+	NetworkManager.send_game_packet(1, NetCodec.encode_input(seq, move, aim, buttons))
 
 
 func _physics_process(_delta: float) -> void:
@@ -636,17 +635,44 @@ func _physics_process(_delta: float) -> void:
 	var snapshot: Array = []
 	for p in _all_players:
 		snapshot.append(p.get_net_snapshot() if is_instance_valid(p) else [])
-	_rpc_snapshot.rpc(snapshot)
+	NetworkManager.send_game_packet(0, NetCodec.encode_snapshot(snapshot))
+	# Each guest also gets its own player's ack'd state, which its client-side
+	# prediction reconciles against (player.gd _net_guest_tick()).
+	var peers: PackedInt32Array = multiplayer.get_peers()
+	for p in _all_players:
+		if is_instance_valid(p) and not p.is_bot and p.player_peer_id != 1 \
+				and peers.has(p.player_peer_id):
+			NetworkManager.send_game_packet(p.player_peer_id, NetCodec.encode_own_state(p.get_net_own_state()))
 
 
-@rpc("authority", "call_remote", "unreliable_ordered")
-func _rpc_snapshot(snapshot: Array) -> void:
-	if snapshot.size() != _all_players.size():
-		return  # match scene not built yet on this peer (or a stale packet)
-	for i in snapshot.size():
-		var p = _all_players[i]
-		if is_instance_valid(p) and not (snapshot[i] as Array).is_empty():
-			p.apply_net_snapshot(snapshot[i])
+func _on_game_packet(from: int, data: PackedByteArray) -> void:
+	if data.is_empty() or not is_online:
+		return
+	match data[0]:
+		NetCodec.PKT_INPUT:
+			if not _is_online_host():
+				return
+			var inp: Array = NetCodec.decode_input(data)
+			var p: Node = _find_player_by_peer(from)
+			if not inp.is_empty() and p != null:
+				p.push_net_input(inp[0], inp[1], inp[2], inp[3])
+		NetCodec.PKT_SNAPSHOT:
+			if from != 1:
+				return
+			var snapshot: Array = NetCodec.decode_snapshot(data)
+			if snapshot.size() != _all_players.size():
+				return  # match scene not built yet on this peer (or malformed)
+			for i in snapshot.size():
+				var p = _all_players[i]
+				if is_instance_valid(p) and not (snapshot[i] as Array).is_empty():
+					p.apply_net_snapshot(snapshot[i])
+		NetCodec.PKT_OWN_STATE:
+			if from != 1:
+				return
+			var state: Array = NetCodec.decode_own_state(data)
+			var p: Node = _find_player_by_peer(multiplayer.get_unique_id())
+			if not state.is_empty() and p != null:
+				p.apply_net_own_state(state)
 
 
 ## Host-side: mirror a player's one-off cosmetic event to every guest.
@@ -661,7 +687,7 @@ func _rpc_player_fx(player_index: int, kind: int, pos_2d: Vector2) -> void:
 		return
 	var p = _all_players[player_index]
 	if is_instance_valid(p):
-		p.play_fx(kind, pos_2d)
+		p.play_host_fx(kind, pos_2d)
 
 
 func _on_net_peer_disconnected(peer_id: int) -> void:

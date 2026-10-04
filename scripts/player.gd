@@ -421,10 +421,25 @@ const NET_FLAG_ELIMINATED := 2
 const NET_FLAG_DASHING := 4
 ## One-off cosmetic events mirrored host -> guests (see _fx()/play_fx()).
 enum Fx { DASH, SLASH, KICK, KILL, TRIP, FALL }
-## Host-side cap on queued guest input frames (~100ms at 60Hz): frames are
-## consumed one per physics tick so short taps survive network bunching, but
-## a backlog beyond this is dropped oldest-first to keep input latency bounded.
-const NET_INPUT_MAX_QUEUE := 6
+## Host-side: guest input frames are simulated one movement step each, all
+## of a tick's arrivals in that tick (no queueing delay -- a standing backlog
+## measured 5-6 frames = ~90ms of input lag). A burst beyond this many per
+## tick (a long network stall) is collapsed: the oldest frames are skipped,
+## their buttons OR-ed in so taps survive, and the guest's prediction gets
+## corrected by the next own-state.
+const NET_INPUT_MAX_STEPS_PER_TICK := 6
+## Guest-side prediction: unacknowledged inputs kept for replay (~1s at
+## 60Hz; anything older means the host stopped acking -- drop it).
+const NET_PRED_MAX_HISTORY := 60
+## Guest-side: how fast the visual correction offset left by a
+## reconciliation decays (per second), and the error beyond which a
+## correction snaps instead (respawn-sized jumps).
+const NET_PRED_SMOOTH_RATE := 12.0
+## Guest-side: how long a locally predicted Fx waits for the host's mirrored
+## copy to be swallowed (a misprediction the host never echoes expires).
+const NET_PRED_FX_WINDOW_MS := 1000
+## Host-side clamp on _net_dart_lead (a long stall's worth of ticks).
+const NET_DART_LEAD_MAX := 8
 ## Guest-side: how fast a rendered player closes the gap to the latest host
 ## snapshot position, and the gap beyond which it snaps instead (respawns,
 ## round resets -- anything that's a teleport on the host).
@@ -485,11 +500,29 @@ var _combat_anim_active: bool = false
 var _combat_anim_timer: float = 0.0
 var _lunge_tween: Tween = null
 
-# Host-side: a remote human's queued input frames ([move, aim, buttons]),
-# filled by push_net_input() and consumed one per tick into _net_frame, which
-# the _get_*_input() getters read instead of local devices.
+# Host-side: a remote human's queued input frames ([move, aim, buttons, seq]),
+# filled by push_net_input() and drained each tick by _take_net_inputs() into
+# _net_frame, which the _get_*_input() getters read instead of local devices.
 var _net_queue: Array = []
-var _net_frame: Array = [Vector2.ZERO, Vector2.ZERO, 0]
+var _net_frame: Array = [Vector2.ZERO, Vector2.ZERO, 0, 0]
+## Host-side: sequence number of the last guest input simulated (sent back to
+## that guest in its own-state so it knows which inputs to replay).
+var _net_ack_seq: int = 0
+## Host-side: host dart ticks minus guest inputs simulated (network jitter
+## makes some ticks consume 0 inputs and others 2).
+var _net_dart_lead: int = 0
+## Guest-side prediction state for our own player (see _net_guest_tick()).
+var _pred_seq: int = 0
+var _pred_history: Array = []          # [seq, move, dash_held, locked], unacked
+var _pred_pending: Array = []          # latest own-state from the host, not yet reconciled
+var _pred_active: bool = false         # predicting right now (vs following the host)
+var _pred_replaying: bool = false      # inside _reconcile_prediction()'s replay
+var _pred_fx_pending: Array = []       # [Fx kind, msec] played locally, host echo not seen yet
+var _pred_momentum_dash: bool = false  # predicted dash is an EMBEDDED momentum release
+var _pred_visual_offset: Vector3 = Vector3.ZERO
+## Diagnostics (read by tests/test_net_probe.gd): reconciliation error sizes.
+var pred_corrections: Array = []
+var pred_dart_corrections: Array = []
 # Guest-side: latest host snapshot position this player is gliding toward.
 var _net_target_pos: Vector3 = Vector3.ZERO
 var _has_net_target: bool = false
@@ -590,52 +623,261 @@ func _reads_primary_input() -> bool:
 	return _is_online() or player_index == 0
 
 
-func push_net_input(move: Vector2, aim: Vector2, buttons: int) -> void:
-	_net_queue.append([move, aim, buttons])
-	while _net_queue.size() > NET_INPUT_MAX_QUEUE:
-		_net_queue.pop_front()
+func push_net_input(seq: int, move: Vector2, aim: Vector2, buttons: int) -> void:
+	if seq <= _net_ack_seq and seq != 0:
+		return  # stale/duplicate
+	_net_queue.append([move, aim, buttons, seq])
 
 
 func clear_net_input() -> void:
 	_net_queue.clear()
-	_net_frame = [Vector2.ZERO, Vector2.ZERO, 0]
+	_net_frame = [Vector2.ZERO, Vector2.ZERO, 0, _net_ack_seq]
 
 
-func _consume_net_input() -> void:
-	# An empty queue keeps the previous frame -- a late packet then reads as
-	# "still holding the same input", not a spurious release.
-	if not _net_queue.is_empty():
-		_net_frame = _net_queue.pop_front()
+## Host-side: this tick's guest input frames, oldest first, each to be
+## simulated as one movement step. Empty when nothing arrived this tick: the
+## player then doesn't move (the guest's prediction only advances per input
+## it sent) and the throw/melee handlers keep reading the previous frame, so
+## a late packet reads as "still holding", not a spurious release.
+func _take_net_inputs() -> Array:
+	if _net_queue.is_empty():
+		return []
+	var skipped_buttons: int = 0
+	while _net_queue.size() > NET_INPUT_MAX_STEPS_PER_TICK:
+		skipped_buttons |= int(_net_queue.pop_front()[2])
+	var frames: Array = _net_queue.duplicate()
+	_net_queue.clear()
+	if skipped_buttons != 0:
+		frames[0] = [frames[0][0], frames[0][1], int(frames[0][2]) | skipped_buttons, frames[0][3]]
+	var last: Array = frames[frames.size() - 1]
+	_net_frame = last
+	_net_ack_seq = int(last[3])
+	return frames
 
 
 func _net_button(bit: int) -> bool:
 	return (int(_net_frame[2]) & bit) != 0
 
 
-## Guest-side physics tick: no simulation at all (the host's snapshots drive
-## this player), just ship this device's input for our own player.
+## Guest-side physics tick. Other players: nothing (host snapshots drive
+## them). Our own player: ship this tick's input, and predict its result
+## locally instead of waiting a round trip -- movement/dash (_step_movement()),
+## our own dart (charge, throw, flight, tap-recall) and our Slash/Kick/Dash
+## feedback -- running the same code the host will run for that input. The
+## host's own-state (apply_net_own_state()) is reconciled first: rewind to it,
+## replay the inputs it hasn't simulated yet. Hits, kills and every effect on
+## OTHER players stay host-only.
 func _net_guest_tick() -> void:
 	if not is_primary_local_player():
 		return
-	var move_in: Vector2 = _get_move_input()
-	var aim_in: Vector2 = _get_aim_input()
+	# Quantized exactly as the host will decode it, so both sides simulate
+	# identical inputs.
+	var move_in: Vector2 = NetCodec.quantize_input(_get_move_input())
+	var aim_in: Vector2 = NetCodec.quantize_input(_get_aim_input())
+	var dash_held: bool = _get_dash_pressed()
+	var action_held: bool = _get_action_held()
+	var melee_held: bool = _get_melee_action_held()
 	var buttons: int = 0
-	if _get_dash_pressed():
+	if dash_held:
 		buttons |= NET_BTN_DASH
-	if _get_action_held():
+	if action_held:
 		buttons |= NET_BTN_ACTION
-	if _get_melee_action_held():
+	if melee_held:
 		buttons |= NET_BTN_MELEE
-	GameManager.send_local_input(move_in, aim_in, buttons)
-	# Aim locally right away instead of waiting a round trip for the host's
-	# snapshot (apply_net_snapshot() skips aim_dir for our own player) -- same
-	# rule as _physics_process's own aim block.
+	_pred_seq += 1
+	GameManager.send_local_input(_pred_seq, move_in, aim_in, buttons)
+	var new_aim: Vector2 = _aim_from_input(move_in, aim_in)
+
+	if not _pred_pending.is_empty():
+		_reconcile_prediction()
+	if not _pred_active or is_falling or is_eliminated \
+			or GameManager.current_state != GameManager.RoundState.PLAYING:
+		_pred_history.clear()
+		_set_aim(new_aim)  # aim still shows locally while frozen
+		return
+	var entry: Array = [_pred_seq, move_in, dash_held, action_held, melee_held, new_aim]
+	_pred_history.append(entry)
+	if _pred_history.size() > NET_PRED_MAX_HISTORY:
+		_pred_history.pop_front()
+	_predict_tick(entry, get_physics_process_delta_time())
+
+
+## The host's aim rule (_physics_process's aim block) for one input.
+func _aim_from_input(move_in: Vector2, aim_in: Vector2) -> Vector2:
 	if aim_in.length() > DEADZONE:
-		aim_dir = aim_in.normalized()
-	elif move_in.length() > DEADZONE:
-		aim_dir = move_in.normalized()
+		return aim_in.normalized()
+	if move_in.length() > DEADZONE:
+		return move_in.normalized()
+	return aim_dir
+
+
+func _set_aim(dir: Vector2) -> void:
+	aim_dir = dir
 	if aim_indicator != null:
 		aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
+
+
+## One predicted tick for history entry [seq, move, dash, action, melee, aim],
+## in the host's per-tick order: melee cooldown, movement, aim, throw/recall
+## and melee handlers, then the dart's own physics tick. Live (not replaying)
+## ticks also fire this player's feedback immediately (_predict_fx()).
+func _predict_tick(h: Array, dt: float, tick_dart: bool = true) -> void:
+	if _melee_cooldown_timer > 0.0:
+		_melee_cooldown_timer -= dt
+	_step_movement(h[1], h[2], _host_movement_locked(), dt, true)
+	_set_aim(h[5])
+	var dart_ok: bool = dart != null and is_instance_valid(dart)
+	var action_held: bool = h[3]
+	if dart_ok:
+		# _handle_throw_input() + the FLYING/SWINGING tap-recall half of
+		# _handle_dart_away_input(). Releasing an EMBEDDED hold (recall vs
+		# redirect) is left to the host -- only the hold's movement lock is
+		# mirrored here.
+		var rising: bool = action_held and not _prev_throw_held
+		match dart.state:
+			DART_STATE_HOLSTERED:
+				if rising:
+					dart.begin_charge()
+			DART_STATE_CHARGING:
+				if not action_held and _prev_throw_held:
+					dart.release_throw(aim_dir)
+			DART_STATE_FLYING, DART_STATE_SWINGING:
+				if rising:
+					dart.begin_recall()
+			DART_STATE_EMBEDDED:
+				_embedded_hold_active = action_held
+	_prev_throw_held = action_held
+	_prev_recall_held = action_held
+	var melee_held: bool = h[4]
+	if melee_held and not _prev_melee_held and _melee_cooldown_timer <= 0.0 and dart_ok:
+		_melee_cooldown_timer = MELEE_COOLDOWN
+		if not _pred_replaying:
+			var in_hand: bool = dart.state == DART_STATE_HOLSTERED or dart.state == DART_STATE_CHARGING
+			_predict_fx(Fx.SLASH if in_hand else Fx.KICK)
+	_prev_melee_held = melee_held
+	if dart_ok and tick_dart:
+		dart.predict_tick(dt)
+
+
+## Guest-side: play our own feedback now and remember it, so the host's
+## mirrored copy of the same event (play_host_fx()) is skipped, not doubled.
+func _predict_fx(kind: int) -> void:
+	play_fx(kind)
+	_pred_fx_pending.append([kind, Time.get_ticks_msec()])
+
+
+## Entry point for host-mirrored cosmetic events (GameManager._rpc_player_fx).
+func play_host_fx(kind: int, pos_2d: Vector2 = Vector2.ZERO) -> void:
+	var now: int = Time.get_ticks_msec()
+	_pred_fx_pending = _pred_fx_pending.filter(func(e: Array) -> bool: return now - int(e[1]) < NET_PRED_FX_WINDOW_MS)
+	for i in _pred_fx_pending.size():
+		if int(_pred_fx_pending[i][0]) == kind:
+			_pred_fx_pending.remove_at(i)
+			return  # already played when we predicted it
+	play_fx(kind, pos_2d)
+
+
+## Host-side: the state a guest needs to replay its own unacked inputs from
+## (sent only to that guest, every tick -- see GameManager / NetCodec):
+## [0 ack_seq, 1 can_move, 2 position, 3 velocity, 4 is_dashing,
+##  5 dash_timer, 6 dash_cooldown, 7 dash_dir, 8 dash_speed, 9 prev_dash,
+##  10 knockback_timer, 11 knockback_dir, 12 trip_timer, 13 melee_cooldown,
+##  14 dart_state, 15 dart_pos, 16 dart_dir, 17 dart_flight_speed,
+##  18 dart_charge_time, 19 dart_recall_time, 20 dart_swing_range,
+##  21 embedded_hold_active, 22 prev_action_held, 23 prev_melee_held,
+##  24 dart_lead (host dart ticks ahead of the acked input, may be < 0)]
+func get_net_own_state() -> Array:
+	var can_move: bool = not is_falling and not is_eliminated and _invuln_timer <= 0.0 \
+		and GameManager.current_state == GameManager.RoundState.PLAYING
+	var d_ok: bool = dart != null and is_instance_valid(dart)
+	return [
+		_net_ack_seq, can_move, global_position, velocity, _is_dashing, _dash_timer,
+		_dash_cooldown_timer, _dash_dir, _dash_speed, _prev_dash, _knockback_timer,
+		_knockback_dir, _trip_timer, _melee_cooldown_timer,
+		dart.state if d_ok else -1,
+		dart.pos_2d if d_ok else Vector2.ZERO,
+		dart.dir_2d if d_ok else Vector2.ZERO,
+		dart._flight_speed if d_ok else 0.0,
+		dart._charge_time if d_ok else 0.0,
+		dart._recall_time if d_ok else 0.0,
+		dart._swing_effective_range if d_ok else INF,
+		_embedded_hold_active, _prev_throw_held, _prev_melee_held, _net_dart_lead,
+	]
+
+
+## Guest-side: keep only the newest own-state; _net_guest_tick() reconciles it.
+func apply_net_own_state(state: Array) -> void:
+	_pred_pending = state
+
+
+func _reconcile_prediction() -> void:
+	var st: Array = _pred_pending
+	_pred_pending = []
+	var ack: int = int(st[0])
+	while not _pred_history.is_empty() and int(_pred_history[0][0]) <= ack:
+		_pred_history.pop_front()
+	var host_pos: Vector3 = st[2]
+	_net_target_pos = host_pos
+	_has_net_target = true
+	if not bool(st[1]):
+		# Host has us frozen (spawn protection, round countdown, falling,
+		# eliminated): follow its position (and dart) like any other player.
+		_pred_active = false
+		return
+	var shown_pos: Vector3 = global_position
+	var dart_ok: bool = dart != null and is_instance_valid(dart)
+	var shown_dart: Vector2 = dart.pos_2d if dart_ok else Vector2.ZERO
+	var shown_dart_state: int = dart.state if dart_ok else -1
+	global_position = host_pos
+	velocity = st[3]
+	_is_dashing = bool(st[4])
+	_dash_timer = float(st[5])
+	_dash_cooldown_timer = float(st[6])
+	_dash_dir = st[7]
+	_dash_speed = float(st[8])
+	_prev_dash = bool(st[9])
+	_knockback_timer = float(st[10])
+	_knockback_dir = st[11]
+	_trip_timer = float(st[12])
+	_melee_cooldown_timer = float(st[13])
+	_embedded_hold_active = bool(st[21])
+	_prev_throw_held = bool(st[22])
+	_prev_recall_held = _prev_throw_held
+	_prev_melee_held = bool(st[23])
+	if not _is_dashing:
+		_pred_momentum_dash = false
+	if dart_ok and int(st[14]) >= 0:
+		dart.restore_net_prediction(int(st[14]), st[15], st[16], float(st[17]), float(st[18]), float(st[19]), float(st[20]))
+	var dt: float = get_physics_process_delta_time()
+	_pred_replaying = true
+	if dart_ok:
+		dart.silent = true
+	# Align the host's dart (ticked per host tick) with our per-input replay:
+	# a dart already `lead` ticks ahead of the acked input skips that many
+	# replayed dart ticks; one that's behind catches up first.
+	var dart_skip: int = int(st[24])
+	if dart_ok:
+		for i in range(dart_skip, 0):
+			dart.predict_tick(dt)
+	for h: Array in _pred_history:
+		_predict_tick(h, dt, dart_skip <= 0)
+		dart_skip -= 1
+	_pred_replaying = false
+	if dart_ok:
+		dart.silent = false
+	var err: Vector3 = shown_pos - global_position
+	if not _pred_active or err.length() > NET_SNAP_DISTANCE:
+		_pred_visual_offset = Vector3.ZERO  # resuming / teleport: no blend
+	else:
+		_pred_visual_offset += err
+		if err.length() > 0.01:
+			pred_corrections.append(err.length())
+	if _pred_active and dart_ok and dart.state == shown_dart_state \
+			and dart.state != DART_STATE_HOLSTERED and dart.state != DART_STATE_CHARGING:
+		var dart_err: float = shown_dart.distance_to(dart.pos_2d)
+		if dart_err > 0.01:
+			pred_dart_corrections.append(dart_err)
+	_pred_active = true
 
 
 ## Host-side: this player's replicated state, one entry of GameManager's
@@ -660,12 +902,16 @@ func get_net_snapshot() -> Array:
 
 ## Guest-side: apply one host snapshot entry (see get_net_snapshot()).
 func apply_net_snapshot(snap: Array) -> void:
-	var pos: Vector3 = snap[0]
-	_net_target_pos = pos
-	if not _has_net_target or global_position.distance_to(pos) > NET_SNAP_DISTANCE:
-		global_position = pos
-	_has_net_target = true
-	velocity = snap[1]
+	var predicted: bool = _pred_active and is_primary_local_player()
+	if not predicted:
+		# Our own predicted player's movement state comes from
+		# apply_net_own_state() instead (ack'd, replayable).
+		var pos: Vector3 = snap[0]
+		_net_target_pos = pos
+		if not _has_net_target or global_position.distance_to(pos) > NET_SNAP_DISTANCE:
+			global_position = pos
+		_has_net_target = true
+		velocity = snap[1]
 	if not is_primary_local_player():
 		aim_dir = snap[2]
 		if aim_indicator != null:
@@ -676,11 +922,11 @@ func apply_net_snapshot(snap: Array) -> void:
 	if (flags & NET_FLAG_ELIMINATED) != 0 and not is_eliminated:
 		_eliminate()
 	var dashing: bool = (flags & NET_FLAG_DASHING) != 0
-	if dashing != _is_dashing:
+	if not predicted and dashing != _is_dashing:
 		_is_dashing = dashing
 		if not dashing and _dash_trail != null:
 			_dash_trail.emitting = false
-	if dart != null and is_instance_valid(dart) and int(snap[5]) >= 0:
+	if not predicted and dart != null and is_instance_valid(dart) and int(snap[5]) >= 0:
 		dart.apply_net_state(int(snap[5]), snap[6], snap[7], float(snap[8]))
 
 
@@ -867,8 +1113,9 @@ func _play_anim(anim_name: String, speed: float = 1.0, force: bool = false) -> v
 func _process(delta: float) -> void:
 	# Online guest: glide toward the latest host snapshot position (see
 	# apply_net_snapshot(), which snaps instead for teleport-sized gaps).
-	if _has_net_target and not is_sim_authority():
+	if _has_net_target and not is_sim_authority() and not _pred_active:
 		global_position = global_position.lerp(_net_target_pos, clampf(NET_INTERP_RATE * delta, 0.0, 1.0))
+	_apply_pred_visual_offset(delta)
 	# Smooth speed ratio toward current velocity magnitude (0.0–1.0)
 	var speed_ratio: float = velocity.length() / move_speed
 	_move_speed_smooth = lerp(_move_speed_smooth, speed_ratio, 10.0 * delta)
@@ -938,14 +1185,38 @@ func _process(delta: float) -> void:
 			_run_bob_time = lerp(_run_bob_time, 0.0, 5.0 * delta)
 
 
+## Guest-side: a reconciliation moves our predicted body instantly; the mesh
+## is shifted back by the same amount and eased in, so small corrections
+## don't read as a pop. Skipped while the kick lunge tween owns the mesh's x/z.
+func _apply_pred_visual_offset(delta: float) -> void:
+	if player_mesh == null or is_falling or (_pred_visual_offset == Vector3.ZERO and not _pred_active):
+		return
+	_pred_visual_offset = _pred_visual_offset.lerp(Vector3.ZERO, clampf(NET_PRED_SMOOTH_RATE * delta, 0.0, 1.0))
+	if _pred_visual_offset.length() < 0.001:
+		_pred_visual_offset = Vector3.ZERO
+	if _lunge_tween != null and _lunge_tween.is_running():
+		return
+	player_mesh.position.x = _pred_visual_offset.x
+	player_mesh.position.z = _pred_visual_offset.z
+
+
 func _physics_process(delta: float) -> void:
 	if not is_sim_authority():
 		_net_guest_tick()
 		return
+	var net_frames: Array = []
 	if _uses_net_input():
-		# Consume every tick, even through the early-returns below, so a
-		# backlog never builds up while this player can't act.
-		_consume_net_input()
+		# Take every tick, even through the early-returns below, so a backlog
+		# never builds up (and acks keep advancing) while this player can't act.
+		net_frames = _take_net_inputs()
+		# Our dart ticks once per host tick, but the guest's prediction ticks
+		# it once per input: track how far ahead of the inputs it is (see
+		# get_net_own_state()'s dart_lead).
+		# Only meaningful while the dart is out (charging/away); zeroed in hand.
+		if dart != null and is_instance_valid(dart) and dart.state == DART_STATE_HOLSTERED:
+			_net_dart_lead = 0
+		else:
+			_net_dart_lead = clampi(_net_dart_lead + 1 - net_frames.size(), -NET_DART_LEAD_MAX, NET_DART_LEAD_MAX)
 	if is_falling:
 		return
 	if is_eliminated:
@@ -975,16 +1246,64 @@ func _physics_process(delta: float) -> void:
 		move_and_slide()
 		return
 
+	if _melee_cooldown_timer > 0.0:
+		_melee_cooldown_timer -= delta
+
+	if _uses_net_input():
+		# One movement step per guest input received (see _take_net_inputs()):
+		# the guest predicts its own movement one step per input it sends, so
+		# stepping the same inputs here keeps both sides in agreement. Buttons
+		# are OR-ed across this tick's frames so a tap still reaches the
+		# once-per-tick throw/recall/melee handlers below.
+		var merged_buttons: int = 0
+		for f: Array in net_frames:
+			_net_frame = f
+			_net_ack_seq = int(f[3])
+			merged_buttons |= int(f[2])
+			_step_movement(_get_move_input(), _get_dash_pressed(), _host_movement_locked(), delta, false)
+			_check_boundary_fall()
+			if is_falling:
+				return
+		if not net_frames.is_empty():
+			_net_frame = [_net_frame[0], _net_frame[1], merged_buttons, _net_ack_seq]
+	else:
+		_step_movement(_get_move_input(), _get_dash_pressed(), _host_movement_locked(), delta, false)
+		_check_boundary_fall()
+		if is_falling:
+			return
 	var move_input: Vector2 = _get_move_input()
 	var aim_input: Vector2 = _get_aim_input()
 
+	# --- Aim indicator ---
+	if aim_input.length() > DEADZONE:
+		aim_dir = aim_input.normalized()
+	elif move_input.length() > DEADZONE:
+		aim_dir = move_input.normalized()
+	aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
+
+	# --- Rope dart throw: hold to charge, release to throw ---
+	_handle_throw_input()
+	# --- Rope dart Recall/Redirect: same shared button, dart.state == EMBEDDED
+	# disambiguates tap (Recall, pulls the dart back at increasing speed --
+	# rope_dart.gd's begin_recall()/_process_returning()) vs hold-then-release
+	# (Redirect -- rope_dart.gd's begin_swing_redirect(), into SWINGING).
+	# FLYING/SWINGING stay tap-only immediate Recall (no anchor to redirect
+	# from) ---
+	_handle_dart_away_input(delta)
+	# --- Slash/Kick: same button, context-sensitive on dart.state (see
+	# _handle_melee_input() below) ---
+	_handle_melee_input()
+
+
+## One tick of movement: trip/knockback/dash timers, dash activation,
+## velocity, leash/swing clamps, move_and_slide(). Run by the simulating
+## peer once per input, and by an online guest for its own player as
+## client-side prediction (predicting = true: no FX/dart side effects --
+## the host performs those and mirrors them -- see _net_guest_tick()).
+func _step_movement(move_input: Vector2, dash_input: bool, movement_locked: bool, delta: float, predicting: bool) -> void:
 	# --- Rope-trip countdown ---
 	if _trip_timer > 0.0:
 		_trip_timer -= delta
-
-	# --- Slash/Kick cooldown / knockback countdowns ---
-	if _melee_cooldown_timer > 0.0:
-		_melee_cooldown_timer -= delta
 	if _knockback_timer > 0.0:
 		_knockback_timer -= delta
 
@@ -997,6 +1316,7 @@ func _physics_process(delta: float) -> void:
 		_dash_timer -= delta
 		if _dash_timer <= 0.0:
 			_is_dashing = false
+			_pred_momentum_dash = false
 			_dash_cooldown_timer = DASH_COOLDOWN
 			if _dash_trail != null:
 				_dash_trail.emitting = false
@@ -1017,23 +1337,9 @@ func _physics_process(delta: float) -> void:
 	# a lock doesn't "queue" a surprise dash the instant the lock ends via a
 	# stale edge.
 	#
-	# _movement_locked_now covers both lock windows with one shared boolean
-	# (see its own comment below, at the point it's actually consumed by the
-	# velocity block) -- computed here, ahead of that block, purely because
-	# dash activation also needs to read it and happens first in frame order.
-	var _charging_now: bool = dart != null and is_instance_valid(dart) and dart.state == DART_STATE_CHARGING
-	# Task #18: reads _embedded_hold_active, which player.gd's own
-	# _handle_dart_away_input() (called later THIS SAME physics tick, near the
-	# bottom of this function) sets/clears -- so this frame's read is actually
-	# last frame's value, one tick stale. This exactly mirrors _charging_now's
-	# own pre-existing timing above (dart.begin_charge() is likewise called
-	# later in _handle_throw_input(), so the very first frame CHARGING/holding
-	# begins also reads stale HOLSTERED/inactive here) -- same established
-	# one-frame-lag precedent, not a new inconsistency introduced by this task.
-	var _redirect_holding_now: bool = dart != null and is_instance_valid(dart) and dart.state == DART_STATE_EMBEDDED and _embedded_hold_active
-	var _movement_locked_now: bool = _charging_now or _redirect_holding_now
+	var _movement_locked_now: bool = movement_locked
 	if not _is_dashing and _dash_cooldown_timer <= 0.0:
-		var dash_held: bool = _get_dash_pressed()
+		var dash_held: bool = dash_input
 		if dash_held and not _prev_dash and not _movement_locked_now:
 			# Task #38: while EMBEDDED, Dash is repointed to a momentum
 			# release (Pendulum Swing / Slingshot) instead of a normal ground
@@ -1107,7 +1413,10 @@ func _physics_process(delta: float) -> void:
 				# starting next tick and this boosted velocity is actually
 				# free to carry the player away instead of being immediately
 				# capped back to the rope's radius.
-				dart.begin_recall()
+				if predicting:
+					_pred_momentum_dash = true
+				else:
+					dart.begin_recall()
 			else:
 				var dash_dir: Vector2 = move_input if move_input.length() > 0.1 else _facing_dir
 				_dash_dir = dash_dir.normalized()
@@ -1115,7 +1424,10 @@ func _physics_process(delta: float) -> void:
 			_is_dashing = true
 			_dash_timer = DASH_DURATION
 			_dash_cooldown_timer = DASH_COOLDOWN
-			_fx(Fx.DASH)
+			if not predicting:
+				_fx(Fx.DASH)
+			elif not _pred_replaying:
+				_predict_fx(Fx.DASH)
 		_prev_dash = dash_held
 
 	# --- Velocity ---
@@ -1144,32 +1456,34 @@ func _physics_process(delta: float) -> void:
 		# DASH_SPEED above so a tripped player can still burst free.
 		var trip_mult: float = TRIP_SPEED_MULT if _trip_timer > 0.0 else 1.0
 		velocity = Vector3(effective_move_input.x, 0.0, effective_move_input.y) * move_speed * trip_mult
-	_apply_rope_leash_velocity_clamp()
+	# A guest predicting a momentum release still has the dart EMBEDDED in its
+	# replica (the host unanchors it -- begin_recall() above -- and reports that
+	# a round trip later), so skip the leash that would cancel the boost.
+	if not _pred_momentum_dash:
+		_apply_rope_leash_velocity_clamp()
 	_apply_swing_forward_lock()
 	move_and_slide()
-	_check_boundary_fall()
-	if is_falling:
-		return
 
-	# --- Aim indicator ---
-	if aim_input.length() > DEADZONE:
-		aim_dir = aim_input.normalized()
-	elif move_input.length() > DEADZONE:
-		aim_dir = move_input.normalized()
-	aim_indicator.position = Vector3(aim_dir.x, 0.0, aim_dir.y) * 1.2
 
-	# --- Rope dart throw: hold to charge, release to throw ---
-	_handle_throw_input()
-	# --- Rope dart Recall/Redirect: same shared button, dart.state == EMBEDDED
-	# disambiguates tap (Recall, pulls the dart back at increasing speed --
-	# rope_dart.gd's begin_recall()/_process_returning()) vs hold-then-release
-	# (Redirect -- rope_dart.gd's begin_swing_redirect(), into SWINGING).
-	# FLYING/SWINGING stay tap-only immediate Recall (no anchor to redirect
-	# from) ---
-	_handle_dart_away_input(delta)
-	# --- Slash/Kick: same button, context-sensitive on dart.state (see
-	# _handle_melee_input() below) ---
-	_handle_melee_input()
+## Host/offline: whether this tick's movement is locked by a committed dart
+## action (CHARGING, or holding to redirect while EMBEDDED).
+func _host_movement_locked() -> bool:
+	# _movement_locked_now covers both lock windows with one shared boolean
+	# (see its own comment below, at the point it's actually consumed by the
+	# velocity block) -- computed here, ahead of that block, purely because
+	# dash activation also needs to read it and happens first in frame order.
+	var _charging_now: bool = dart != null and is_instance_valid(dart) and dart.state == DART_STATE_CHARGING
+	# Task #18: reads _embedded_hold_active, which player.gd's own
+	# _handle_dart_away_input() (called later THIS SAME physics tick, near the
+	# bottom of this function) sets/clears -- so this frame's read is actually
+	# last frame's value, one tick stale. This exactly mirrors _charging_now's
+	# own pre-existing timing above (dart.begin_charge() is likewise called
+	# later in _handle_throw_input(), so the very first frame CHARGING/holding
+	# begins also reads stale HOLSTERED/inactive here) -- same established
+	# one-frame-lag precedent, not a new inconsistency introduced by this task.
+	var _redirect_holding_now: bool = dart != null and is_instance_valid(dart) and dart.state == DART_STATE_EMBEDDED and _embedded_hold_active
+	var _movement_locked_now: bool = _charging_now or _redirect_holding_now
+	return _movement_locked_now
 
 
 func _get_dash_pressed() -> bool:
@@ -2060,6 +2374,13 @@ func reset_for_round(start_pos: Vector3) -> void:
 	spawn_pos = start_pos
 	global_position = start_pos
 	_net_target_pos = start_pos
+	# Guest prediction restarts from the host's next own-state.
+	_pred_active = false
+	_pred_history.clear()
+	_pred_pending = []
+	_pred_visual_offset = Vector3.ZERO
+	_pred_momentum_dash = false
+	_pred_fx_pending.clear()
 	collision_shape.disabled = false
 	is_dead = true  # cleared by the spawn-invuln countdown once it expires -- see RESPAWN_INVULN_TIME
 	is_eliminated = false

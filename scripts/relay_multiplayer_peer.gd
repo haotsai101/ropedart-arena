@@ -23,6 +23,12 @@ extends MultiplayerPeerExtension
 ## Incoming, the server has rewritten `peer` to the SENDER's id.
 
 const HEADER_SIZE := 6
+## Channel byte reserved for game packets that bypass SceneMultiplayer (see
+## send_raw()): NetCodec's hand-packed per-tick snapshot/own-state/input.
+const RAW_CHANNEL := 255
+
+## A RAW_CHANNEL frame from a known peer (payload without the relay header).
+signal raw_packet(from: int, data: PackedByteArray)
 
 var _ws: WebSocketPeer = null
 var _unique_id: int = 0
@@ -57,6 +63,9 @@ func remove_remote_peer(peer_id: int) -> void:
 	if not _remote_peers.has(peer_id):
 		return
 	_remote_peers.erase(peer_id)
+	# Drop its still-queued packets: SceneMultiplayer rejects (and logs) any
+	# packet whose sender it has already removed.
+	_incoming = _incoming.filter(func(p: Dictionary) -> bool: return p["peer"] != peer_id)
 	peer_disconnected.emit(peer_id)
 
 
@@ -66,6 +75,9 @@ func receive_frame(frame: PackedByteArray) -> void:
 	var from: int = frame.decode_s32(0)
 	if not _remote_peers.has(from):
 		return  # not (yet) a peer we've announced -- SceneMultiplayer would reject it anyway
+	if frame[5] == RAW_CHANNEL:
+		raw_packet.emit(from, frame.slice(HEADER_SIZE))
+		return
 	_incoming.append({
 		"peer": from,
 		"mode": frame[4],
@@ -93,16 +105,28 @@ func _get_packet_script() -> PackedByteArray:
 
 
 func _put_packet_script(buffer: PackedByteArray) -> Error:
+	return _send_frame(_target_peer, _transfer_mode, _transfer_channel, buffer)
+
+
+## Send a game packet straight to the relay, skipping SceneMultiplayer's RPC
+## framing (node path ids, per-Variant headers) and its per-peer fan-out: a
+## broadcast (target 0) leaves this device ONCE and the server copies it to
+## every other room member.
+func send_raw(target: int, data: PackedByteArray) -> Error:
+	return _send_frame(target, TRANSFER_MODE_UNRELIABLE_ORDERED, RAW_CHANNEL, data)
+
+
+func _send_frame(target: int, mode: int, channel: int, payload: PackedByteArray) -> Error:
 	if _ws == null or _status != CONNECTION_CONNECTED:
 		return ERR_UNCONFIGURED
 	if _ws.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		return ERR_CONNECTION_ERROR
 	var frame := PackedByteArray()
 	frame.resize(HEADER_SIZE)
-	frame.encode_s32(0, _target_peer)
-	frame[4] = _transfer_mode
-	frame[5] = _transfer_channel
-	frame.append_array(buffer)
+	frame.encode_s32(0, target)
+	frame[4] = mode
+	frame[5] = channel
+	frame.append_array(payload)
 	return _ws.send(frame, WebSocketPeer.WRITE_MODE_BINARY)
 
 

@@ -1,0 +1,6 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/manual_online_play.gd" id="1_manual"]
+
+[node name="ManualOnlinePlay" type="Node"]
+script = ExtResource("1_manual")

@@ -18,6 +18,8 @@ signal rooms_fetched(rooms: Array)           # Array of room Dicts from /rooms
 signal character_chosen(peer_id: int, char_id: String)
 signal headwear_chosen(peer_id: int, headwear_id: String)
 signal cloth_chosen(peer_id: int, cloth_id: String)
+## Raw game packet (NetCodec) from a room peer -- see send_game_packet().
+signal game_packet(from: int, data: PackedByteArray)
 
 const MAX_PLAYERS := 6
 
@@ -173,7 +175,31 @@ func _flush_pending() -> void:
 # _process — poll the WS every frame
 # ---------------------------------------------------------------------------
 
+## Frame alignment (each misplaced poll cost a whole frame per hop -- measured
+## ~50ms of RTT on a 0.4ms-ping local server):
+##   - physics runs first: read the socket and dispatch RPCs right away, so a
+##     guest input / host snapshot reaches the players in THIS tick instead of
+##     waiting for SceneTree's own multiplayer poll in the next _process.
+##   - _process runs last (process_priority): polling the socket there flushes
+##     everything queued during this frame's physics/process to the wire.
+func _ready() -> void:
+	process_physics_priority = -100
+	process_priority = 100
+
+
+func _physics_process(_delta: float) -> void:
+	_poll_socket()
+	if _relay != null:
+		multiplayer.poll()
+
+
 func _process(_delta: float) -> void:
+	_poll_socket()
+	if _relay != null:
+		multiplayer.poll()
+
+
+func _poll_socket() -> void:
 	if _ws != null:
 		_ws.poll()
 		var ws_state := _ws.get_ready_state()
@@ -318,7 +344,19 @@ func _open_relay(unique_id: int, as_host: bool) -> void:
 	_close_relay()
 	_relay = RelayMultiplayerPeer.new()
 	_relay.setup(_ws, unique_id, as_host)
+	_relay.raw_packet.connect(_on_relay_raw_packet)
 	multiplayer.multiplayer_peer = _relay
+
+
+func _on_relay_raw_packet(from: int, data: PackedByteArray) -> void:
+	game_packet.emit(from, data)
+
+
+## Send a NetCodec packet: target > 0 one peer, 0 everyone else in the room.
+## Unlike an RPC broadcast, a target-0 send leaves this device once.
+func send_game_packet(target: int, data: PackedByteArray) -> void:
+	if _relay != null:
+		_relay.send_raw(target, data)
 
 
 func _close_relay() -> void:
