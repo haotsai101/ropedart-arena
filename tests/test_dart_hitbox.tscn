@@ -1,0 +1,6 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://tests/test_dart_hitbox.gd" id="1_hitbox"]
+
+[node name="TestDartHitbox" type="Node"]
+script = ExtResource("1_hitbox")

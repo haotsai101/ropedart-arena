@@ -152,7 +152,11 @@ signal state_changed(new_state: int)
 ## a small buffer so a near-miss still reads as a hit. Rope-line contact uses
 ## a slightly smaller radius since the rope itself is thin (a trip, not a
 ## direct hit) but still needs to be generous enough to feel fair in combat.
-@export var dart_hit_radius: float = 0.55
+## Was 0.55 -- almost exactly visual contact (0.4 + head 0.14), so a dart
+## visibly clipping a character's edge still missed; 0.75 gives the forgiving
+## party-brawler hitbox a thrown projectile needs. Tested against the dart's
+## whole path this tick, not just its end point (see _check_player_hits()).
+@export var dart_hit_radius: float = 0.75
 @export var rope_trip_radius: float = 0.5
 
 ## Fixed flight/embed height. Obstacle collision boxes (PillarA/B in
@@ -228,6 +232,9 @@ var _swing_effective_range: float = INF
 ## state transitions run for their gameplay effect only -- no SFX, sparks or
 ## fall visuals, which the live predicted tick already played once.
 var silent: bool = false
+## Where the dart head was at the start of this physics tick -- the swept
+## hit test in _check_player_hits() covers _hit_from -> pos_2d.
+var _hit_from: Vector2 = Vector2.ZERO
 
 @onready var head_mesh: MeshInstance3D = $Head
 @onready var rope_mesh: MultiMeshInstance3D = $RopeLine
@@ -432,6 +439,7 @@ func _process(_delta: float) -> void:
 func _physics_process(delta: float) -> void:
 	if _is_net_guest():
 		return  # the host simulates this dart; apply_net_state() mirrors it here
+	_hit_from = pos_2d  # start of this tick's swept hit segment
 	match state:
 		State.CHARGING:
 			_charge_time = minf(_charge_time + delta, max_charge_time)
@@ -1138,6 +1146,13 @@ func force_holster() -> void:
 ## including EMBEDDED), and only for players who weren't already killed by
 ## the dart-contact check this tick, so a player standing right at the dart
 ## head is never *also* counted as merely tripped when the dart IS lethal.
+##
+## The dart-head test is swept: distance from the target to the segment the
+## head travelled THIS tick (_hit_from -> pos_2d). A point test at the end
+## position let a 16-26 u/s dart (up to ~0.45 u per tick) step over a
+## target's edge between two ticks. Target positions come from
+## GameManager.hit_test_pos(), which rewinds them to what a remote guest
+## owner actually saw on screen (lag compensation).
 func _check_player_hits(dart_lethal: bool = true) -> void:
 	if owner_player == null or not is_instance_valid(owner_player):
 		return
@@ -1148,8 +1163,8 @@ func _check_player_hits(dart_lethal: bool = true) -> void:
 			continue
 		if p.get("is_dead") == true:
 			continue
-		var p_pos: Vector2 = p.get_pos_2d()
-		if dart_lethal and p_pos.distance_to(pos_2d) <= dart_hit_radius:
+		var p_pos: Vector2 = GameManager.hit_test_pos(p, owner_player)
+		if dart_lethal and _point_segment_distance(p_pos, _hit_from, pos_2d) <= dart_hit_radius:
 			p.take_dart_hit()
 			continue
 		var rope_dist := INF

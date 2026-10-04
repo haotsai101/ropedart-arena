@@ -504,10 +504,14 @@ var _lunge_tween: Tween = null
 # filled by push_net_input() and drained each tick by _take_net_inputs() into
 # _net_frame, which the _get_*_input() getters read instead of local devices.
 var _net_queue: Array = []
-var _net_frame: Array = [Vector2.ZERO, Vector2.ZERO, 0, 0]
+var _net_frame: Array = [Vector2.ZERO, Vector2.ZERO, 0, 0, 0]
 ## Host-side: sequence number of the last guest input simulated (sent back to
 ## that guest in its own-state so it knows which inputs to replay).
 var _net_ack_seq: int = 0
+## Host-side: the host tick this guest was SEEING other players at when it
+## sent the newest simulated input -- GameManager.hit_test_pos() rewinds hit
+## targets to it (lag compensation). 0 = unknown.
+var _net_view_tick: int = 0
 ## Host-side: host dart ticks minus guest inputs simulated (network jitter
 ## makes some ticks consume 0 inputs and others 2).
 var _net_dart_lead: int = 0
@@ -623,15 +627,15 @@ func _reads_primary_input() -> bool:
 	return _is_online() or player_index == 0
 
 
-func push_net_input(seq: int, move: Vector2, aim: Vector2, buttons: int) -> void:
+func push_net_input(seq: int, move: Vector2, aim: Vector2, buttons: int, view_tick: int = 0) -> void:
 	if seq <= _net_ack_seq and seq != 0:
 		return  # stale/duplicate
-	_net_queue.append([move, aim, buttons, seq])
+	_net_queue.append([move, aim, buttons, seq, view_tick])
 
 
 func clear_net_input() -> void:
 	_net_queue.clear()
-	_net_frame = [Vector2.ZERO, Vector2.ZERO, 0, _net_ack_seq]
+	_net_frame = [Vector2.ZERO, Vector2.ZERO, 0, _net_ack_seq, 0]
 
 
 ## Host-side: this tick's guest input frames, oldest first, each to be
@@ -648,10 +652,11 @@ func _take_net_inputs() -> Array:
 	var frames: Array = _net_queue.duplicate()
 	_net_queue.clear()
 	if skipped_buttons != 0:
-		frames[0] = [frames[0][0], frames[0][1], int(frames[0][2]) | skipped_buttons, frames[0][3]]
+		frames[0] = [frames[0][0], frames[0][1], int(frames[0][2]) | skipped_buttons, frames[0][3], frames[0][4]]
 	var last: Array = frames[frames.size() - 1]
 	_net_frame = last
 	_net_ack_seq = int(last[3])
+	_net_view_tick = int(last[4])
 	return frames
 
 
@@ -685,7 +690,7 @@ func _net_guest_tick() -> void:
 	if melee_held:
 		buttons |= NET_BTN_MELEE
 	_pred_seq += 1
-	GameManager.send_local_input(_pred_seq, move_in, aim_in, buttons)
+	GameManager.send_local_input(_pred_seq, move_in, aim_in, buttons, GameManager.guest_view_tick())
 	var new_aim: Vector2 = _aim_from_input(move_in, aim_in)
 
 	if not _pred_pending.is_empty():
@@ -1265,7 +1270,7 @@ func _physics_process(delta: float) -> void:
 			if is_falling:
 				return
 		if not net_frames.is_empty():
-			_net_frame = [_net_frame[0], _net_frame[1], merged_buttons, _net_ack_seq]
+			_net_frame = [_net_frame[0], _net_frame[1], merged_buttons, _net_ack_seq, _net_view_tick]
 	else:
 		_step_movement(_get_move_input(), _get_dash_pressed(), _host_movement_locked(), delta, false)
 		_check_boundary_fall()
@@ -1822,7 +1827,7 @@ func _perform_slash() -> void:
 			continue
 		if p.get("is_dead") == true:
 			continue
-		if my_pos.distance_to(p.get_pos_2d()) <= MELEE_RANGE:
+		if my_pos.distance_to(GameManager.hit_test_pos(p, self)) <= MELEE_RANGE:
 			p.take_dart_hit()
 
 
@@ -1839,7 +1844,7 @@ func _perform_kick() -> void:
 			continue
 		if p.get("is_dead") == true:
 			continue
-		if my_pos.distance_to(p.get_pos_2d()) <= MELEE_RANGE:
+		if my_pos.distance_to(GameManager.hit_test_pos(p, self)) <= MELEE_RANGE:
 			p.apply_kick_knockback(my_pos)
 
 

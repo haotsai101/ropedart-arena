@@ -625,17 +625,75 @@ func _rpc_round_reset(countdown: float) -> void:
 ## numbers the input so the host can ack it (see the own-state packet).
 ## `move`/`aim` must already be NetCodec.quantize_input()-ed: the guest
 ## predicts with exactly what the host decodes.
-func send_local_input(seq: int, move: Vector2, aim: Vector2, buttons: int) -> void:
-	NetworkManager.send_game_packet(1, NetCodec.encode_input(seq, move, aim, buttons))
+func send_local_input(seq: int, move: Vector2, aim: Vector2, buttons: int, view_tick: int) -> void:
+	NetworkManager.send_game_packet(1, NetCodec.encode_input(seq, move, aim, buttons, view_tick))
+
+
+# --- Lag compensation --------------------------------------------------------
+# A guest sees other players ~a one-way trip + interpolation in the past, but
+# the host used to test its dart/melee hits against where targets are NOW --
+# a moving target was 0.5-0.9 units from where the guest saw it, more than
+# the whole hit radius. The host keeps a short history of every player's
+# position per host tick; each guest input carries the newest snapshot tick
+# that guest had applied (minus its interpolation delay), and hits by that
+# guest are tested against targets rewound to that tick ("favor the shooter").
+
+## Ticks of history kept (~0.5s) and the most a hit may be rewound (~250ms,
+## so a very laggy shooter can't hit someone who's long since moved away).
+const POS_HISTORY_SIZE := 32
+const LAG_COMP_MAX_TICKS := 15
+## Guests render other players easing toward the newest snapshot
+## (player.gd NET_INTERP_RATE = 25/s), which trails it by ~40ms = ~2 ticks.
+const LAG_COMP_INTERP_TICKS := 2
+
+var _net_tick: int = 0                # host: physics ticks since the match scene began
+var _pos_history: Array = []          # host: [tick, PackedVector2Array by player index]
+var _last_snapshot_tick: int = 0      # guest: newest host tick received
+
+
+## Guest: the host tick our screen is currently showing other players at.
+func guest_view_tick() -> int:
+	return maxi(_last_snapshot_tick - LAG_COMP_INTERP_TICKS, 0)
+
+
+## Where `target` should be hit-tested for an attack by `attacker`: its
+## current position, except for an attack by a remote guest on the online
+## host, which is tested against where that guest saw the target.
+func hit_test_pos(target: Node, attacker: Node) -> Vector2:
+	var now: Vector2 = target.get_pos_2d()
+	if not _is_online_host() or attacker == null or not is_instance_valid(attacker) \
+			or attacker.is_bot or attacker.player_peer_id == 1:
+		return now
+	var view: int = int(attacker._net_view_tick)
+	if view <= 0 or _pos_history.is_empty():
+		return now
+	view = clampi(view, _net_tick - LAG_COMP_MAX_TICKS, _net_tick)
+	var entry: Array = _pos_history[view % POS_HISTORY_SIZE]
+	var idx: int = _all_players.find(target)
+	if entry.is_empty() or int(entry[0]) != view or idx < 0 or idx >= (entry[1] as PackedVector2Array).size():
+		return now
+	return entry[1][idx]
+
+
+func _record_pos_history() -> void:
+	if _pos_history.size() != POS_HISTORY_SIZE:
+		_pos_history.resize(POS_HISTORY_SIZE)
+		_pos_history.fill([])
+	var positions := PackedVector2Array()
+	for p in _all_players:
+		positions.append(p.get_pos_2d() if is_instance_valid(p) else Vector2.ZERO)
+	_pos_history[_net_tick % POS_HISTORY_SIZE] = [_net_tick, positions]
 
 
 func _physics_process(_delta: float) -> void:
 	if not _is_online_host() or _all_players.is_empty():
 		return
+	_net_tick += 1
+	_record_pos_history()
 	var snapshot: Array = []
 	for p in _all_players:
 		snapshot.append(p.get_net_snapshot() if is_instance_valid(p) else [])
-	NetworkManager.send_game_packet(0, NetCodec.encode_snapshot(snapshot))
+	NetworkManager.send_game_packet(0, NetCodec.encode_snapshot(snapshot, _net_tick))
 	# Each guest also gets its own player's ack'd state, which its client-side
 	# prediction reconciles against (player.gd _net_guest_tick()).
 	var peers: PackedInt32Array = multiplayer.get_peers()
@@ -655,13 +713,14 @@ func _on_game_packet(from: int, data: PackedByteArray) -> void:
 			var inp: Array = NetCodec.decode_input(data)
 			var p: Node = _find_player_by_peer(from)
 			if not inp.is_empty() and p != null:
-				p.push_net_input(inp[0], inp[1], inp[2], inp[3])
+				p.push_net_input(inp[0], inp[1], inp[2], inp[3], inp[4])
 		NetCodec.PKT_SNAPSHOT:
 			if from != 1:
 				return
 			var snapshot: Array = NetCodec.decode_snapshot(data)
 			if snapshot.size() != _all_players.size():
 				return  # match scene not built yet on this peer (or malformed)
+			_last_snapshot_tick = NetCodec.snapshot_tick(data)
 			for i in snapshot.size():
 				var p = _all_players[i]
 				if is_instance_valid(p) and not (snapshot[i] as Array).is_empty():
@@ -719,6 +778,8 @@ func return_to_lobby() -> void:
 	_ready_peers.clear()
 	online_slot_peers = []
 	_all_players.clear()
+	_pos_history.clear()
+	_last_snapshot_tick = 0
 	current_state = RoundState.LOBBY
 	# Touch overlays are added under /root (not the match scene) by
 	# player.gd's _ready(), so the scene change below wouldn't free them.

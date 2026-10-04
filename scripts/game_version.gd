@@ -6,4 +6,4 @@ extends Node
 ## time. NetworkManager sends this string when creating/joining an online room
 ## so mismatched client builds can be rejected before they start a match.
 
-const VERSION := "74a63b6"
+const VERSION := "b2db6a4"

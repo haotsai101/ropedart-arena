@@ -31,7 +31,8 @@ const U16_INF := 65535
 const SNAP_ENTRY_SIZE := 23
 const SNAP_FLAG_ABSENT := 128  # entry slot whose player node is gone
 const OWN_STATE_SIZE := 48
-const INPUT_SIZE := 14
+const INPUT_SIZE := 18
+const SNAP_HEADER_SIZE := 6
 
 
 static func _s16(v: float) -> int:
@@ -62,17 +63,18 @@ static func quantize_input(v: Vector2) -> Vector2:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot: [type][count] + count x 23-byte entries, each mirroring
+# Snapshot: [type][count][u32 host tick] + count x 23-byte entries, each mirroring
 # player.gd get_net_snapshot(): pos, vel, aim, lives, flags, dart state/pos/
 # dir/charge. Velocity's y is dropped (players move on the XZ plane).
 # ---------------------------------------------------------------------------
 
-static func encode_snapshot(entries: Array) -> PackedByteArray:
+static func encode_snapshot(entries: Array, tick: int) -> PackedByteArray:
 	var b := PackedByteArray()
-	b.resize(2 + entries.size() * SNAP_ENTRY_SIZE)
+	b.resize(SNAP_HEADER_SIZE + entries.size() * SNAP_ENTRY_SIZE)
 	b[0] = PKT_SNAPSHOT
 	b[1] = entries.size()
-	var o := 2
+	b.encode_u32(2, tick)
+	var o := SNAP_HEADER_SIZE
 	for e: Array in entries:
 		if e.is_empty():
 			b[o + 13] = SNAP_FLAG_ABSENT
@@ -101,13 +103,13 @@ static func encode_snapshot(entries: Array) -> PackedByteArray:
 ## Decodes to the same per-player Array shape get_net_snapshot() returns
 ## ([] for an absent slot); returns [] if the packet is malformed.
 static func decode_snapshot(b: PackedByteArray) -> Array:
-	if b.size() < 2:
+	if b.size() < SNAP_HEADER_SIZE:
 		return []
 	var n: int = b[1]
-	if b.size() != 2 + n * SNAP_ENTRY_SIZE:
+	if b.size() != SNAP_HEADER_SIZE + n * SNAP_ENTRY_SIZE:
 		return []
 	var out: Array = []
-	var o := 2
+	var o := SNAP_HEADER_SIZE
 	for i in n:
 		if b[o + 13] & SNAP_FLAG_ABSENT:
 			out.append([])
@@ -126,6 +128,11 @@ static func decode_snapshot(b: PackedByteArray) -> Array:
 		])
 		o += SNAP_ENTRY_SIZE
 	return out
+
+
+## The host tick a snapshot packet was built on (0 if malformed).
+static func snapshot_tick(b: PackedByteArray) -> int:
+	return b.decode_u32(2) if b.size() >= SNAP_HEADER_SIZE else 0
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +210,10 @@ static func decode_own_state(b: PackedByteArray) -> Array:
 
 
 # ---------------------------------------------------------------------------
-# Input: [type][u32 seq][move s16 x2][aim s16 x2][u8 buttons]
+# Input: [type][u32 seq][move s16 x2][aim s16 x2][u8 buttons][u32 view tick]
 # ---------------------------------------------------------------------------
 
-static func encode_input(seq: int, move: Vector2, aim: Vector2, buttons: int) -> PackedByteArray:
+static func encode_input(seq: int, move: Vector2, aim: Vector2, buttons: int, view_tick: int) -> PackedByteArray:
 	var b := PackedByteArray()
 	b.resize(INPUT_SIZE)
 	b[0] = PKT_INPUT
@@ -216,10 +223,11 @@ static func encode_input(seq: int, move: Vector2, aim: Vector2, buttons: int) ->
 	b.encode_s16(9, clampi(roundi(aim.x * INPUT_SCALE), -32767, 32767))
 	b.encode_s16(11, clampi(roundi(aim.y * INPUT_SCALE), -32767, 32767))
 	b[13] = buttons & 0xff
+	b.encode_u32(14, maxi(view_tick, 0))
 	return b
 
 
-## [seq, move, aim, buttons], or [] if malformed.
+## [seq, move, aim, buttons, view_tick], or [] if malformed.
 static func decode_input(b: PackedByteArray) -> Array:
 	if b.size() != INPUT_SIZE:
 		return []
@@ -228,4 +236,5 @@ static func decode_input(b: PackedByteArray) -> Array:
 		Vector2(b.decode_s16(5) / INPUT_SCALE, b.decode_s16(7) / INPUT_SCALE),
 		Vector2(b.decode_s16(9) / INPUT_SCALE, b.decode_s16(11) / INPUT_SCALE),
 		b[13],
+		b.decode_u32(14),
 	]
