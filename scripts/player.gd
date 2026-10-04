@@ -95,6 +95,13 @@ const MELEE_RANGE: float = 1.8
 ## this a held button (or a bot's continuously-true in-range decision) would
 ## melee every single physics tick.
 const MELEE_COOLDOWN: float = 0.4
+## Dash Slash: Slash (dart in hand) pressed DURING a dash keeps the blade out
+## for the rest of the dash -- anyone who comes within DASH_SLASH_RANGE of the
+## dash's path is hit (once each), instead of a single instant range check
+## that a fast dash would carry you straight past. The dash also lunges a bit
+## further (DASH_SLASH_EXTEND seconds). Uses the normal melee cooldown.
+const DASH_SLASH_RANGE: float = MELEE_RANGE
+const DASH_SLASH_EXTEND: float = 0.08
 const KICK_KNOCKBACK_SPEED: float = 14.0
 const KICK_KNOCKBACK_DURATION: float = 0.25
 
@@ -396,6 +403,9 @@ var _trip_timer: float = 0.0
 # input.
 var _prev_melee_held: bool = false
 var _melee_cooldown_timer: float = 0.0
+var _dash_slash_active: bool = false
+var _dash_slash_prev: Vector2 = Vector2.ZERO   # where the sweep resumes from
+var _dash_slash_hit: Dictionary = {}           # players already struck this dash
 var _knockback_timer: float = 0.0
 var _knockback_dir: Vector2 = Vector2.ZERO
 
@@ -769,8 +779,10 @@ func _predict_tick(h: Array, dt: float, tick_dart: bool = true) -> void:
 	var melee_held: bool = h[4]
 	if melee_held and not _prev_melee_held and _melee_cooldown_timer <= 0.0 and dart_ok:
 		_melee_cooldown_timer = MELEE_COOLDOWN
+		var in_hand: bool = dart.state == DART_STATE_HOLSTERED or dart.state == DART_STATE_CHARGING
+		if in_hand and _is_dashing:
+			_dash_timer += DASH_SLASH_EXTEND  # Dash Slash lunge (hits stay host-side)
 		if not _pred_replaying:
-			var in_hand: bool = dart.state == DART_STATE_HOLSTERED or dart.state == DART_STATE_CHARGING
 			_predict_fx(Fx.SLASH if in_hand else Fx.KICK)
 	_prev_melee_held = melee_held
 	if dart_ok and tick_dart:
@@ -1247,10 +1259,12 @@ func _physics_process(delta: float) -> void:
 		# body each tick like every other early-return branch below does.
 		velocity = Vector3.ZERO
 		move_and_slide()
+		_pin_to_floor()
 		return
 	if GameManager.current_state != GameManager.RoundState.PLAYING:
 		velocity = Vector3.ZERO
 		move_and_slide()
+		_pin_to_floor()
 		return
 
 	# --- Spawn/respawn protection window (see RESPAWN_INVULN_TIME's own
@@ -1263,6 +1277,7 @@ func _physics_process(delta: float) -> void:
 			is_dead = false
 		velocity = Vector3.ZERO
 		move_and_slide()
+		_pin_to_floor()
 		return
 
 	if _melee_cooldown_timer > 0.0:
@@ -1310,8 +1325,9 @@ func _physics_process(delta: float) -> void:
 	# from) ---
 	_handle_dart_away_input(delta)
 	# --- Slash/Kick: same button, context-sensitive on dart.state (see
-	# _handle_melee_input() below) ---
+	# _handle_melee_input() below); during a dash Slash becomes a Dash Slash ---
 	_handle_melee_input()
+	_update_dash_slash()
 
 
 ## One tick of movement: trip/knockback/dash timers, dash activation,
@@ -1482,6 +1498,7 @@ func _step_movement(move_input: Vector2, dash_input: bool, movement_locked: bool
 		_apply_rope_leash_velocity_clamp()
 	_apply_swing_forward_lock()
 	move_and_slide()
+	_pin_to_floor()
 
 
 ## Host/offline: whether this tick's movement is locked by a committed dart
@@ -1811,9 +1828,58 @@ func _handle_melee_input() -> void:
 		return
 	_melee_cooldown_timer = MELEE_COOLDOWN
 	if dart.state == DART_STATE_HOLSTERED or dart.state == DART_STATE_CHARGING:
-		_perform_slash()
+		if _is_dashing:
+			_start_dash_slash()
+		else:
+			_perform_slash()
 	else:
 		_perform_kick()
+
+
+func _start_dash_slash() -> void:
+	_dash_slash_active = true
+	_dash_slash_hit.clear()
+	_dash_slash_prev = get_pos_2d()
+	_dash_timer += DASH_SLASH_EXTEND
+	_fx(Fx.SLASH)
+
+
+## Simulating peer, every tick after the melee handler: sweep the dash slash
+## along the path moved since last tick (lag-compensated targets, like every
+## other hit), and end it with the dash.
+func _update_dash_slash() -> void:
+	if not _dash_slash_active:
+		return
+	var cur: Vector2 = get_pos_2d()
+	for p in get_tree().get_nodes_in_group("players"):
+		if p == self or not is_instance_valid(p) or _dash_slash_hit.has(p):
+			continue
+		if p.get("is_dead") == true:
+			continue
+		if _point_segment_dist(GameManager.hit_test_pos(p, self), _dash_slash_prev, cur) <= DASH_SLASH_RANGE:
+			_dash_slash_hit[p] = true
+			p.take_dart_hit()
+	_dash_slash_prev = cur
+	if not _is_dashing:
+		_dash_slash_active = false
+
+
+## The arena is a flat floor and players never move vertically (velocity.y is
+## always 0, there's no gravity), so a body pushed up -- e.g. by overlapping
+## another player's capsule -- would float forever while its 2D (XZ) hitbox
+## stayed where it was. Keep the capsule center at floor height. (Ring-out
+## falling only moves player_mesh, never the body.)
+func _pin_to_floor() -> void:
+	if absf(global_position.y - GameManager.PLAYER_HALF_HEIGHT) > 0.0001:
+		global_position.y = GameManager.PLAYER_HALF_HEIGHT
+
+
+static func _point_segment_dist(p: Vector2, a: Vector2, b: Vector2) -> float:
+	var ab: Vector2 = b - a
+	var len_sq: float = ab.length_squared()
+	if len_sq < 0.000001:
+		return p.distance_to(a)
+	return p.distance_to(a + ab * clampf((p - a).dot(ab) / len_sq, 0.0, 1.0))
 
 
 ## Dart in hand -- melee with the dart itself. Reuses the exact same
@@ -2437,6 +2503,8 @@ func _reset_movement_and_dart_state() -> void:
 	_knockback_dir = Vector2.ZERO
 	_melee_cooldown_timer = 0.0
 	_prev_melee_held = false
+	_dash_slash_active = false
+	_dash_slash_hit.clear()
 	# Phase 4: an in-progress EMBEDDED hold-for-redirect is exactly the same
 	# class of "residual scripted-input state that must not carry through a
 	# teleport" as dash/knockback/melee cooldown above -- a player who

@@ -378,6 +378,7 @@ func _init_game_local(main: Node) -> void:
 	if player_characters.is_empty():
 		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
+	var spawns: Array = _get_spawn_positions()
 	var bot_script := load("res://scripts/bot_controller.gd")
 	for i in total_players:
 		var p = player_scene.instantiate()
@@ -389,6 +390,10 @@ func _init_game_local(main: Node) -> void:
 		p.character_cloth_id = str(player_cloth.get(i, ""))
 		p.mascot_color_index = int(player_colors.get(i, i))
 		p.mascot_mask_id = str(player_masks.get(i, "plain"))
+		# Place BEFORE add_child: every player spawning at the origin and only
+		# moving at round start meant overlapping capsules that physics pushed
+		# apart -- possibly up onto each other's heads.
+		p.position = spawns[i % spawns.size()]
 		main.add_child(p)
 		_all_players.append(p)
 		if p.is_bot:
@@ -408,6 +413,7 @@ func _init_game_online(main: Node) -> void:
 	if player_characters.is_empty():
 		assign_default_characters()
 	var player_scene := load("res://scenes/player.tscn") as PackedScene
+	var spawns: Array = _get_spawn_positions()
 	var bot_script := load("res://scripts/bot_controller.gd")
 	_all_players.clear()
 
@@ -429,6 +435,10 @@ func _init_game_online(main: Node) -> void:
 		p.character_cloth_id = str(player_cloth.get(i, ""))
 		p.mascot_color_index = int(player_colors.get(i, i))
 		p.mascot_mask_id = str(player_masks.get(i, "plain"))
+		# Place BEFORE add_child: every player spawning at the origin and only
+		# moving at round start meant overlapping capsules that physics pushed
+		# apart -- possibly up onto each other's heads.
+		p.position = spawns[i % spawns.size()]
 		main.add_child(p)
 		_all_players.append(p)
 		if p.is_bot and multiplayer.is_server():
