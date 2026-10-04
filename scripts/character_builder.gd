@@ -21,7 +21,10 @@ extends RefCounted
 const NONE_ID := "none"
 
 
-static func build_character_visual(base_id: String, headwear_id: String, cloth_id: String) -> Node3D:
+## `color_index`/`mask_id` only matter for a "customizable" character (the
+## mascot): its MASCOT_COLORS body color and MASK_PATTERNS mask picture.
+static func build_character_visual(base_id: String, headwear_id: String, cloth_id: String,
+		color_index: int = 0, mask_id: String = "plain") -> Node3D:
 	var char_def: Dictionary = GameManager.get_character_def(base_id)
 	var base_scene: PackedScene = load(str(char_def.get("glb_path", "")))
 	if base_scene == null:
@@ -36,19 +39,38 @@ static func build_character_visual(base_id: String, headwear_id: String, cloth_i
 		_apply_accessory_slot(root, skeleton, native_headwear, headwear_id, GameManager.HEADWEAR_DEFS)
 		_apply_accessory_slot(root, skeleton, native_cloth, cloth_id, GameManager.CLOTH_DEFS)
 
-	# Tint every mesh part with the character color (emission layer, texture
-	# stays visible underneath) -- mirrors player.gd's _reset_player_tint();
-	# applied here too so swapped-in accessory parts get the same treatment
-	# as the base body, and so the lobby preview matches in-game appearance.
-	var character_color: Color = char_def.get("character_color", Color.WHITE)
+	# Every surface gets its own material copy, tagged with its resting look
+	# (meta "base_albedo"/"rest_emission") so player.gd's _reset_player_tint()
+	# can restore it after a hit flash:
+	#  - KayKit characters: colors live in a texture, so albedo goes white and
+	#    a character-color emission layer is added for identification.
+	#  - the customizable mascot: colors live in the material itself, so they
+	#    are kept, its body parts take the picked color, its mask the picked
+	#    pattern, and no emission layer (the body color IS the identification).
+	var customizable: bool = bool(char_def.get("customizable", false))
+	var tinted: Array = char_def.get("tinted_meshes", [])
+	var mask_mesh: String = str(char_def.get("mask_mesh", ""))
+	var character_color: Color = GameManager.mascot_color(color_index) if customizable else char_def.get("character_color", Color.WHITE)
 	for mi: MeshInstance3D in find_mesh_instances(root):
-		var base_mat: Material = mi.get_active_material(0)
-		var mat: StandardMaterial3D = (base_mat.duplicate() as StandardMaterial3D) if base_mat is StandardMaterial3D else StandardMaterial3D.new()
-		mat.albedo_color = Color.WHITE
-		mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
-		mat.emission_enabled = true
-		mat.emission = character_color * 0.4
-		mi.set_surface_override_material(0, mat)
+		for surface: int in mi.mesh.get_surface_count():
+			var base_mat: Material = mi.get_active_material(surface)
+			var mat: StandardMaterial3D = (base_mat.duplicate() as StandardMaterial3D) if base_mat is StandardMaterial3D else StandardMaterial3D.new()
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+			var rest_emission := Color.BLACK
+			if customizable:
+				if tinted.has(str(mi.name)):
+					mat.albedo_color = character_color
+				elif str(mi.name) == mask_mesh:
+					mat.albedo_texture = GameManager.mask_pattern_texture(mask_id)
+					mat.albedo_color = Color.WHITE
+			else:
+				mat.albedo_color = Color.WHITE
+				rest_emission = character_color * 0.4
+			mat.emission_enabled = true
+			mat.emission = rest_emission
+			mat.set_meta("base_albedo", mat.albedo_color)
+			mat.set_meta("rest_emission", rest_emission)
+			mi.set_surface_override_material(surface, mat)
 		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 	return root
@@ -74,12 +96,16 @@ static func _apply_accessory_slot(root: Node3D, base_skeleton: Skeleton3D, nativ
 	# Pull the picked accessory's mesh(es) out of its source character's own
 	# glb and reparent them under the base character's skeleton -- see this
 	# file's header comment for why this skins correctly.
+	# Source glb: the accessory's own "glb_path" (e.g. the mascot's headwear
+	# pack) or else its source character's glb.
 	var resolved_def: Dictionary = _find_def(defs_pool, resolved_id)
-	var source_char_id: String = str(resolved_def.get("source_char_id", ""))
-	if source_char_id == "":
-		return
-	var source_char_def: Dictionary = GameManager.get_character_def(source_char_id)
-	var source_scene: PackedScene = load(str(source_char_def.get("glb_path", "")))
+	var glb_path: String = str(resolved_def.get("glb_path", ""))
+	if glb_path == "":
+		var source_char_id: String = str(resolved_def.get("source_char_id", ""))
+		if source_char_id == "":
+			return
+		glb_path = str(GameManager.get_character_def(source_char_id).get("glb_path", ""))
+	var source_scene: PackedScene = load(glb_path) if glb_path != "" else null
 	if source_scene == null:
 		return
 	var temp_instance: Node3D = source_scene.instantiate()

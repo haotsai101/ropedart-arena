@@ -18,6 +18,8 @@ signal rooms_fetched(rooms: Array)           # Array of room Dicts from /rooms
 signal character_chosen(peer_id: int, char_id: String)
 signal headwear_chosen(peer_id: int, headwear_id: String)
 signal cloth_chosen(peer_id: int, cloth_id: String)
+signal color_chosen(peer_id: int, color_index: int)  # mascot body color (MASCOT_COLORS index)
+signal mask_chosen(peer_id: int, mask_id: String)    # mascot mask (MASK_PATTERNS id)
 ## Raw game packet (NetCodec) from a room peer -- see send_game_packet().
 signal game_packet(from: int, data: PackedByteArray)
 
@@ -31,6 +33,8 @@ var room_players: Array = []   # [{username, peer_id}]
 var peer_characters: Dictionary = {}   # peer_id (int) → character id (String)
 var peer_headwear: Dictionary = {}     # peer_id (int) → headwear id (String), "" = native
 var peer_cloth: Dictionary = {}        # peer_id (int) → cloth id (String), "" = native
+var peer_colors: Dictionary = {}       # peer_id (int) → MASCOT_COLORS index (int)
+var peer_masks: Dictionary = {}        # peer_id (int) → MASK_PATTERNS id (String)
 
 var _signaling_url := "wss://ropedart-arena.onrender.com"
 
@@ -95,6 +99,8 @@ func disconnect_from_room() -> void:
 	peer_characters.clear()
 	peer_headwear.clear()
 	peer_cloth.clear()
+	peer_colors.clear()
+	peer_masks.clear()
 	multiplayer.multiplayer_peer = null
 
 
@@ -127,6 +133,20 @@ func send_cloth_choice(cloth_id: String) -> void:
 	peer_cloth[my_peer_id] = cloth_id
 	emit_signal("cloth_chosen", my_peer_id, cloth_id)
 	_send_signal({"type": "cloth_choice", "cloth_id": cloth_id})
+
+
+func send_color_choice(color_index: int) -> void:
+	## Same pattern as send_character_choice(), for the mascot's body color.
+	peer_colors[my_peer_id] = color_index
+	emit_signal("color_chosen", my_peer_id, color_index)
+	_send_signal({"type": "color_choice", "color_index": color_index})
+
+
+func send_mask_choice(mask_id: String) -> void:
+	## Same pattern as send_character_choice(), for the mascot's mask pattern.
+	peer_masks[my_peer_id] = mask_id
+	emit_signal("mask_chosen", my_peer_id, mask_id)
+	_send_signal({"type": "mask_choice", "mask_id": mask_id})
 
 
 func fetch_rooms() -> void:
@@ -291,7 +311,7 @@ func _handle_signal(msg: Dictionary) -> void:
 		"character_choice":
 			# Relayed by the signaling server when a peer broadcasts their character pick.
 			var peer_id: int = int(msg.get("peer_id", 0))
-			var char_id: String = str(msg.get("char_id", "char_barbarian"))
+			var char_id: String = str(msg.get("char_id", GameManager.default_character_id()))
 			if peer_id > 0 and peer_id != my_peer_id:
 				peer_characters[peer_id] = char_id
 				emit_signal("character_chosen", peer_id, char_id)
@@ -311,6 +331,20 @@ func _handle_signal(msg: Dictionary) -> void:
 			if peer_id > 0 and peer_id != my_peer_id:
 				peer_cloth[peer_id] = cloth_id
 				emit_signal("cloth_chosen", peer_id, cloth_id)
+
+		"color_choice":
+			var peer_id: int = int(msg.get("peer_id", 0))
+			var color_index: int = int(msg.get("color_index", 0))
+			if peer_id > 0 and peer_id != my_peer_id:
+				peer_colors[peer_id] = color_index
+				emit_signal("color_chosen", peer_id, color_index)
+
+		"mask_choice":
+			var peer_id: int = int(msg.get("peer_id", 0))
+			var mask_id: String = str(msg.get("mask_id", "plain"))
+			if peer_id > 0 and peer_id != my_peer_id:
+				peer_masks[peer_id] = mask_id
+				emit_signal("mask_chosen", peer_id, mask_id)
 
 		"error":
 			var err_code: String = str(msg.get("code", ""))

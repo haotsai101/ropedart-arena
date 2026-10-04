@@ -56,6 +56,9 @@ var player_characters: Dictionary = {}   # player_index (int) → character id (
 ## deliberately picked no accessory, distinct from "hasn't chosen yet".
 var player_headwear: Dictionary = {}     # player_index (int) → headwear id (String)
 var player_cloth: Dictionary = {}        # player_index (int) → cloth id (String)
+## Mascot customization (only read for the "customizable" character):
+var player_colors: Dictionary = {}       # player_index (int) → MASCOT_COLORS index (int)
+var player_masks: Dictionary = {}        # player_index (int) → MASK_PATTERNS id (String)
 var _all_players: Array = []
 var _timer: float = 0.0
 
@@ -91,19 +94,33 @@ const PLAYER_COLORS := [
 	Color(0.4, 0.9, 0.9),
 ]
 
-## KayKit Adventurers 2.0 characters. Unlike the old fruit set, these share
-## one identical skeleton wrapper name ("Rig_Medium") across every character
-## and both animation source files, so no body_mesh_name / per-character
-## rig-renaming hack is needed (see player.gd's _setup_animation()) — color
-## identification is applied as an emission tint across every mesh part
-## instead of overriding one named body mesh, since these are fully textured
-## models, not flat-shaded shapes.
-## native_headwear/native_cloth record which HEADWEAR_DEFS/CLOTH_DEFS id (below)
-## this character models natively in its own glb -- "" means it has none.
-## Picking a base character defaults its two accessory slots to these (see
-## GameManager.resolve_headwear_id/resolve_cloth_id) rather than forcing
-## everything to "none"; the player can still override either slot from there.
+## Playable characters. native_headwear/native_cloth record which
+## HEADWEAR_DEFS/CLOTH_DEFS id (below) the character wears by default --
+## picking a base character resets its accessory slots to these (see
+## GameManager.resolve_headwear_id/resolve_cloth_id); the player can still
+## override either slot from there. "headwear"/"cloth" (optional) whitelist
+## which accessories fit this character at all.
 const CHARACTER_DEFS: Array = [
+	# Our own character (art/mascot/mascot.blend -> export_mascot.py). It's
+	# customizable: a body color (MASCOT_COLORS) and a mask pattern
+	# (MASK_PATTERNS) per player -- several players may be the mascot at once
+	# as long as their colors differ.
+	{"id": "char_mascot", "glb_path": "res://assets/characters/mascot/Mascot.glb", "display_name": "Mascot",
+		"character_color": Color(1.0, 0.61, 0.22, 1.0), "native_headwear": "mascot_leaf", "native_cloth": "none",
+		"customizable": true, "cloth": ["none"],
+		"tinted_meshes": ["Mascot_Body", "Mascot_LegLeft", "Mascot_LegRight", "Mascot_HandLeft", "Mascot_HandRight"],
+		"mask_mesh": "Mascot_Mask"},
+]
+
+## KayKit Adventurers 2.0 characters -- DISABLED for now (the game ships only
+## the mascot). Their glbs stay in assets/ because the mascot still plays
+## KayKit's shared Rig_Medium animation clips. To re-enable: move these back
+## into CHARACTER_DEFS and their accessories (DISABLED_KAYKIT_HEADWEAR_DEFS /
+## DISABLED_KAYKIT_CLOTH_DEFS) back into HEADWEAR_DEFS / CLOTH_DEFS, and give
+## the mascot a "headwear" whitelist (its hats don't fit KayKit heads and
+## vice versa). KayKit parts are fully textured, so CharacterBuilder tints
+## them with a character-color emission layer instead of an albedo color.
+const DISABLED_KAYKIT_CHARACTER_DEFS: Array = [
 	{"id": "char_barbarian",    "glb_path": "res://assets/kaykit_adventurers/characters/Barbarian.glb",    "display_name": "Barbarian",      "character_color": Color(0.85, 0.08, 0.04, 1.0), "native_headwear": "barbarian_bearhat",  "native_cloth": "none"},
 	{"id": "char_knight",       "glb_path": "res://assets/kaykit_adventurers/characters/Knight.glb",       "display_name": "Knight",         "character_color": Color(0.30, 0.50, 0.90, 1.0), "native_headwear": "knight_helmet",      "native_cloth": "knight_cape"},
 	{"id": "char_mage",         "glb_path": "res://assets/kaykit_adventurers/characters/Mage.glb",         "display_name": "Mage",           "character_color": Color(0.60, 0.20, 0.85, 1.0), "native_headwear": "mage_hat",           "native_cloth": "mage_cape"},
@@ -112,34 +129,78 @@ const CHARACTER_DEFS: Array = [
 	{"id": "char_rogue_hooded", "glb_path": "res://assets/kaykit_adventurers/characters/Rogue_Hooded.glb", "display_name": "Rogue (Hooded)", "character_color": Color(0.42, 0.26, 0.62, 1.0), "native_headwear": "rogue_hooded_mask",  "native_cloth": "rogue_hooded_cape"},
 ]
 
-## Headwear pool, poolable across ALL base characters (unlike base character
-## picks, duplicates are allowed here -- see CLAUDE.md's uniqueness note).
-## Each non-"none" entry's mesh_names are pulled from source_char_id's own
-## glb and reparented onto whichever base character the player picked -- see
-## scripts/character_builder.gd for how, and its header comment for why this
-## skins correctly (every character shares one skeleton, "Rig_Medium", with
-## identical bone names). Mesh names verified directly against each glb's
-## exported node names (Rogue_Hooded's parts are prefixed "RogueHooded_", not
-## "Rogue_Hooded_" -- deliberately not a naming-convention typo here).
+## Mascot body colors, as the LINEAR values set in mascot.blend (custom
+## properties on its Mascot_Body material); mascot_color() converts to the
+## sRGB a StandardMaterial3D albedo expects.
+const MASCOT_COLORS: Array = [
+	{"id": "orange", "display_name": "Orange", "linear": Color(1.00, 0.33, 0.04)},
+	{"id": "red",    "display_name": "Red",    "linear": Color(0.85, 0.05, 0.06)},
+	{"id": "yellow", "display_name": "Yellow", "linear": Color(1.00, 0.70, 0.05)},
+	{"id": "green",  "display_name": "Green",  "linear": Color(0.20, 0.62, 0.06)},
+	{"id": "teal",   "display_name": "Teal",   "linear": Color(0.03, 0.55, 0.55)},
+	{"id": "blue",   "display_name": "Blue",   "linear": Color(0.06, 0.20, 0.95)},
+	{"id": "purple", "display_name": "Purple", "linear": Color(0.36, 0.08, 0.85)},
+	{"id": "pink",   "display_name": "Pink",   "linear": Color(1.00, 0.25, 0.50)},
+]
+
+## Mascot mask pictures: res://assets/characters/mascot/mask_patterns/mask_<id>.png
+const MASK_PATTERNS: Array = [
+	{"id": "plain",   "display_name": "Plain"},
+	{"id": "stripes", "display_name": "Stripes"},
+	{"id": "dots",    "display_name": "Polka Dots"},
+	{"id": "checker", "display_name": "Checker"},
+	{"id": "heart",   "display_name": "Heart"},
+	{"id": "star",    "display_name": "Star"},
+]
+
+## Headwear pool. Each non-"none" entry's mesh_names are pulled from its glb
+## ("glb_path", or else source_char_id's character glb) and reparented onto
+## the wearer's skeleton -- see scripts/character_builder.gd for how, and its
+## header comment for why this skins correctly (every character shares one
+## skeleton, "Rig_Medium", with identical bone names). "only_for" limits an
+## entry to one base character.
+const MASCOT_HEADWEAR_GLB := "res://assets/characters/mascot/MascotHeadwear.glb"
 const HEADWEAR_DEFS: Array = [
-	{"id": "none",               "display_name": "None",        "source_char_id": "",                "mesh_names": []},
+	{"id": "none",        "display_name": "None", "source_char_id": "",            "mesh_names": []},
+	{"id": "mascot_leaf", "display_name": "Leaf", "source_char_id": "char_mascot", "mesh_names": ["Mascot_Leaf"], "only_for": "char_mascot"},
+	# art/mascot/build_headwear.py -> export_mascot.py; fitted to the mascot's crown
+	{"id": "cap", "display_name": "Baseball Cap", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Cap"], "only_for": "char_mascot"},
+	{"id": "bird_nest", "display_name": "Bird's Nest", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_BirdNest"], "only_for": "char_mascot"},
+	{"id": "pirate", "display_name": "Pirate Hat", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Pirate"], "only_for": "char_mascot"},
+	{"id": "top_hat", "display_name": "Top Hat", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_TopHat"], "only_for": "char_mascot"},
+	{"id": "beanie", "display_name": "Beanie", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Beanie"], "only_for": "char_mascot"},
+	{"id": "crown", "display_name": "Crown", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Crown"], "only_for": "char_mascot"},
+	{"id": "chef", "display_name": "Chef Hat", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Chef"], "only_for": "char_mascot"},
+	{"id": "propeller", "display_name": "Propeller Cap", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Propeller"], "only_for": "char_mascot"},
+	{"id": "viking", "display_name": "Viking Helmet", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Viking"], "only_for": "char_mascot"},
+	{"id": "party", "display_name": "Party Hat", "glb_path": MASCOT_HEADWEAR_GLB, "mesh_names": ["Hat_Party"], "only_for": "char_mascot"},
+]
+
+## Disabled with the KayKit characters (see DISABLED_KAYKIT_CHARACTER_DEFS).
+## Mesh names verified against each glb's exported node names (Rogue_Hooded's
+## parts are prefixed "RogueHooded_", not "Rogue_Hooded_").
+const DISABLED_KAYKIT_HEADWEAR_DEFS: Array = [
 	{"id": "barbarian_bearhat",  "display_name": "Bear Hat",     "source_char_id": "char_barbarian",    "mesh_names": ["Barbarian_BearHat"]},
 	{"id": "knight_helmet",      "display_name": "Helmet",       "source_char_id": "char_knight",       "mesh_names": ["Knight_Helmet", "Knight_HelmetVisor"]},
 	{"id": "mage_hat",           "display_name": "Wizard Hat",   "source_char_id": "char_mage",         "mesh_names": ["Mage_Hat"]},
 	{"id": "rogue_hooded_mask",  "display_name": "Hood & Mask",  "source_char_id": "char_rogue_hooded", "mesh_names": ["RogueHooded_Mask"]},
 ]
 
-## Cloth/cape pool, poolable across all base characters (same rules as
-## HEADWEAR_DEFS above). Ranger/Rogue/Rogue_Hooded's own capes are included
-## here as pickable options too, not just Knight/Mage's.
+## Cloth/cape pool (same rules as HEADWEAR_DEFS above).
 const CLOTH_DEFS: Array = [
-	{"id": "none",               "display_name": "None",        "source_char_id": "",                "mesh_names": []},
+	{"id": "none", "display_name": "None", "source_char_id": "", "mesh_names": []},
+]
+
+const DISABLED_KAYKIT_CLOTH_DEFS: Array = [
 	{"id": "knight_cape",        "display_name": "Knight Cape",  "source_char_id": "char_knight",       "mesh_names": ["Knight_Cape"]},
 	{"id": "mage_cape",          "display_name": "Mage Cape",    "source_char_id": "char_mage",         "mesh_names": ["Mage_Cape"]},
 	{"id": "ranger_cape",        "display_name": "Ranger Cape",  "source_char_id": "char_ranger",       "mesh_names": ["Ranger_Cape"]},
 	{"id": "rogue_cape",         "display_name": "Rogue Cape",   "source_char_id": "char_rogue",        "mesh_names": ["Rogue_Cape"]},
 	{"id": "rogue_hooded_cape",  "display_name": "Hooded Cape",  "source_char_id": "char_rogue_hooded", "mesh_names": ["RogueHooded_Cape"]},
 ]
+
+func default_character_id() -> String:
+	return str((CHARACTER_DEFS[0] as Dictionary)["id"])
 
 
 func get_character_def(char_id: String) -> Dictionary:
@@ -164,17 +225,65 @@ func get_cloth_def(cloth_id: String) -> Dictionary:
 
 
 func resolve_headwear_id(base_char_id: String, choice: String) -> String:
-	## "" (unset) falls back to the base character's own native headwear;
-	## any other value (including the explicit "none") is used as-is.
-	if choice != "":
+	## "" (unset) -- or a pick this base character can't wear -- falls back to
+	## its own native headwear; any other value (including "none") is used as-is.
+	if choice != "" and accessory_fits(base_char_id, choice, true):
 		return choice
 	return str(get_character_def(base_char_id).get("native_headwear", "none"))
 
 
 func resolve_cloth_id(base_char_id: String, choice: String) -> String:
-	if choice != "":
+	if choice != "" and accessory_fits(base_char_id, choice, false):
 		return choice
 	return str(get_character_def(base_char_id).get("native_cloth", "none"))
+
+
+## Whether `accessory_id` can go on `base_char_id`: a character with its own
+## "headwear"/"cloth" whitelist (the mascot) only takes those; an accessory
+## with "only_for" (the mascot's leaf) only goes on that character.
+func accessory_fits(base_char_id: String, accessory_id: String, is_headwear: bool) -> bool:
+	var whitelist: Variant = get_character_def(base_char_id).get("headwear" if is_headwear else "cloth", null)
+	if whitelist is Array:
+		return (whitelist as Array).has(accessory_id)
+	var def: Dictionary = get_headwear_def(accessory_id) if is_headwear else get_cloth_def(accessory_id)
+	if str(def.get("id", "")) != accessory_id:
+		return false  # unknown (e.g. a disabled KayKit hat)
+	var only_for: String = str(def.get("only_for", ""))
+	return only_for == "" or only_for == base_char_id
+
+
+func is_customizable(char_id: String) -> bool:
+	return bool(get_character_def(char_id).get("customizable", false))
+
+
+## sRGB albedo for MASCOT_COLORS[index] (wraps).
+func mascot_color(index: int) -> Color:
+	var c: Color = (MASCOT_COLORS[posmod(index, MASCOT_COLORS.size())] as Dictionary)["linear"]
+	return c.linear_to_srgb()
+
+
+func mask_pattern_texture(pattern_id: String) -> Texture2D:
+	var path := "res://assets/characters/mascot/mask_patterns/mask_%s.png" % pattern_id
+	if not ResourceLoader.exists(path):
+		path = "res://assets/characters/mascot/mask_patterns/mask_plain.png"
+	return load(path) as Texture2D
+
+
+## Fills player_colors so every mascot in the match has a different color:
+## each slot keeps its pick if no earlier mascot took it, else gets the next
+## free color. Slots that aren't the mascot are ignored.
+func resolve_mascot_colors() -> void:
+	var used: Array = []
+	for i: int in total_players:
+		if not is_customizable(str(player_characters.get(i, ""))):
+			continue
+		var want: int = posmod(int(player_colors.get(i, i)), MASCOT_COLORS.size())
+		var k := 0
+		while used.has(want) and k < MASCOT_COLORS.size():
+			want = (want + 1) % MASCOT_COLORS.size()
+			k += 1
+		player_colors[i] = want
+		used.append(want)
 
 ## Half-height of the player capsule; added to spawn marker Y (spawn markers
 ## in main.tscn/main_forest.tscn sit at Y=0, i.e. floor level) so a spawned
@@ -275,9 +384,11 @@ func _init_game_local(main: Node) -> void:
 		p.name = "Player%d" % i
 		p.player_index = i
 		p.is_bot = (i >= human_count)
-		p.character_id = player_characters.get(i, "char_barbarian")
+		p.character_id = player_characters.get(i, default_character_id())
 		p.character_headwear_id = str(player_headwear.get(i, ""))
 		p.character_cloth_id = str(player_cloth.get(i, ""))
+		p.mascot_color_index = int(player_colors.get(i, i))
+		p.mascot_mask_id = str(player_masks.get(i, "plain"))
 		main.add_child(p)
 		_all_players.append(p)
 		if p.is_bot:
@@ -316,6 +427,8 @@ func _init_game_online(main: Node) -> void:
 		p.character_id = player_characters.get(i, CHARACTER_DEFS[i % CHARACTER_DEFS.size()]["id"])
 		p.character_headwear_id = str(player_headwear.get(i, ""))
 		p.character_cloth_id = str(player_cloth.get(i, ""))
+		p.mascot_color_index = int(player_colors.get(i, i))
+		p.mascot_mask_id = str(player_masks.get(i, "plain"))
 		main.add_child(p)
 		_all_players.append(p)
 		if p.is_bot and multiplayer.is_server():
@@ -336,6 +449,8 @@ func assign_default_characters(shuffle_seed: int = -1) -> void:
 	# silently carry over onto whichever base character now lands in that slot.
 	player_headwear.clear()
 	player_cloth.clear()
+	player_colors.clear()
+	player_masks.clear()
 	var shuffled: Array = CHARACTER_DEFS.duplicate()
 	if shuffle_seed < 0:
 		shuffled.shuffle()
@@ -347,12 +462,8 @@ func assign_default_characters(shuffle_seed: int = -1) -> void:
 			var tmp = shuffled[i]
 			shuffled[i] = shuffled[j]
 			shuffled[j] = tmp
-	var slot: int = 0
-	for def in shuffled:
-		if slot >= total_players:
-			break
-		player_characters[slot] = def["id"]
-		slot += 1
+	for slot: int in total_players:
+		player_characters[slot] = shuffled[slot % shuffled.size()]["id"]
 
 
 @rpc("authority", "call_local", "reliable")
@@ -367,16 +478,19 @@ func sync_characters_rpc() -> void:
 
 
 @rpc("authority", "call_local", "reliable")
-func _rpc_sync_accessories(headwear: Dictionary, cloth: Dictionary) -> void:
+func _rpc_sync_accessories(headwear: Dictionary, cloth: Dictionary, colors: Dictionary, masks: Dictionary) -> void:
 	player_headwear = headwear
 	player_cloth = cloth
+	player_colors = colors
+	player_masks = masks
 
 
 func sync_accessories_rpc() -> void:
 	## Lobby calls this alongside sync_characters_rpc(), before changing scene,
-	## so all peers know each other's headwear/cloth picks too.
+	## so all peers know each other's headwear/cloth (and mascot color/mask)
+	## picks too.
 	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
-		rpc("_rpc_sync_accessories", player_headwear, player_cloth)
+		rpc("_rpc_sync_accessories", player_headwear, player_cloth, player_colors, player_masks)
 
 
 func _process(delta: float) -> void:
@@ -435,7 +549,7 @@ func start_round() -> void:
 		if player_characters.is_empty():
 			assign_default_characters()
 		rpc("_rpc_sync_characters", player_characters)
-		rpc("_rpc_sync_accessories", player_headwear, player_cloth)
+		rpc("_rpc_sync_accessories", player_headwear, player_cloth, player_colors, player_masks)
 	# NOTE: round_wins/last_round_winner_index/match_winner_index are
 	# deliberately NOT touched here -- they persist across rounds within a
 	# match (see round_wins' own comment); only _reset_match_state() (a whole

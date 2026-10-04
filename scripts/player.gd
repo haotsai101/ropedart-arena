@@ -157,12 +157,15 @@ const KILL_SHAKE_DURATION: float = 0.22
 @onready var _mesh_ground_offset: float = -GameManager.PLAYER_HALF_HEIGHT
 
 var player_mesh: Node3D = null
-var character_id: String = "char_barbarian"
+var character_id: String = ""  # "" = GameManager.default_character_id()
 ## "" means "use character_id's own native accessory" -- see
 ## GameManager.resolve_headwear_id/resolve_cloth_id, called in _ready() below.
 ## Set by GameManager before add_child(player), same as character_id.
 var character_headwear_id: String = ""
 var character_cloth_id: String = ""
+## Customizable character (the mascot) only: MASCOT_COLORS index + mask id.
+var mascot_color_index: int = 0
+var mascot_mask_id: String = "plain"
 var _mesh_base_scale: Vector3 = Vector3.ONE
 ## One duplicated material per mesh part of the character (arms/body/head/
 ## legs/accessories) — KayKit characters are fully textured, so player-color
@@ -540,11 +543,20 @@ func _ready() -> void:
 	# color tint) via the shared builder -- see character_builder.gd's header
 	# comment for why swapping parts across characters skins correctly. "" on
 	# either accessory id falls back to character_id's own native pick.
+	if character_id == "" or GameManager.get_character_def(character_id).get("id", "") != character_id:
+		character_id = GameManager.default_character_id()
 	var char_def: Dictionary = GameManager.get_character_def(character_id)
 	var resolved_headwear: String = GameManager.resolve_headwear_id(character_id, character_headwear_id)
 	var resolved_cloth: String = GameManager.resolve_cloth_id(character_id, character_cloth_id)
-	player_mesh = CharacterBuilder.build_character_visual(character_id, resolved_headwear, resolved_cloth)
-	character_color = char_def.get("character_color", player_color)
+	player_mesh = CharacterBuilder.build_character_visual(character_id, resolved_headwear, resolved_cloth,
+		mascot_color_index, mascot_mask_id)
+	character_color = GameManager.mascot_color(mascot_color_index) if GameManager.is_customizable(character_id) \
+		else char_def.get("character_color", player_color)
+	# A customizable character's picked body color IS its identity: the HUD
+	# panel, off-screen pin and death burst all use player_color, so they
+	# must match the body instead of the fixed per-slot palette.
+	if GameManager.is_customizable(character_id):
+		player_color = character_color
 	if player_mesh != null:
 		# KayKit Adventurers models are realistically human-proportioned
 		# (~2.4-2.5 units tall at scale 1.0) — 0.85 uniform brings them to
@@ -560,9 +572,10 @@ func _ready() -> void:
 	_player_materials.clear()
 	if player_mesh != null:
 		for mi in CharacterBuilder.find_mesh_instances(player_mesh):
-			var mat: StandardMaterial3D = mi.get_active_material(0) as StandardMaterial3D
-			if mat != null:
-				_player_materials.append(mat)
+			for surface: int in mi.mesh.get_surface_count():
+				var mat: StandardMaterial3D = mi.get_active_material(surface) as StandardMaterial3D
+				if mat != null:
+					_player_materials.append(mat)
 	_reset_player_tint()
 	_setup_animation()
 	_setup_dash_trail()
@@ -1088,14 +1101,15 @@ func _setup_dash_trail() -> void:
 
 
 func _reset_player_tint() -> void:
-	## Normal resting appearance: full-opacity texture (albedo left white so
-	## it multiplies to the texture's own colors unmodified) with a
-	## character-color emission glow layered on top for identification.
+	## Normal resting appearance, as CharacterBuilder set it up per material
+	## (metas "base_albedo"/"rest_emission"): KayKit parts = white albedo over
+	## their texture + a character-color emission glow; mascot parts = their
+	## own/picked albedo and no glow.
 	for mat in _player_materials:
-		mat.albedo_color = Color.WHITE
+		mat.albedo_color = mat.get_meta("base_albedo", Color.WHITE)
 		mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
 		mat.emission_enabled = true
-		mat.emission = character_color * 0.4
+		mat.emission = mat.get_meta("rest_emission", character_color * 0.4)
 
 
 func _play_anim(anim_name: String, speed: float = 1.0, force: bool = false) -> void:

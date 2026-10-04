@@ -162,7 +162,11 @@ func _setup_player_panels() -> void:
 
 		var label: Label = _name_labels[idx]
 		label.text = ("P%d" % (idx + 1)) + (" [BOT]" if p.is_bot else "")
-		label.add_theme_color_override("font_color", color)
+		# White on the tinted panel: player colors include yellow/pink/teal,
+		# which are unreadable as text on a panel of the same color.
+		label.add_theme_color_override("font_color", Color.WHITE)
+		label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.75))
+		label.add_theme_constant_override("outline_size", 6)
 
 		_build_dot_row(_life_dot_rows[idx], _life_dot_capacity, color)
 		_build_dot_row(_pip_rows[idx], _pip_capacity, Color(1.0, 0.85, 0.2))

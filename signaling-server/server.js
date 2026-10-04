@@ -53,6 +53,18 @@ function broadcastToRoom(room, obj) {
   }
 }
 
+// Lobby picks (character / headwear / cloth / mascot color / mask). Each is
+// stored on the sender's player entry and relayed to the rest of the room
+// tagged with the sender's peer_id; a later joiner is sent everyone's current
+// picks. Message type -> the field carrying the value.
+const CHOICE_FIELDS = {
+  character_choice: "char_id",
+  headwear_choice: "headwear_id",
+  cloth_choice: "cloth_id",
+  color_choice: "color_index",
+  mask_choice: "mask_id",
+};
+
 function buildPlayerList(room) {
   return room.players.map((p) => ({ username: p.username, peer_id: p.peer_id }));
 }
@@ -144,6 +156,12 @@ function handleMessage(ws, raw) {
         settings: room.settings,
       });
 
+      // Catch the joiner up on everyone's lobby picks so far
+      for (const p of room.players) {
+        if (p.peer_id === peer_id || !p.choices) continue;
+        for (const choice of Object.values(p.choices)) send(ws, choice);
+      }
+
       // Broadcast updated player list to everyone in the room
       broadcastToRoom(room, { type: "player_list", players: buildPlayerList(room) });
 
@@ -190,6 +208,32 @@ function handleMessage(ws, raw) {
       if (meta.peer_id !== 1) return;
       room.started = true;
       broadcastToRoom(room, { type: "game_starting" });
+      break;
+    }
+
+    case "character_choice":
+    case "headwear_choice":
+    case "cloth_choice":
+    case "color_choice":
+    case "mask_choice": {
+      const meta = ws_meta.get(ws);
+      if (!meta) return;
+      const room = rooms[meta.code];
+      if (!room) return;
+      const field = CHOICE_FIELDS[type];
+      const value =
+        type === "color_choice"
+          ? Math.min(63, Math.max(0, parseInt(msg[field]) || 0))
+          : String(msg[field] ?? "").slice(0, 64);
+      const out = { type, peer_id: meta.peer_id, [field]: value };
+      const player = room.players.find((p) => p.peer_id === meta.peer_id);
+      if (player) {
+        player.choices = player.choices || {};
+        player.choices[type] = out;
+      }
+      for (const p of room.players) {
+        if (p.peer_id !== meta.peer_id) send(p.socket, out);
+      }
       break;
     }
 

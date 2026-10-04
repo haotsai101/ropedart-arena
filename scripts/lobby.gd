@@ -56,13 +56,17 @@ var _local_focus: int = 0   # 0 = total players, 1 = difficulty, 2 = map
 var _char_cursor: int = 0       # index into GameManager.CHARACTER_DEFS
 var _headwear_cursor: int = 0   # index into GameManager.HEADWEAR_DEFS
 var _cloth_cursor: int = 0      # index into GameManager.CLOTH_DEFS
-var _char_slot: int = 0         # which cycler row L/R affects: 0=base 1=headwear 2=cloth
+var _color_cursor: int = 0      # index into GameManager.MASCOT_COLORS (mascot only)
+var _mask_cursor: int = 0       # index into GameManager.MASK_PATTERNS (mascot only)
+var _char_slot: int = 0         # which cycler row L/R affects -- index into _char_rows()
 
 # Character selection — online waiting lobby
 var _wait_char_cursor: int = 0       # index into GameManager.CHARACTER_DEFS
 var _wait_headwear_cursor: int = 0   # index into GameManager.HEADWEAR_DEFS
 var _wait_cloth_cursor: int = 0      # index into GameManager.CLOTH_DEFS
-var _wait_char_slot: int = 0      # which cycler row L/R affects within the char area: 0=base 1=headwear 2=cloth
+var _wait_color_cursor: int = 0      # index into GameManager.MASCOT_COLORS (mascot only)
+var _wait_mask_cursor: int = 0       # index into GameManager.MASK_PATTERNS (mascot only)
+var _wait_char_slot: int = 0      # which cycler row L/R affects within the char area -- index into _char_rows()
 var _wait_area: int = 0           # 0=settings area (host), 1=char-picker area
 
 # Error/transition timer
@@ -109,6 +113,8 @@ func _ready() -> void:
 	NetworkManager.character_chosen.connect(_on_character_chosen)
 	NetworkManager.headwear_chosen.connect(_on_character_chosen)
 	NetworkManager.cloth_chosen.connect(_on_character_chosen)
+	NetworkManager.color_chosen.connect(_on_color_chosen)
+	NetworkManager.mask_chosen.connect(_on_character_chosen)
 
 	if not UsernameManager.has_username():
 		# First-ever launch: skip the username-entry screen entirely and drop
@@ -144,6 +150,10 @@ func _exit_tree() -> void:
 		NetworkManager.headwear_chosen.disconnect(_on_character_chosen)
 	if NetworkManager.cloth_chosen.is_connected(_on_character_chosen):
 		NetworkManager.cloth_chosen.disconnect(_on_character_chosen)
+	if NetworkManager.color_chosen.is_connected(_on_color_chosen):
+		NetworkManager.color_chosen.disconnect(_on_color_chosen)
+	if NetworkManager.mask_chosen.is_connected(_on_character_chosen):
+		NetworkManager.mask_chosen.disconnect(_on_character_chosen)
 
 
 # ---------------------------------------------------------------------------
@@ -850,28 +860,29 @@ func _build_waiting_screen() -> void:
 
 	var char_area_focused: bool = (_wait_area == 1)
 	var my_char_def: Dictionary = GameManager.CHARACTER_DEFS[_wait_char_cursor]
-	var my_char_id: String = str(my_char_def.get("id", "char_barbarian"))
+	var my_char_id: String = str(my_char_def.get("id", GameManager.default_character_id()))
 	var my_headwear_def: Dictionary = GameManager.HEADWEAR_DEFS[_wait_headwear_cursor]
 	var my_cloth_def: Dictionary = GameManager.CLOTH_DEFS[_wait_cloth_cursor]
 	var is_taken: bool = _is_char_taken_by_other(my_char_id)
 	var char_value_text: String = str(my_char_def.get("display_name", "?")) + (" (taken!)" if is_taken else "")
 
-	var base_row := _make_settings_row("Character", char_value_text, char_area_focused and _wait_char_slot == 0, true, 0.042,
-			func(): _set_wait_char_row(0, -1), func(): _set_wait_char_row(0, 1))
-	char_rows_vbox.add_child(base_row)
-	var headwear_row := _make_settings_row("Headwear", str(my_headwear_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 1, true, 0.042,
-			func(): _set_wait_char_row(1, -1), func(): _set_wait_char_row(1, 1))
-	char_rows_vbox.add_child(headwear_row)
-	var cloth_row := _make_settings_row("Cloth / Cape", str(my_cloth_def.get("display_name", "?")), char_area_focused and _wait_char_slot == 2, true, 0.042,
-			func(): _set_wait_char_row(2, -1), func(): _set_wait_char_row(2, 1))
-	char_rows_vbox.add_child(cloth_row)
+	var color_taken: bool = GameManager.is_customizable(my_char_id) and _is_color_taken_by_other(_wait_color_cursor)
+	_add_char_rows(char_rows_vbox, my_char_id, {
+		"character": char_value_text,
+		"color": str((GameManager.MASCOT_COLORS[_wait_color_cursor] as Dictionary).get("display_name", "?")) + (" (taken!)" if color_taken else ""),
+		"mask": str((GameManager.MASK_PATTERNS[_wait_mask_cursor] as Dictionary).get("display_name", "?")),
+		"headwear": str(my_headwear_def.get("display_name", "?")),
+		"cloth": str(my_cloth_def.get("display_name", "?")),
+	}, _wait_char_slot if char_area_focused else -1, 0.042, _set_wait_char_row)
 
 	var preview_size := Vector2(vw * 0.11, vh * 0.135)
 	var char_preview := _make_character_preview(
 		my_char_id,
 		str(my_headwear_def.get("id", "none")),
 		str(my_cloth_def.get("id", "none")),
-		preview_size
+		preview_size,
+		_wait_color_cursor,
+		str((GameManager.MASK_PATTERNS[_wait_mask_cursor] as Dictionary).get("id", "plain"))
 	)
 	char_body_hbox.add_child(char_preview)
 
@@ -1087,9 +1098,21 @@ func _update_wait_prompt() -> void:
 
 
 func _is_char_taken_by_other(char_id: String) -> bool:
+	if GameManager.is_customizable(char_id):
+		return false  # several Mascots may play -- their colors must differ instead
 	var my_pid: int = NetworkManager.my_peer_id
 	for pid: int in NetworkManager.peer_characters.keys():
 		if pid != my_pid and str(NetworkManager.peer_characters[pid]) == char_id:
+			return true
+	return false
+
+
+## Another peer already picked the Mascot in this color.
+func _is_color_taken_by_other(color_index: int) -> bool:
+	var my_pid: int = NetworkManager.my_peer_id
+	for pid: int in NetworkManager.peer_characters.keys():
+		if pid != my_pid and GameManager.is_customizable(str(NetworkManager.peer_characters[pid])) \
+				and int(NetworkManager.peer_colors.get(pid, -1)) == color_index:
 			return true
 	return false
 
@@ -1260,7 +1283,8 @@ func _make_panel(w: int, h: int, v_offset: int) -> Panel:
 	return panel
 
 
-func _make_character_preview(base_id: String, headwear_id: String, cloth_id: String, preview_size: Vector2) -> Control:
+func _make_character_preview(base_id: String, headwear_id: String, cloth_id: String, preview_size: Vector2,
+		color_index: int = 0, mask_id: String = "plain") -> Control:
 	## Live 3D preview of the assembled character (base + headwear + cloth),
 	## used by both the local and online character customizer screens.
 	## Rebuilt from scratch on every call -- callers already do a full
@@ -1312,7 +1336,7 @@ func _make_character_preview(base_id: String, headwear_id: String, cloth_id: Str
 	key_light.light_energy = 1.2
 	world.add_child(key_light)
 
-	var char_visual: Node3D = CharacterBuilder.build_character_visual(base_id, headwear_id, cloth_id)
+	var char_visual: Node3D = CharacterBuilder.build_character_visual(base_id, headwear_id, cloth_id, color_index, mask_id)
 	if char_visual != null:
 		char_visual.scale = Vector3(0.85, 0.85, 0.85)
 		char_visual.position = Vector3(0.0, -0.7, 0.0)
@@ -1438,13 +1462,14 @@ func _input_waiting(event: InputEvent) -> void:
 	if NetworkManager.is_host:
 		_input_waiting_host(event)
 	else:
-		# Non-host: Up/Down switches which of the 3 rows is active, Left/Right
-		# cycles that row's value (mirrors the host's char-area controls below).
+		# Non-host: Up/Down switches which row is active, Left/Right cycles
+		# that row's value (mirrors the host's char-area controls below).
+		var n_rows: int = _char_rows(_wait_char_id()).size()
 		if event.is_action_pressed("ui_up"):
-			_wait_char_slot = (_wait_char_slot - 1 + 3) % 3
+			_wait_char_slot = (_wait_char_slot - 1 + n_rows) % n_rows
 			_rebuild_ui()
 		elif event.is_action_pressed("ui_down"):
-			_wait_char_slot = (_wait_char_slot + 1) % 3
+			_wait_char_slot = (_wait_char_slot + 1) % n_rows
 			_rebuild_ui()
 		elif event.is_action_pressed("ui_left"):
 			_cycle_wait_slot(-1)
@@ -1452,27 +1477,39 @@ func _input_waiting(event: InputEvent) -> void:
 			_cycle_wait_slot(1)
 
 
+func _wait_char_id() -> String:
+	return str((GameManager.CHARACTER_DEFS[_wait_char_cursor] as Dictionary).get("id", GameManager.default_character_id()))
+
+
 func _cycle_wait_slot(delta: int) -> void:
-	## Left/Right cycles whichever of the 3 rows (_wait_char_slot) is active,
-	## broadcasting the change to other peers via NetworkManager -- mirrors
-	## _cycle_local_slot()'s single-player equivalent.
-	match _wait_char_slot:
-		0:
+	## Left/Right cycles whichever row (_wait_char_slot, see _char_rows()) is
+	## active, broadcasting the change to other peers via NetworkManager --
+	## mirrors _cycle_local_slot()'s single-player equivalent.
+	var rows: Array = _char_rows(_wait_char_id())
+	match str(rows[clampi(_wait_char_slot, 0, rows.size() - 1)]):
+		"character":
 			var char_count: int = GameManager.CHARACTER_DEFS.size()
 			_wait_char_cursor = (_wait_char_cursor + delta + char_count) % char_count
 			_sync_wait_accessory_defaults()
-			var char_id: String = (GameManager.CHARACTER_DEFS[_wait_char_cursor] as Dictionary).get("id", "char_barbarian")
-			NetworkManager.send_character_choice(char_id)
+			NetworkManager.send_character_choice(_wait_char_id())
 			NetworkManager.send_headwear_choice(str((GameManager.HEADWEAR_DEFS[_wait_headwear_cursor] as Dictionary).get("id", "none")))
 			NetworkManager.send_cloth_choice(str((GameManager.CLOTH_DEFS[_wait_cloth_cursor] as Dictionary).get("id", "none")))
-		1:
-			var headwear_count: int = GameManager.HEADWEAR_DEFS.size()
-			_wait_headwear_cursor = (_wait_headwear_cursor + delta + headwear_count) % headwear_count
+			if GameManager.is_customizable(_wait_char_id()):
+				NetworkManager.send_color_choice(_wait_color_cursor)
+				NetworkManager.send_mask_choice(str((GameManager.MASK_PATTERNS[_wait_mask_cursor] as Dictionary).get("id", "plain")))
+		"color":
+			_wait_color_cursor = posmod(_wait_color_cursor + delta, GameManager.MASCOT_COLORS.size())
+			NetworkManager.send_color_choice(_wait_color_cursor)
+		"mask":
+			_wait_mask_cursor = posmod(_wait_mask_cursor + delta, GameManager.MASK_PATTERNS.size())
+			NetworkManager.send_mask_choice(str((GameManager.MASK_PATTERNS[_wait_mask_cursor] as Dictionary).get("id", "plain")))
+		"headwear":
+			_wait_headwear_cursor = _next_fitting(GameManager.HEADWEAR_DEFS, _wait_headwear_cursor, delta, _wait_char_id(), true)
 			NetworkManager.send_headwear_choice(str((GameManager.HEADWEAR_DEFS[_wait_headwear_cursor] as Dictionary).get("id", "none")))
-		2:
-			var cloth_count: int = GameManager.CLOTH_DEFS.size()
-			_wait_cloth_cursor = (_wait_cloth_cursor + delta + cloth_count) % cloth_count
+		"cloth":
+			_wait_cloth_cursor = _next_fitting(GameManager.CLOTH_DEFS, _wait_cloth_cursor, delta, _wait_char_id(), false)
 			NetworkManager.send_cloth_choice(str((GameManager.CLOTH_DEFS[_wait_cloth_cursor] as Dictionary).get("id", "none")))
+	_wait_char_slot = mini(_wait_char_slot, _char_rows(_wait_char_id()).size() - 1)
 	_rebuild_ui()
 
 
@@ -1512,7 +1549,7 @@ func _input_waiting_host(event: InputEvent) -> void:
 				_wait_area = 1
 				_wait_char_slot = 0
 		else:
-			_wait_char_slot = mini(_wait_char_slot + 1, 2)
+			_wait_char_slot = mini(_wait_char_slot + 1, _char_rows(_wait_char_id()).size() - 1)
 		_rebuild_settings_only()
 	elif event.is_action_pressed("ui_left"):
 		if _wait_area == 0:
@@ -1800,6 +1837,48 @@ func _start_local_game() -> void:
 
 
 # ===========================================================================
+# Character customizer rows (shared by the local and online screens)
+# ===========================================================================
+
+## Which cycler rows the customizer shows for a base character: the
+## customizable mascot gets Color + Mask (and only its own leaf/none as
+## headwear); KayKit characters get Headwear + Cloth.
+func _char_rows(char_id: String) -> Array:
+	var rows: Array = ["character", "color", "mask", "headwear"] if GameManager.is_customizable(char_id) \
+		else ["character", "headwear", "cloth"]
+	if GameManager.CHARACTER_DEFS.size() == 1:
+		rows.erase("character")  # nothing to pick
+	return rows
+
+
+const _ROW_LABELS := {"character": "Character", "color": "Color", "mask": "Mask",
+	"headwear": "Headwear", "cloth": "Cloth / Cape"}
+
+
+## Adds one cycler row per _char_rows() entry. `values` maps row key -> text;
+## `on_cycle(row_index, delta)` handles the row's ◀ ▶ taps.
+func _add_char_rows(parent: Control, char_id: String, values: Dictionary, active_slot: int,
+		row_h: float, on_cycle: Callable) -> void:
+	var rows: Array = _char_rows(char_id)
+	for i: int in rows.size():
+		var key: String = rows[i]
+		parent.add_child(_make_settings_row(str(_ROW_LABELS[key]), str(values.get(key, "?")), active_slot == i, true, row_h,
+				func(): on_cycle.call(i, -1), func(): on_cycle.call(i, 1)))
+
+
+## Next accessory index from `cursor` in direction `delta` that `char_id`
+## can wear (see GameManager.accessory_fits()).
+func _next_fitting(defs_pool: Array, cursor: int, delta: int, char_id: String, is_headwear: bool) -> int:
+	var n: int = defs_pool.size()
+	var idx: int = cursor
+	for _i: int in n:
+		idx = (idx + delta + n) % n
+		if GameManager.accessory_fits(char_id, str((defs_pool[idx] as Dictionary).get("id", "")), is_headwear):
+			return idx
+	return cursor
+
+
+# ===========================================================================
 # LOCAL — character selection screen
 # ===========================================================================
 
@@ -1828,7 +1907,7 @@ func _build_char_select_local_screen() -> void:
 	panel.add_child(root_vbox)
 
 	var hint := Label.new()
-	hint.text = "No two fighters can share the same base character (headwear/cloth may repeat)"
+	hint.text = "Every fighter needs a different color"
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_font_size_override("font_size", _fs(16))
 	hint.add_theme_color_override("font_color", COLOR_DIM)
@@ -1853,16 +1932,15 @@ func _build_char_select_local_screen() -> void:
 	var base_def: Dictionary = GameManager.CHARACTER_DEFS[_char_cursor]
 	var headwear_def: Dictionary = GameManager.HEADWEAR_DEFS[_headwear_cursor]
 	var cloth_def: Dictionary = GameManager.CLOTH_DEFS[_cloth_cursor]
+	var base_id: String = str(base_def.get("id", GameManager.default_character_id()))
 
-	var base_row := _make_settings_row("Character", str(base_def.get("display_name", "?")), _char_slot == 0, true, 0.065,
-			func(): _set_local_char_row(0, -1), func(): _set_local_char_row(0, 1))
-	rows_vbox.add_child(base_row)
-	var headwear_row := _make_settings_row("Headwear", str(headwear_def.get("display_name", "?")), _char_slot == 1, true, 0.065,
-			func(): _set_local_char_row(1, -1), func(): _set_local_char_row(1, 1))
-	rows_vbox.add_child(headwear_row)
-	var cloth_row := _make_settings_row("Cloth / Cape", str(cloth_def.get("display_name", "?")), _char_slot == 2, true, 0.065,
-			func(): _set_local_char_row(2, -1), func(): _set_local_char_row(2, 1))
-	rows_vbox.add_child(cloth_row)
+	_add_char_rows(rows_vbox, base_id, {
+		"character": str(base_def.get("display_name", "?")),
+		"color": str((GameManager.MASCOT_COLORS[_color_cursor] as Dictionary).get("display_name", "?")),
+		"mask": str((GameManager.MASK_PATTERNS[_mask_cursor] as Dictionary).get("display_name", "?")),
+		"headwear": str(headwear_def.get("display_name", "?")),
+		"cloth": str(cloth_def.get("display_name", "?")),
+	}, _char_slot, 0.065, _set_local_char_row)
 
 	var slot_hint := Label.new()
 	slot_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -1874,10 +1952,12 @@ func _build_char_select_local_screen() -> void:
 
 	var preview_size := Vector2(vw * 0.22, vh * 0.42)
 	var preview := _make_character_preview(
-		str(base_def.get("id", "char_barbarian")),
+		base_id,
 		str(headwear_def.get("id", "none")),
 		str(cloth_def.get("id", "none")),
-		preview_size
+		preview_size,
+		_color_cursor,
+		str((GameManager.MASK_PATTERNS[_mask_cursor] as Dictionary).get("id", "plain"))
 	)
 	body_hbox.add_child(preview)
 
@@ -1898,11 +1978,12 @@ func _build_char_select_local_screen() -> void:
 
 
 func _input_char_select_local(event: InputEvent) -> void:
+	var n_rows: int = _char_rows(_local_char_id()).size()
 	if event.is_action_pressed("ui_up"):
-		_char_slot = (_char_slot - 1 + 3) % 3
+		_char_slot = (_char_slot - 1 + n_rows) % n_rows
 		_rebuild_ui()
 	elif event.is_action_pressed("ui_down"):
-		_char_slot = (_char_slot + 1) % 3
+		_char_slot = (_char_slot + 1) % n_rows
 		_rebuild_ui()
 	elif event.is_action_pressed("ui_left"):
 		_cycle_local_slot(-1)
@@ -1920,22 +2001,30 @@ func _input_char_select_local(event: InputEvent) -> void:
 			_set_screen("local_config")
 
 
+func _local_char_id() -> String:
+	return str((GameManager.CHARACTER_DEFS[_char_cursor] as Dictionary).get("id", GameManager.default_character_id()))
+
+
 func _cycle_local_slot(delta: int) -> void:
-	## Left/Right cycles whichever of the 3 rows (_char_slot) is active.
+	## Left/Right cycles whichever row (_char_slot, see _char_rows()) is active.
 	## Changing the base character resets headwear/cloth to ITS native picks
 	## (see _sync_local_accessory_defaults()) rather than leaving a mismatched
 	## accessory choice hanging over from a previous base character.
-	match _char_slot:
-		0:
+	var rows: Array = _char_rows(_local_char_id())
+	match str(rows[clampi(_char_slot, 0, rows.size() - 1)]):
+		"character":
 			var char_count: int = GameManager.CHARACTER_DEFS.size()
 			_char_cursor = (_char_cursor + delta + char_count) % char_count
 			_sync_local_accessory_defaults()
-		1:
-			var headwear_count: int = GameManager.HEADWEAR_DEFS.size()
-			_headwear_cursor = (_headwear_cursor + delta + headwear_count) % headwear_count
-		2:
-			var cloth_count: int = GameManager.CLOTH_DEFS.size()
-			_cloth_cursor = (_cloth_cursor + delta + cloth_count) % cloth_count
+		"color":
+			_color_cursor = posmod(_color_cursor + delta, GameManager.MASCOT_COLORS.size())
+		"mask":
+			_mask_cursor = posmod(_mask_cursor + delta, GameManager.MASK_PATTERNS.size())
+		"headwear":
+			_headwear_cursor = _next_fitting(GameManager.HEADWEAR_DEFS, _headwear_cursor, delta, _local_char_id(), true)
+		"cloth":
+			_cloth_cursor = _next_fitting(GameManager.CLOTH_DEFS, _cloth_cursor, delta, _local_char_id(), false)
+	_char_slot = mini(_char_slot, _char_rows(_local_char_id()).size() - 1)
 	_rebuild_ui()
 
 
@@ -1959,7 +2048,7 @@ func _index_of_def_id(defs_pool: Array, def_id: String) -> int:
 
 
 func _commit_local_char_select() -> void:
-	var human_char: String = (GameManager.CHARACTER_DEFS[_char_cursor] as Dictionary).get("id", "char_barbarian")
+	var human_char: String = (GameManager.CHARACTER_DEFS[_char_cursor] as Dictionary).get("id", GameManager.default_character_id())
 	var human_headwear: String = (GameManager.HEADWEAR_DEFS[_headwear_cursor] as Dictionary).get("id", "none")
 	var human_cloth: String = (GameManager.CLOTH_DEFS[_cloth_cursor] as Dictionary).get("id", "none")
 
@@ -1969,9 +2058,13 @@ func _commit_local_char_select() -> void:
 	GameManager.player_characters.clear()
 	GameManager.player_headwear.clear()
 	GameManager.player_cloth.clear()
+	GameManager.player_colors.clear()
+	GameManager.player_masks.clear()
 	GameManager.player_characters[0] = human_char
 	GameManager.player_headwear[0] = human_headwear
 	GameManager.player_cloth[0] = human_cloth
+	GameManager.player_colors[0] = _color_cursor
+	GameManager.player_masks[0] = str((GameManager.MASK_PATTERNS[_mask_cursor] as Dictionary).get("id", "plain"))
 
 	var remaining: Array = []
 	for def in GameManager.CHARACTER_DEFS:
@@ -1984,12 +2077,13 @@ func _commit_local_char_select() -> void:
 		if bot_slot < remaining.size():
 			GameManager.player_characters[i] = remaining[bot_slot]
 		else:
-			GameManager.player_characters[i] = (GameManager.CHARACTER_DEFS[i % GameManager.CHARACTER_DEFS.size()] as Dictionary).get("id", "char_barbarian")
+			GameManager.player_characters[i] = (GameManager.CHARACTER_DEFS[i % GameManager.CHARACTER_DEFS.size()] as Dictionary).get("id", GameManager.default_character_id())
 
 	# Apply match config and change scene
 	GameManager.is_online = false
 	GameManager.lobby_mode = false
 	GameManager.total_players = _local_total_players
+	GameManager.resolve_mascot_colors()  # a bot that's also the Mascot gets another color
 	GameManager.human_count = 1
 	GameManager.bot_difficulty = _local_bot_difficulty
 	GameManager.selected_map_scene = MAP_SCENES[clampi(_local_map_id, 0, MAP_SCENES.size() - 1)]
@@ -2035,13 +2129,15 @@ func _assign_online_characters() -> void:
 		var peer_id: int = GameManager.peer_id_for_slot(i)
 		if NetworkManager.peer_characters.has(peer_id):
 			var choice: String = str(NetworkManager.peer_characters[peer_id])
-			if not used.has(choice):
+			if GameManager.is_customizable(choice):
+				GameManager.player_characters[i] = choice  # never exclusive -- colors differ instead
+			elif not used.has(choice):
 				GameManager.player_characters[i] = choice
 				used.append(choice)
 			# else: conflict — keep the default assigned by assign_default_characters()
 		else:
 			# No peer choice: register the default to block it from others
-			var default_char: String = str(GameManager.player_characters.get(i, "char_barbarian"))
+			var default_char: String = str(GameManager.player_characters.get(i, GameManager.default_character_id()))
 			if not used.has(default_char):
 				used.append(default_char)
 
@@ -2049,7 +2145,7 @@ func _assign_online_characters() -> void:
 	for i: int in total:
 		var peer_id: int = GameManager.peer_id_for_slot(i)
 		if not NetworkManager.peer_characters.has(peer_id):
-			var current: String = str(GameManager.player_characters.get(i, "char_barbarian"))
+			var current: String = str(GameManager.player_characters.get(i, GameManager.default_character_id()))
 			if used.count(current) > 1:
 				# Find next available character
 				for def in GameManager.CHARACTER_DEFS:
@@ -2071,8 +2167,19 @@ func _assign_online_accessories() -> void:
 			GameManager.player_headwear[i] = str(NetworkManager.peer_headwear[peer_id])
 		if NetworkManager.peer_cloth.has(peer_id):
 			GameManager.player_cloth[i] = str(NetworkManager.peer_cloth[peer_id])
+		if NetworkManager.peer_colors.has(peer_id):
+			GameManager.player_colors[i] = int(NetworkManager.peer_colors[peer_id])
+		if NetworkManager.peer_masks.has(peer_id):
+			GameManager.player_masks[i] = str(NetworkManager.peer_masks[peer_id])
+	# Two Mascots in one color: later slots move to the next free color.
+	GameManager.resolve_mascot_colors()
 
 
 func _on_character_chosen(_peer_id: int, _char_id: String) -> void:
+	if _screen == "waiting":
+		_rebuild_ui()
+
+
+func _on_color_chosen(_peer_id: int, _color_index: int) -> void:
 	if _screen == "waiting":
 		_rebuild_ui()

@@ -13,3 +13,6 @@ Thumbs.db
 
 # Claude Code local state (worktrees, local settings)
 .claude/
+
+# Blender auto-backups
+*.blend1
