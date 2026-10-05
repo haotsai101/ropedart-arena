@@ -14,6 +14,15 @@ extends CanvasLayer
 ## flagged judgment call: no further action happens after this).
 
 const MAX_PLAYERS := 6
+## Touch devices: the on-screen joystick and buttons (virtual_controls.gd)
+## own both bottom corners, so every player panel moves into one row across
+## the top instead of the four-corner layout. Same gate as the controls
+## themselves (player.gd spawns them when a touchscreen is available);
+## settable for screenshots/tests on desktop.
+var touch_layout: bool = false
+const TOP_ROW_HEIGHT := 0.12   # fraction of screen height
+const TOP_ROW_MAX_WIDTH := 0.17
+const TOP_ROW_GAP := 0.012
 
 # Per-player panel references (indexed by player_index)
 var _panels: Array = []
@@ -132,10 +141,31 @@ func _build_skeleton() -> void:
 	_root.add_child(_overlay)
 
 
+## Re-anchor panels 0..count-1 into one evenly spaced row along the top edge.
+func _apply_top_row_layout(count: int) -> void:
+	var n: int = clampi(count, 1, MAX_PLAYERS)
+	var width: float = minf(TOP_ROW_MAX_WIDTH, (1.0 - TOP_ROW_GAP * (n + 1)) / n)
+	var total: float = n * width + (n - 1) * TOP_ROW_GAP
+	var left: float = (1.0 - total) / 2.0
+	for i in n:
+		var panel: Panel = _panels[i]
+		var x0: float = left + i * (width + TOP_ROW_GAP)
+		panel.set_anchor(SIDE_LEFT, x0)
+		panel.set_anchor(SIDE_RIGHT, x0 + width)
+		panel.set_anchor(SIDE_TOP, 0.0)
+		panel.set_anchor(SIDE_BOTTOM, TOP_ROW_HEIGHT)
+		panel.offset_left = 0.0
+		panel.offset_right = 0.0
+		panel.offset_top = 6.0
+		panel.offset_bottom = 0.0
+
+
 func _setup_player_panels() -> void:
 	_life_dot_capacity = maxi(GameManager.lives_per_round, 1)
 	_pip_capacity = maxi(GameManager.rounds_to_win, 1)
 	var players = get_tree().get_nodes_in_group("players")
+	if touch_layout or DisplayServer.is_touchscreen_available():
+		_apply_top_row_layout(players.size())
 	for p in players:
 		var idx: int = p.player_index
 		var color: Color = p.player_color
