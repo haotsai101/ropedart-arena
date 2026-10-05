@@ -32,5 +32,6 @@ install_hook() {
 install_hook "post-commit" "$REPO_ROOT/scripts/tools/post-commit-hook.sh"
 
 echo ""
-echo "Done. Every commit will now run scripts/tools/export_ios.sh automatically."
-echo "Opt out for one commit with: SKIP_IOS_EXPORT=1 git commit -m \"...\""
+echo "Done. Every commit will now run scripts/tools/export_ios.sh (Xcode project)"
+echo "and scripts/tools/export_android.sh (debug APK) automatically."
+echo "Opt out for one commit with: SKIP_IOS_EXPORT=1 / SKIP_ANDROID_EXPORT=1 git commit -m \"...\""

@@ -1,31 +1,37 @@
 #!/usr/bin/env bash
-# One-command iOS export: regenerates the version stamp, then runs Godot's
-# export step. Still leaves the Xcode build/archive/upload step manual --
-# this only replaces the two Godot-side steps (generate_version.sh + the
-# `godot --export-release "iOS"` invocation) with one command.
+# One-command iOS builds.
 #
-# Usage (from anywhere):
-#   scripts/tools/export_ios.sh
+#   scripts/tools/export_ios.sh             Xcode project only
+#                                            -> export/ios/RopeDartArena.xcodeproj
+#   scripts/tools/export_ios.sh device      + build/sign for development and
+#                                            install on the connected iPhone
+#                                            -> export/ios/build/device/*.ipa
+#   scripts/tools/export_ios.sh testflight  + archive, sign for the App Store and
+#                                            upload to App Store Connect/TestFlight
 #
-# Override the Godot binary if auto-detection doesn't find yours:
-#   GODOT_BIN=/path/to/Godot scripts/tools/export_ios.sh
+# Versions come from scripts/tools/app_version.sh (VERSION file + git commit
+# count). Override the Godot binary with GODOT_BIN=/path/to/Godot.
 #
-# After this finishes, open export/ios/RopeDartArena.xcodeproj in Xcode,
-# then build/archive/install or upload to TestFlight as usual -- that part
-# isn't automated here.
+# Signing is automatic (team below, `-allowProvisioningUpdates`), so Xcode
+# must be signed in to the Apple ID (Xcode > Settings > Accounts) -- or, for
+# `testflight`, set an App Store Connect API key:
+#   ASC_KEY_ID=...  ASC_ISSUER_ID=...  ASC_KEY_PATH=/path/AuthKey_XXXX.p8
+# `testflight` needs a paid Apple Developer Program team and the app record
+# (bundle id com.ropedartarena.game) created in App Store Connect. See
+# docs/deployment.md.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+MODE="${1:-project}"
+TEAM_ID="${IOS_TEAM_ID:-5H964M87S4}"
+PROJECT="export/ios/RopeDartArena.xcodeproj"
+SCHEME="RopeDartArena"
 
-# --- 1) Locate a Godot binary -------------------------------------------
-# Respects an explicit override first, then checks common install
-# locations, then falls back to whatever's on PATH. This project targets
-# the STANDARD build (not .NET) -- if only a mono/.NET build is found,
-# warn but still use it, since it can still export a non-C# project fine.
+# --- Godot binary (standard build; a .NET build can export this project too)
 if [[ -n "${GODOT_BIN:-}" ]]; then
-  : # explicit override, trust it
+  :
 elif command -v godot4 >/dev/null 2>&1; then
   GODOT_BIN="$(command -v godot4)"
 elif command -v godot >/dev/null 2>&1; then
@@ -34,21 +40,72 @@ elif [[ -x "/Applications/Godot.app/Contents/MacOS/Godot" ]]; then
   GODOT_BIN="/Applications/Godot.app/Contents/MacOS/Godot"
 elif [[ -x "/Applications/Godot_mono.app/Contents/MacOS/Godot" ]]; then
   GODOT_BIN="/Applications/Godot_mono.app/Contents/MacOS/Godot"
-  echo "export_ios.sh: only found the .NET/mono build (this project is standard, non-.NET) -- using it anyway, it can still export a non-C# project." >&2
 else
-  echo "export_ios.sh: could not find a Godot binary. Set GODOT_BIN=/path/to/Godot and re-run." >&2
+  echo "export_ios.sh: no Godot binary found. Set GODOT_BIN=/path/to/Godot." >&2
   exit 1
 fi
-
 echo "Using Godot binary: $GODOT_BIN"
 
-# --- 2) Regenerate the version stamp ------------------------------------
 "$REPO_ROOT/scripts/tools/generate_version.sh"
+. "$REPO_ROOT/scripts/tools/app_version.sh"
+stamp_export_presets
+echo "Version $APP_VERSION (build $APP_BUILD)"
 
-# --- 3) Run the actual export --------------------------------------------
-EXPORT_PATH="export/ios/RopeDartArena.xcodeproj"
-echo "Exporting iOS project to $EXPORT_PATH ..."
-"$GODOT_BIN" --headless --export-release "iOS" "$EXPORT_PATH"
+# --- 1) Godot: generate the Xcode project (preset is "export project only";
+# signing/building is done below with full control over the settings).
+mkdir -p export/ios
+"$GODOT_BIN" --headless --path . --export-release "iOS" "$PROJECT"
+[[ -d "$PROJECT" ]] || { echo "export_ios.sh: Godot produced no $PROJECT" >&2; exit 1; }
+echo "Xcode project: $PROJECT"
+[[ "$MODE" == "project" ]] && exit 0
 
-echo ""
-echo "Done. Next: open $EXPORT_PATH in Xcode and build/archive/upload as usual."
+AUTH=(-allowProvisioningUpdates)
+if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" ]]; then
+  AUTH+=(-authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" -authenticationKeyPath "$ASC_KEY_PATH")
+fi
+SIGNING=(DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic CODE_SIGN_IDENTITY="Apple Development"
+         PROVISIONING_PROFILE_SPECIFIER="")
+BUILD_DIR="export/ios/build/$MODE"
+ARCHIVE="$BUILD_DIR/RopeDartArena.xcarchive"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+# --- 2) Archive (signed for development; the export step below re-signs for
+# the chosen distribution method).
+xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+  -destination "generic/platform=iOS" -archivePath "$ARCHIVE" \
+  "${AUTH[@]}" "${SIGNING[@]}" archive | tail -n 20
+
+case "$MODE" in
+  device)     METHOD="debugging"; DEST="export" ;;
+  testflight) METHOD="app-store-connect"; DEST="upload" ;;
+  *) echo "usage: $0 [project|device|testflight]" >&2; exit 2 ;;
+esac
+cat > "$BUILD_DIR/ExportOptions.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>method</key><string>$METHOD</string>
+  <key>destination</key><string>$DEST</string>
+  <key>teamID</key><string>$TEAM_ID</string>
+  <key>signingStyle</key><string>automatic</string>
+</dict></plist>
+PLIST
+
+# --- 3) Export: an .ipa for the device, or straight upload to App Store Connect.
+xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$BUILD_DIR" \
+  -exportOptionsPlist "$BUILD_DIR/ExportOptions.plist" "${AUTH[@]}" | tail -n 20
+
+if [[ "$MODE" == "device" ]]; then
+  IPA="$(ls "$BUILD_DIR"/*.ipa | head -1)"
+  echo "Built $IPA"
+  DEVICE="$(xcrun devicectl list devices 2>/dev/null | awk '/available|connected/ && /iPhone|iPad/ {print $3; exit}')"
+  if [[ -n "$DEVICE" ]]; then
+    xcrun devicectl device install app --device "$DEVICE" "$IPA"
+    echo "Installed on $DEVICE"
+  else
+    echo "No iPhone connected -- plug one in (trusted, Developer Mode on) and run: xcrun devicectl device install app --device <id> $IPA"
+  fi
+else
+  echo "Uploaded build $APP_VERSION ($APP_BUILD) -- it appears in App Store Connect > TestFlight after processing."
+fi

@@ -15,6 +15,7 @@ compatibility/default_parent_skeleton_in_mesh_instance_3d=true
 [application]
 
 config/name="Dartrope Arena"
+config/icon="res://assets/icon/app_icon_1024.png"
 run/main_scene="res://scenes/lobby.tscn"
 config/features=PackedStringArray("4.7", "Forward Plus")
 
@@ -28,6 +29,7 @@ GameVersion="*res://scripts/game_version.gd"
 
 [display]
 
+window/handheld/orientation=4
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 
@@ -103,4 +105,5 @@ throw_dart={
 
 [rendering]
 
+textures/vram_compression/import_etc2_astc=true
 environment/defaults/default_environment="res://scenes/default_env.tres"

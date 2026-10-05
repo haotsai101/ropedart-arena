@@ -1,8 +1,12 @@
-# Godot
+# Godot -- export_presets.cfg IS committed (Godot 4 keeps keystore paths and
+# passwords in .godot/export_credentials.cfg, which is ignored)
 .godot/
 *.import
-export_presets.cfg
 export.cfg
+export/
+# Godot Android Gradle build template (~1 GB once built); export_android.sh
+# reinstalls it on demand for `play` builds
+android/
 
 # Signaling server
 signaling-server/node_modules/
